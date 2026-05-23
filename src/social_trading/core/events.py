@@ -1,0 +1,100 @@
+"""
+Redis Stream event schemas — typed dictionaries for each stream.
+
+These define the exact field names published to / consumed from each stream.
+All values are strings (Redis Streams serialize everything to bytes/str).
+Services must serialize to these shapes before publishing and
+deserialize from them after consuming.
+"""
+from __future__ import annotations
+
+from typing import TypedDict
+
+
+# raw_social  ────────────────────────────────────────────────────────────────
+class RawSocialEvent(TypedDict):
+    id: str
+    source: str           # twitter | reddit | stocktwits | lunarcrush
+    ticker: str
+    text: str
+    author_id: str
+    author_followers: str  # int as str
+    author_account_age_days: str
+    author_following: str
+    post_count_30d: str
+    likes: str
+    reposts: str
+    is_original: str       # "1" | "0"
+    url: str
+    collected_at: str      # ISO-8601
+
+
+# sentiment_signals  ─────────────────────────────────────────────────────────
+class SentimentEvent(TypedDict):
+    post_id: str
+    ticker: str
+    positive: str          # float as str
+    negative: str
+    neutral: str
+    score: str
+    model: str
+    latency_ms: str
+    classified_at: str     # ISO-8601
+
+
+# market_data  ───────────────────────────────────────────────────────────────
+class MarketDataEvent(TypedDict):
+    ticker: str
+    last: str              # float as str
+    bid: str
+    ask: str
+    volume: str
+    avg_volume_30d: str
+    atr_14: str
+    vix: str
+    timestamp: str         # ISO-8601
+
+
+# strategy_signals  ──────────────────────────────────────────────────────────
+class SignalEvent(TypedDict):
+    ticker: str
+    direction: str         # LONG | SHORT
+    quality_score: str     # float as str
+    sentiment_score: str
+    volume_z_score: str
+    momentum: str
+    convergence: str
+    source_post_count: str
+    generated_at: str      # ISO-8601
+
+
+# selected_signals  ──────────────────────────────────────────────────────────
+class ApprovedSignalEvent(TypedDict):
+    ticker: str
+    direction: str
+    quality_score: str
+    sentiment_score: str
+    volume_z_score: str
+    momentum: str
+    convergence: str
+    source_post_count: str
+    generated_at: str
+    quantity: str          # int as str — added by risk service
+    stop_loss: str         # float as str
+    take_profit: str
+
+
+# ── Stream name constants ─────────────────────────────────────────────────────
+STREAM_RAW_SOCIAL = "raw_social"
+STREAM_SENTIMENT = "sentiment_signals"
+STREAM_MARKET_DATA = "market_data"
+STREAM_STRATEGY_SIGNALS = "strategy_signals"
+STREAM_SELECTED_SIGNALS = "selected_signals"
+
+ALL_STREAMS = [
+    STREAM_RAW_SOCIAL,
+    STREAM_SENTIMENT,
+    STREAM_MARKET_DATA,
+    STREAM_STRATEGY_SIGNALS,
+    STREAM_SELECTED_SIGNALS,
+]

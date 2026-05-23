@@ -1,0 +1,120 @@
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  ingest:
+    build: .
+    command: python -m social_trading.services.ingest_service
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  nlp:
+    build: .
+    command: python -m social_trading.services.nlp_service
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  signal:
+    build: .
+    command: python -m social_trading.services.signal_service
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  risk:
+    build: .
+    command: python -m social_trading.services.risk_service
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  execution:
+    build: .
+    command: python -m social_trading.services.execution_service
+    env_file: .env
+    network_mode: host          # needs localhost access to IBKR Gateway
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  streamlit:
+    build: .
+    command: streamlit run src/social_trading/monitoring/streamlit/app.py --server.port 8501
+    env_file: .env
+    ports:
+      - "8501:8501"
+    depends_on:
+      redis:    { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Observability ──────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  grafana_data:

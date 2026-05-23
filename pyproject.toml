@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "social-trading"
+version = "0.1.0"
+description = "Social media momentum trading system"
+requires-python = ">=3.11"
+dependencies = [
+    # Core
+    "pydantic>=2.5.0",
+    "redis>=5.0.0",
+    "psycopg2-binary>=2.9.0",
+    # Social APIs
+    "tweepy>=4.14.0",
+    "praw>=7.7.0",
+    "httpx>=0.26.0",
+    # NLP
+    "transformers>=4.35.0",
+    "torch>=2.1.0",
+    "vaderSentiment>=3.3.2",
+    "spacy>=3.7.0",
+    # Broker
+    "ib_async>=0.9.86",
+    # Data / math
+    "pandas>=2.1.0",
+    "numpy>=1.26.0",
+    "yfinance>=0.2.36",
+    "scipy>=1.11.0",
+    # Infrastructure
+    "prometheus-client>=0.19.0",
+    "exchange-calendars>=4.3.0",
+    "python-dotenv>=1.0.0",
+    # Monitoring UI
+    "streamlit>=1.32.0",
+    "plotly>=5.18.0",
+    "altair>=5.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "fakeredis>=2.20.0",
+    "respx>=0.20.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+    "types-redis>=4.6.0",
+    "types-psycopg2>=2.9.0",
+]
+backtest = [
+    "vectorbt>=0.26.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/social_trading"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=src/social_trading --cov-report=term-missing -q"
+
+[tool.ruff]
+src = ["src"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
