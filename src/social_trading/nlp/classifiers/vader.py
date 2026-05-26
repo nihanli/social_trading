@@ -63,7 +63,11 @@ class VaderClassifier:
             latency_ms=round(latency_ms, 3),
         )
 
-    async def classify_batch(self, posts: list[SocialPost]) -> list[SentimentResult]:
+    async def classify_batch(
+        self,
+        posts: list[SocialPost],
+        batch_size: int | None = None,  # ignored — VADER is fast enough sequentially
+    ) -> list[SentimentResult]:
         """Classify a batch. VADER is fast enough to run sequentially."""
         results: list[SentimentResult] = []
         for post in posts:
