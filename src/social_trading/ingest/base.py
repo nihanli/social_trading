@@ -170,4 +170,6 @@ def _post_to_stream_dict(post: SocialPost) -> dict[str, str]:
         "is_original": "1" if post.is_original else "0",
         "url": post.url,
         "collected_at": post.collected_at.isoformat(),
+        # StockTwits native Bullish/Bearish label — empty string for other sources
+        "sentiment_label": str(post.raw.get("sentiment_label", "")),
     }
