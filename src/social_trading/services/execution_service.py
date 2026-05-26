@@ -1,11 +1,11 @@
 """
 Execution Service — submits approved signals and manages open positions.
 
-Two concurrent loops:
+Three concurrent loops:
 
   trade_loop:   Consumes selected_signals (consumer group "execution").
                 For each approved signal:
-                  - Skip if position already open for that ticker
+                  - Skip if halted or position already open for that ticker
                   - Submit to ExecutionEngine (paper or IBKR)
                   - Persist trade to Redis (and optionally PostgreSQL)
 
@@ -16,6 +16,9 @@ Two concurrent loops:
                   - Write updated account state to Redis hash 'account:state'
                   - Write per-ticker market snapshot to Redis hash 'market_data:{ticker}'
                     (consumed by risk_service and signal_service)
+
+  command_listener:  Subscribes to Redis pub/sub "trading:commands".
+                     Handles UI commands: HALT_NEW, RESUME, CLOSE_ALL, CLOSE_TICKER.
 
 The ExecutionEngine is injected — swap PaperTradingEngine for IBKRExecutionEngine
 with no code changes in this file.
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal as os_signal
@@ -67,6 +71,10 @@ logger = logging.getLogger(__name__)
 _GROUP = "execution"
 _CONSUMER = "exec-0"
 _INGEST_BATCH = 16
+
+# Shared halt flag: set by HALT_NEW command, cleared by RESUME.
+# run_trade_loop checks this before opening any new position.
+_halt_flag = asyncio.Event()
 
 
 # ── Deserialisation ────────────────────────────────────────────────────────────
@@ -181,6 +189,13 @@ async def run_trade_loop(
                 continue
 
             signal, quantity, stop_loss, take_profit = parsed
+
+            # Skip if new positions are halted via UI command
+            if _halt_flag.is_set():
+                logger.debug("Skip %s — new positions halted", signal.ticker)
+                skipped += 1
+                await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                continue
 
             # Skip if position already open
             if signal.ticker in engine.open_tickers:
@@ -344,6 +359,74 @@ async def _write_market_snapshot_and_get_price(
     return None
 
 
+
+# ── UI command listener ────────────────────────────────────────────────────────
+
+async def run_command_listener(engine: PaperTradingEngine, redis: aioredis.Redis) -> None:
+    """
+    Subscribe to the Redis pub/sub channel "trading:commands" and honour
+    control messages published by the Streamlit UI.
+
+    Supported commands (see streamlit/utils/redis_ctrl.py):
+      HALT_NEW      — stop opening new positions (sets _halt_flag)
+      RESUME        — re-enable new positions (clears _halt_flag)
+      CLOSE_ALL     — immediately close every open position
+      CLOSE_TICKER  — close one ticker  (payload: {"ticker": "AAPL"})
+      CONFIG_UPDATED — hint only; no action needed (services reload on next cycle)
+    """
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("trading:commands")
+    logger.info("Command listener subscribed to trading:commands")
+
+    async for raw in pubsub.listen():
+        if raw["type"] != "message":
+            continue
+        try:
+            data = raw["data"]
+            if isinstance(data, bytes):
+                data = data.decode()
+            msg = json.loads(data)
+        except Exception as exc:
+            logger.warning("Malformed command message: %s", exc)
+            continue
+
+        cmd = msg.get("cmd", "")
+        payload = msg.get("payload", {})
+        logger.info("UI command received: %s  payload=%s", cmd, payload)
+
+        if cmd == "HALT_NEW":
+            _halt_flag.set()
+            logger.warning("New positions HALTED via UI command")
+        elif cmd == "RESUME":
+            _halt_flag.clear()
+            logger.info("New positions RESUMED via UI command")
+        elif cmd == "CLOSE_ALL":
+            tickers = list(engine.open_tickers)
+            logger.warning("CLOSE_ALL: closing %d positions", len(tickers))
+            for ticker in tickers:
+                try:
+                    await engine.close_position(ticker, reason="UI:CLOSE_ALL")
+                    POSITIONS_CLOSED.labels(ticker=ticker, reason="UI:CLOSE_ALL").inc()
+                    logger.info("Closed %s via CLOSE_ALL", ticker)
+                except Exception as exc:
+                    logger.error("Failed to close %s: %s", ticker, exc)
+        elif cmd == "CLOSE_TICKER":
+            ticker = payload.get("ticker", "")
+            if not ticker:
+                logger.warning("CLOSE_TICKER missing ticker in payload")
+            elif ticker not in engine.open_tickers:
+                logger.info("CLOSE_TICKER: %s not in open positions — ignoring", ticker)
+            else:
+                try:
+                    await engine.close_position(ticker, reason="UI:CLOSE_TICKER")
+                    POSITIONS_CLOSED.labels(ticker=ticker, reason="UI:CLOSE_TICKER").inc()
+                    logger.info("Closed %s via CLOSE_TICKER", ticker)
+                except Exception as exc:
+                    logger.error("Failed to close %s: %s", ticker, exc)
+        elif cmd == "CONFIG_UPDATED":
+            logger.info("CONFIG_UPDATED received — config will reload on next cycle")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 async def main(use_ibkr: bool = False) -> None:
@@ -388,6 +471,10 @@ async def main(use_ibkr: bool = False) -> None:
         asyncio.create_task(
             run_exit_loop(engine, exit_manager, market_data, breaker, redis),
             name="exec:exit",
+        ),
+        asyncio.create_task(
+            run_command_listener(engine, redis),
+            name="exec:cmd",
         ),
     ]
 
