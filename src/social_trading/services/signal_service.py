@@ -34,6 +34,13 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import STREAM_SENTIMENT, STREAM_STRATEGY_SIGNALS
 from social_trading.core.models import SentimentResult, Signal
 from social_trading.ingest.watchlist.manager import WatchlistManager
+from social_trading.monitoring.metrics import (
+    SENTIMENT_SCORE,
+    SIGNAL_QUALITY,
+    SIGNALS_GENERATED,
+    VOLUME_ZSCORE,
+    start_metrics_server,
+)
 from social_trading.signals.aggregator import SentimentAggregator
 from social_trading.signals.generator import SignalGenerator
 from social_trading.storage.event_bus import TradingEventBus
@@ -153,6 +160,10 @@ async def run_evaluate_task(
                 )
                 if sig is not None:
                     batch_signals.append(sig)
+                    SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
+                    SIGNAL_QUALITY.observe(sig.quality_score)
+                    SENTIMENT_SCORE.labels(ticker=ticker).set(sig.sentiment_score)
+                    VOLUME_ZSCORE.labels(ticker=ticker).set(sig.volume_z_score)
 
             except Exception as exc:
                 logger.warning("Error evaluating %s: %s", ticker, exc)
@@ -176,6 +187,8 @@ async def run_evaluate_task(
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
 
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())

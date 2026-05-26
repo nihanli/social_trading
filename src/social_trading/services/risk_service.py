@@ -38,6 +38,12 @@ from social_trading.core.events import (
     STREAM_STRATEGY_SIGNALS,
 )
 from social_trading.core.models import AccountState, Signal
+from social_trading.monitoring.metrics import (
+    SIGNALS_APPROVED,
+    SIGNALS_REJECTED,
+    set_circuit_breaker_state,
+    start_metrics_server,
+)
 from social_trading.risk.circuit_breaker import CircuitBreaker
 from social_trading.risk.liquidity_gate import LiquidityGate, LiquidityQuote
 from social_trading.risk.position_sizer import PositionSizer
@@ -196,6 +202,7 @@ async def run_risk_service(
 
         # ── Circuit breaker check ─────────────────────────────────────────────
         cb_status = await breaker.check(account, cfg)
+        set_circuit_breaker_state(cb_status.state.value)
         if not cb_status.allow:
             logger.warning(
                 "CircuitBreaker %s — draining queue without forwarding",
@@ -239,6 +246,7 @@ async def run_risk_service(
                 if not gate_result.passed:
                     logger.info("REJECTED (liquidity) %s: %s", signal.ticker, gate_result.reason)
                     rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="liquidity").inc()
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -263,6 +271,7 @@ async def run_risk_service(
                 if shares == 0:
                     logger.info("REJECTED (sizer) %s: %s", signal.ticker, size_reason)
                     rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="sizer").inc()
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -273,6 +282,7 @@ async def run_risk_service(
                         "REJECTED (adv_pct) %s: %s", signal.ticker, gate_result2.reason
                     )
                     rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="adv_pct").inc()
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -288,6 +298,7 @@ async def run_risk_service(
                 )
                 await redis.xadd(STREAM_SELECTED_SIGNALS, stream_dict)
                 approved_total += 1
+                SIGNALS_APPROVED.labels(ticker=signal.ticker, direction=signal.direction).inc()
                 logger.info(
                     "APPROVED %s %s qty=%d entry=%.2f sl=%.2f tp=%.2f [approved=%d rejected=%d]",
                     signal.direction, signal.ticker, shares,
@@ -309,6 +320,8 @@ async def run_risk_service(
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
 
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())

@@ -1,0 +1,82 @@
+{
+  "uid": "social-trading-system",
+  "title": "System Health",
+  "tags": ["social-trading", "infrastructure"],
+  "timezone": "browser",
+  "schemaVersion": 36,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "type": "stat", "title": "Posts Ingested (1h)",
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {}},
+      "targets": [{"expr": "increase(posts_ingested_total[1h])", "legendFormat": "Posts", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 2, "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "type": "stat", "title": "Posts Filtered (1h)",
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {}},
+      "targets": [{"expr": "increase(posts_filtered_total[1h])", "legendFormat": "Filtered", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 3, "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "type": "stat", "title": "NLP Latency p95 (ms)",
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"unit": "ms", "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 200}, {"color": "red", "value": 500}]}}},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(sentiment_latency_ms_bucket[5m]))", "legendFormat": "p95", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 4, "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "type": "stat", "title": "Active Tickers",
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {}},
+      "targets": [{"expr": "active_tickers_total", "legendFormat": "Tickers", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 5, "gridPos": {"x": 0, "y": 4, "w": 24, "h": 8},
+      "type": "timeseries", "title": "Post Ingestion Rate by Source",
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"expr": "rate(posts_ingested_total[5m])", "legendFormat": "{{source}} {{ticker}}", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 6, "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "type": "timeseries", "title": "NLP Latency Percentiles (ms)",
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(sentiment_latency_ms_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.90, rate(sentiment_latency_ms_bucket[5m]))", "legendFormat": "p90", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, rate(sentiment_latency_ms_bucket[5m]))", "legendFormat": "p99", "refId": "C"}
+      ],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 7, "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "type": "timeseries", "title": "Posts Classified by Model & Label",
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"expr": "rate(posts_classified_total[5m])", "legendFormat": "{{model}}/{{label}}", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 8, "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "type": "timeseries", "title": "Ingest Errors",
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "targets": [{"expr": "rate(ingest_errors_total[5m])", "legendFormat": "{{source}} {{error_type}}", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    },
+    {
+      "id": 9, "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+      "type": "timeseries", "title": "Circuit Breaker State Over Time",
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "NORMAL"}, "1": {"text": "REDUCED"}, "2": {"text": "DAILY_HALT"}, "3": {"text": "FULL_HALT"}}}]}},
+      "targets": [{"expr": "circuit_breaker_state", "legendFormat": "State", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": "Prometheus"}
+    }
+  ]
+}

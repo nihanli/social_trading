@@ -33,6 +33,10 @@ from social_trading.ingest.sources.reddit import RedditDataSource
 from social_trading.ingest.sources.stocktwits import StockTwitsDataSource
 from social_trading.ingest.sources.twitter import TwitterDataSource
 from social_trading.ingest.watchlist.manager import WatchlistManager
+from social_trading.monitoring.metrics import (
+    ACTIVE_TICKERS,
+    start_metrics_server,
+)
 
 load_dotenv()
 
@@ -98,6 +102,7 @@ async def run_watchlist_maintenance(
         promoted = await watchlist.promote_candidates()
         expired = await watchlist.expire_stale()
         active_count = await watchlist.size()
+        ACTIVE_TICKERS.set(active_count)
         if promoted or expired:
             logger.info(
                 "watchlist: +%d promoted, -%d expired, %d active",
@@ -109,6 +114,8 @@ async def run_watchlist_maintenance(
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
 
     # Load initial config
     cfg = await SystemConfig.load(redis)

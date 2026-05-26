@@ -42,6 +42,16 @@ from social_trading.core.events import STREAM_SELECTED_SIGNALS
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
 from social_trading.market_data.yfinance import YFinanceMarketData
+from social_trading.monitoring.metrics import (
+    DAILY_PNL_PCT,
+    DRAWDOWN,
+    OPEN_POSITIONS_COUNT,
+    ORDERS_PLACED,
+    PAPER_EQUITY,
+    POSITION_PNL,
+    POSITIONS_CLOSED,
+    start_metrics_server,
+)
 from social_trading.risk.circuit_breaker import CircuitBreaker
 from social_trading.risk.exit_manager import PositionExitManager
 from social_trading.storage.event_bus import TradingEventBus
@@ -188,6 +198,7 @@ async def run_trade_loop(
 
             if result.status == "filled":
                 submitted += 1
+                ORDERS_PLACED.labels(ticker=signal.ticker, status="filled").inc()
                 # Persist trade to Redis list for UI
                 await redis.lpush("trades:recent", str({
                     "ticker": signal.ticker,
@@ -206,6 +217,7 @@ async def run_trade_loop(
                     result.fill_price or 0.0, submitted,
                 )
             else:
+                ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
                 logger.warning(
                     "[EXEC] Rejected %s: %s", signal.ticker, result.error
                 )
@@ -267,6 +279,7 @@ async def run_exit_loop(
             decision = exit_manager.evaluate(pos, current_price, cfg, now=now)
             if decision.should_exit:
                 await engine.close_position(pos.ticker, reason=decision.reason)
+                POSITIONS_CLOSED.labels(reason=decision.reason or "unknown").inc()
                 logger.info(
                     "[EXIT] %s %s reason=%s pnl_approx=%.2f",
                     pos.direction, pos.ticker, decision.reason,
@@ -277,6 +290,19 @@ async def run_exit_loop(
 
         # Write account state (read by risk service)
         await _write_account_state(redis, engine)
+
+        # Update Prometheus account metrics
+        state = await engine.get_account_state()
+        PAPER_EQUITY.set(state.net_liquidation)
+        DAILY_PNL_PCT.set(state.daily_pnl / state.net_liquidation if state.net_liquidation else 0)
+        DRAWDOWN.set(state.drawdown_pct)
+        remaining_positions = await engine.get_positions()
+        OPEN_POSITIONS_COUNT.set(len(remaining_positions))
+        for pos in remaining_positions:
+            cur = engine.get_price(pos.ticker) or pos.entry_price
+            pnl = (cur - pos.entry_price) * pos.quantity if pos.direction == "LONG" \
+                else (pos.entry_price - cur) * pos.quantity
+            POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
         # Write VIX to a shared key (read by risk service)
         await redis.set("market:vix", str(vix))
@@ -323,6 +349,9 @@ async def _write_market_snapshot_and_get_price(
 async def main(use_ibkr: bool = False) -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
+
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())
 

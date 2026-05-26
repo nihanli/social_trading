@@ -32,6 +32,12 @@ from dotenv import load_dotenv
 from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import STREAM_RAW_SOCIAL, STREAM_SENTIMENT
 from social_trading.core.models import SentimentResult, SocialPost
+from social_trading.monitoring.metrics import (
+    POSTS_CLASSIFIED,
+    POSTS_FILTERED,
+    SENTIMENT_LATENCY,
+    start_metrics_server,
+)
 from social_trading.nlp.classifiers.finbert import FinBERTClassifier
 from social_trading.nlp.classifiers.vader import VaderClassifier
 from social_trading.nlp.filters.bot_filter import BotFilter
@@ -143,9 +149,15 @@ async def run_nlp_service(
             results = await pipeline.process_batch(posts)
             for result in results:
                 await redis.xadd(STREAM_SENTIMENT, _result_to_stream_dict(result))
+                SENTIMENT_LATENCY.observe(result.latency_ms)
+                label = "positive" if result.score > 0 else "negative" if result.score < 0 else "neutral"
+                POSTS_CLASSIFIED.labels(model=result.model, label=label).inc()
 
             published += len(results)
             processed += len(posts)
+            filtered = len(posts) - len(results)
+            if filtered > 0:
+                POSTS_FILTERED.labels(reason="pipeline_drop").inc(filtered)
             logger.debug(
                 "batch: %d posts → %d results (total processed=%d published=%d)",
                 len(posts), len(results), processed, published,
@@ -166,6 +178,8 @@ async def run_nlp_service(
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
 
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())

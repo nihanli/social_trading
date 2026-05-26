@@ -37,6 +37,10 @@ services:
     build: .
     command: python -m social_trading.services.ingest_service
     env_file: .env
+    environment:
+      METRICS_PORT: "8000"
+    ports:
+      - "8001:8000"
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -46,6 +50,10 @@ services:
     build: .
     command: python -m social_trading.services.nlp_service
     env_file: .env
+    environment:
+      METRICS_PORT: "8000"
+    ports:
+      - "8002:8000"
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -55,6 +63,10 @@ services:
     build: .
     command: python -m social_trading.services.signal_service
     env_file: .env
+    environment:
+      METRICS_PORT: "8000"
+    ports:
+      - "8003:8000"
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -64,6 +76,10 @@ services:
     build: .
     command: python -m social_trading.services.risk_service
     env_file: .env
+    environment:
+      METRICS_PORT: "8000"
+    ports:
+      - "8004:8000"
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -73,6 +89,10 @@ services:
     build: .
     command: python -m social_trading.services.execution_service
     env_file: .env
+    environment:
+      METRICS_PORT: "8000"
+    ports:
+      - "8005:8000"
     network_mode: host          # needs localhost access to IBKR Gateway
     depends_on:
       postgres: { condition: service_healthy }
@@ -98,6 +118,7 @@ services:
       - "9090:9090"
     volumes:
       - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
     restart: unless-stopped
 
   grafana:
