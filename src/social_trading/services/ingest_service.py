@@ -128,8 +128,11 @@ async def main() -> None:
     # Build registry
     registry = DataSourceRegistry()
 
-    # Register Twitter (polled)
-    registry.register(TwitterDataSource(redis=redis, cfg=cfg))
+    # Register Twitter (polled) — only if bearer token is configured
+    if os.getenv("X_BEARER_TOKEN"):
+        registry.register(TwitterDataSource(redis=redis, cfg=cfg))
+    else:
+        logger.warning("X_BEARER_TOKEN not set — Twitter source disabled")
 
     # Register Reddit (streaming) — only if credentials are configured
     if os.getenv("REDDIT_CLIENT_ID"):
@@ -139,10 +142,19 @@ async def main() -> None:
     else:
         logger.warning("REDDIT_CLIENT_ID not set — Reddit source disabled")
 
-    # Register StockTwits (polled)
-    registry.register(StockTwitsDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+    # Register StockTwits (polled) — only if token is configured
+    if os.getenv("STOCKTWITS_TOKEN"):
+        registry.register(StockTwitsDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+    else:
+        logger.warning("STOCKTWITS_TOKEN not set — StockTwits source disabled")
 
     logger.info("Registered sources: %s", registry.names)
+
+    if not registry.names:
+        logger.error(
+            "No data sources registered — set at least X_BEARER_TOKEN, "
+            "REDDIT_CLIENT_ID, or STOCKTWITS_TOKEN in .env"
+        )
 
     # Build task list
     tasks: list[asyncio.Task] = []
