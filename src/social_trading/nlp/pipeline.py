@@ -111,8 +111,14 @@ class NLPPipeline:
             )
             return None
 
-        # [5] FinBERT — primary classification
-        return await self._classifier.classify(post)
+        # [5] FinBERT — primary classification; enrich with engagement metadata
+        result = await self._classifier.classify(post)
+        return result.model_copy(update={
+            "source": post.source,
+            "likes": post.likes,
+            "reposts": post.reposts,
+            "author_followers": post.author_followers,
+        })
 
     async def process_batch(
         self,
@@ -140,10 +146,19 @@ class NLPPipeline:
             if abs(vader_result.score) >= self._cfg.vader_neutral_threshold:
                 finbert_candidates.append(post)
 
-        # Batch FinBERT call
-        finbert_results = await self._classifier.classify_batch(
+        # Batch FinBERT call; enrich each result with engagement metadata from its post
+        raw_finbert = await self._classifier.classify_batch(
             finbert_candidates, batch_size=self._cfg.finbert_batch_size
         )
+        finbert_results = [
+            r.model_copy(update={
+                "source": p.source,
+                "likes": p.likes,
+                "reposts": p.reposts,
+                "author_followers": p.author_followers,
+            })
+            for r, p in zip(raw_finbert, finbert_candidates, strict=True)
+        ]
 
         return early_results + finbert_results
 
@@ -175,4 +190,8 @@ class NLPPipeline:
             model="stocktwits_native",
             latency_ms=0.0,
             classified_at=datetime.now(UTC),
+            source=post.source,
+            likes=post.likes,
+            reposts=post.reposts,
+            author_followers=post.author_followers,
         )

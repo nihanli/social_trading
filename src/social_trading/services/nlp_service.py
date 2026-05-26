@@ -97,6 +97,10 @@ def _result_to_stream_dict(result: SentimentResult) -> dict[str, str]:
         "model": result.model,
         "latency_ms": str(round(result.latency_ms, 3)),
         "classified_at": result.classified_at.isoformat(),
+        "source": result.source,
+        "likes": str(result.likes),
+        "reposts": str(result.reposts),
+        "author_followers": str(result.author_followers),
     }
 
 

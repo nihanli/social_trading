@@ -51,9 +51,14 @@ class SentimentResult(BaseModel):
     negative: float
     neutral: float
     score: float                     # positive - negative  ∈ [-1, 1]
-    model: str                       # "vader" | "finbert"
+    model: str                       # "vader" | "finbert" | "stocktwits_native"
     latency_ms: float = 0.0
     classified_at: datetime = Field(default_factory=datetime.utcnow)
+    # Engagement metadata forwarded from SocialPost for aggregation weighting
+    source: str = ""                 # "twitter" | "reddit" | "stocktwits"
+    likes: int = 0
+    reposts: int = 0
+    author_followers: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
