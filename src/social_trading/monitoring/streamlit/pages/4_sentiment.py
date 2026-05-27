@@ -17,10 +17,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../"))
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
 
 st.set_page_config(page_title="Sentiment Heatmap", page_icon="🔥", layout="wide")
+st_autorefresh(interval=15_000, key="sentiment_refresh")
 st.title("Sentiment Heatmap")
 
 # ── Time window selector ──────────────────────────────────────────────────────
@@ -116,11 +118,11 @@ col_left, col_right = st.columns(2)
 with col_left:
     st.subheader("Posts by Source")
     source_df = query(f"""
-        SELECT source, COUNT(*) AS posts
+        SELECT social_raw.source, COUNT(*) AS posts
         FROM sentiment_scores
         JOIN social_raw ON sentiment_scores.post_id = social_raw.post_id
         WHERE sentiment_scores.scored_at > NOW() - INTERVAL '{hours} hours'
-        GROUP BY source
+        GROUP BY social_raw.source
         ORDER BY posts DESC
     """)
     if not source_df.empty:

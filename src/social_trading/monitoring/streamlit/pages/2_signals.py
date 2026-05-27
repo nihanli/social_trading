@@ -15,10 +15,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../"))
 
 import plotly.express as px
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
 
 st.set_page_config(page_title="Signal Feed", page_icon="⚡", layout="wide")
+st_autorefresh(interval=15_000, key="signals_refresh")
 st.title("Signal Feed")
 
 # ── Quality distribution + volume timeline ────────────────────────────────────

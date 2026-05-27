@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../"))
 
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
@@ -42,8 +43,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Auto-refresh every 15 seconds
-st.markdown('<meta http-equiv="refresh" content="15">', unsafe_allow_html=True)
+# Auto-refresh this page every 15 seconds (stays on current page — no browser redirect)
+st_autorefresh(interval=15_000, key="main_dashboard_refresh")
 
 # ═══════════════════════════════════════
 # SIDEBAR — System Controls

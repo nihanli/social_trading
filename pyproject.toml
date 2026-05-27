@@ -34,6 +34,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # Monitoring UI
     "streamlit>=1.32.0",
+    "streamlit-autorefresh>=1.0.1",
     "plotly>=5.18.0",
     "altair>=5.2.0",
 ]

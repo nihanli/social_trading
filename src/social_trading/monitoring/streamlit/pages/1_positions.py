@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../"))
 
 import plotly.express as px
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
@@ -25,6 +26,7 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
 )
 
 st.set_page_config(page_title="Positions", page_icon="📂", layout="wide")
+st_autorefresh(interval=15_000, key="positions_refresh")
 st.title("Open Positions")
 
 state = get_system_state()

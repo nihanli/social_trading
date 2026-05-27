@@ -18,10 +18,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../"))
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
 
 st.set_page_config(page_title="Trade Analytics", page_icon="📊", layout="wide")
+st_autorefresh(interval=15_000, key="trades_refresh")
 st.title("Trade Analytics")
 
 mode = st.radio("Trading Mode", ["paper", "live"], horizontal=True)
