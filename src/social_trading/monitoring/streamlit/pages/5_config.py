@@ -8,6 +8,8 @@ Changes are written to Redis and picked up by all services within one loop cycle
 Sections:
   1. Watchlist management (active tickers, pin/unpin)
   2. Discovery & spike detection thresholds
+     2a. X (Twitter) spike detection
+     2b. Trending ticker sources (yfinance, Alpha Vantage, IBKR scanner)
   3. Signal quality (threshold + factor weights)
   4. Position sizing
   5. Exit rules
@@ -105,7 +107,59 @@ with col3:
 st.divider()
 
 # ═══════════════════════════════════════════════════════════════
-# 3. SIGNAL QUALITY
+# 2b. TRENDING TICKER SOURCES
+# ═══════════════════════════════════════════════════════════════
+st.subheader("2b. Trending Ticker Sources")
+st.caption(
+    "Controls for the three supplementary discovery sources that replace StockTwits. "
+    "Discovered tickers are proposed to the watchlist and subject to the liquidity gate."
+)
+
+cfg.discovery_poll_interval_sec = st.select_slider(
+    "Discovery poll interval",
+    options=[60, 120, 300, 600, 900],
+    value=min(
+        [60, 120, 300, 600, 900],
+        key=lambda x: abs(x - int(cfg.discovery_poll_interval_sec)),
+    ),
+    format_func=lambda s: f"{s // 60} min" if s >= 60 else f"{s}s",
+    help="How often yfinance, Alpha Vantage, and IBKR scanner run their discovery cycle.",
+)
+
+col_yf, col_av = st.columns(2)
+
+with col_yf:
+    st.markdown("**Yahoo Finance Screener**")
+    st.caption("No API key required. Queries most_actives, day_gainers, day_losers.")
+    cfg.yfinance_screener_count = st.slider(
+        "Tickers per screener", 10, 100, int(cfg.yfinance_screener_count), 10,
+        help="Number of results fetched from each of the 3 Yahoo screeners per cycle.",
+        key="yf_count",
+    )
+
+with col_av:
+    st.markdown("**Alpha Vantage**")
+    st.caption("Free API key required (ALPHA_VANTAGE_API_KEY). Limit: 25 req/day.")
+    cfg.alpha_vantage_cache_ttl_sec = st.select_slider(
+        "Cache TTL (seconds)",
+        options=[900, 1800, 3600, 7200, 14400],
+        value=min(
+            [900, 1800, 3600, 7200, 14400],
+            key=lambda x: abs(x - int(cfg.alpha_vantage_cache_ttl_sec)),
+        ),
+        format_func=lambda s: f"{s // 3600}h" if s >= 3600 else f"{s // 60}m",
+        help="How long to cache the TOP_GAINERS_LOSERS response. "
+             "Shorter = fresher data but burns daily quota faster.",
+        key="av_ttl",
+    )
+
+st.info(
+    "**IBKR Market Scanner** connection settings (port, client ID) are read from "
+    "`.env` — set `IBKR_SCANNER_PORT` and `IBKR_SCANNER_CLIENT_ID` there.",
+    icon="ℹ️",
+)
+
+st.divider()
 # ═══════════════════════════════════════════════════════════════
 st.header("3. Signal Quality")
 col_s1, col_s2 = st.columns(2)

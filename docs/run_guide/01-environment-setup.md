@@ -61,10 +61,44 @@ Rate limits at Basic tier: 10,000 tweets/month, 1 req/second (our usage: ~3,000/
 
 Default subreddits: `wallstreetbets+stocks+options+investing`
 
-#### StockTwits API — Free
+#### StockTwits API — ⚠️ No longer available for new registrations
 
-1. Register at https://api.stocktwits.com/developers/apps/new
-2. Create an application and copy the **OAuth Token** → `STOCKTWITS_TOKEN`
+StockTwits closed new developer API account creation. Existing tokens continue
+to work; if you have one, set `STOCKTWITS_TOKEN` in `.env`.  
+For new deployments, the three sources below replace StockTwits as the primary
+trending-ticker discovery mechanism.
+
+#### Yahoo Finance Screener — Free, no key required
+
+No sign-up needed. `YFinanceScreenerDataSource` uses the `yfinance` library
+(already installed) to query Yahoo's `most_actives`, `day_gainers`, and
+`day_losers` screeners each cycle. Nothing to configure beyond optionally
+tuning `yfinance_screener_count` in the UI Config page (default: 50).
+
+#### Alpha Vantage — Free API key
+
+Provides the `TOP_GAINERS_LOSERS` endpoint (top gainers, losers, and most
+actively traded — 20 tickers each per call). The free tier allows **25
+requests/day**; the service caches results in Redis for 1 hour by default so
+normal usage stays well within quota.
+
+1. Register at https://www.alphavantage.co/support/#api-key (instant, no credit
+   card)
+2. Copy the API key → `ALPHA_VANTAGE_API_KEY` in `.env`
+
+Cache TTL and all other parameters are tunable from the UI **Config → 2b**
+page without restarting.
+
+#### IBKR Market Scanner — Real-time, requires IBKR account
+
+`IBKRScannerDataSource` runs `HOT_BY_VOLUME` and `TOP_PERC_GAIN` scanner
+subscriptions against TWS/IB Gateway, returning up to 50 real-time results per
+scan. The same IB Gateway instance used for order execution also serves the
+scanner — no second installation needed.
+
+Setup is covered in §1.4 below. The scanner uses a **separate `clientId`**
+(default: `99`) from the execution layer to avoid connection conflicts. Override
+with `IBKR_SCANNER_CLIENT_ID` in `.env` if needed.
 
 ### 1.4 Interactive Brokers Setup
 
@@ -81,6 +115,12 @@ Default subreddits: `wallstreetbets+stocks+options+investing`
    - Socket port: **4002** (paper Gateway) or **7497** (paper TWS)
    - ☑ Allow connections from localhost only
    - Read-Only API: **OFF** (must be off to place orders)
+
+> **Scanner note:** Both the execution layer and the IBKR Market Scanner share
+> the same TWS/Gateway connection but use different `clientId` values. The
+> execution layer defaults to `clientId=10` (`IBKR_CLIENT_ID`); the scanner
+> defaults to `clientId=99` (`IBKR_SCANNER_CLIENT_ID`). Keep them distinct to
+> avoid `"Already connected"` errors.
 
 ### 1.5 Create the .env File
 
@@ -117,11 +157,24 @@ REDDIT_USER_AGENT=social-trading-bot/0.1 by u/YourUsername
 # ── StockTwits ────────────────────────────────────────────────────────────────
 STOCKTWITS_TOKEN=                  # leave empty to disable StockTwits source
 
+# ── Trending Ticker Sources ───────────────────────────────────────────────────
+# Yahoo Finance screener: no key needed — zero-config, enabled by default
+
+# Alpha Vantage free key — get one at alphavantage.co/support/#api-key
+# Leave empty to disable (Yahoo Finance + IBKR scanner still run)
+ALPHA_VANTAGE_API_KEY=
+
 # ── Interactive Brokers ───────────────────────────────────────────────────────
-IBKR_HOST=127.0.0.1
+IBKR_HOST=127.0.0.1        # shared by execution layer and market scanner
+
+# Execution layer
 IBKR_PORT=7497          # 7497=TWS paper, 4002=Gateway paper, 4001=Gateway live
 IBKR_CLIENT_ID=10
 IBKR_PAPER=true
+
+# Market Scanner (discovery) — separate client ID avoids "Already connected" errors
+IBKR_SCANNER_PORT=7497             # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
+IBKR_SCANNER_CLIENT_ID=99
 
 # ── System ────────────────────────────────────────────────────────────────────
 LOG_LEVEL=INFO

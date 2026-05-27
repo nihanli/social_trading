@@ -27,6 +27,9 @@ class SystemConfig:
     watchlist_promote_interval: int = 600   # seconds between liquidity checks
     counts_poll_interval_sec: int = 300     # X Counts polling cadence
     stocktwits_poll_interval_sec: int = 300
+    discovery_poll_interval_sec: int = 300      # yfinance / alpha_vantage / ibkr scanner cadence
+    yfinance_screener_count: int = 50           # tickers to fetch per screener call
+    alpha_vantage_cache_ttl_sec: int = 3600     # cache TTL — protects 25 req/day quota
 
     # ── Seed tickers (never expire from watchlist) ────────────────────────────
     seed_tickers: list[str] = field(default_factory=lambda: [

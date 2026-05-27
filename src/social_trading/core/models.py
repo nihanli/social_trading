@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 #  Social Data
 # ─────────────────────────────────────────────────────────────────────────────
 
-SourceName = Literal["twitter", "reddit", "stocktwits", "lunarcrush"]
+SourceName = Literal["twitter", "reddit", "stocktwits", "lunarcrush", "yfinance", "alpha_vantage", "ibkr"]
 
 
 class SocialPost(BaseModel):
