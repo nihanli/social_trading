@@ -298,9 +298,9 @@ async def run_exit_loop(
                 logger.info(
                     "[EXIT] %s %s reason=%s pnl_approx=%.2f",
                     pos.direction, pos.ticker, decision.reason,
-                    (current_price - pos.entry_price) * pos.quantity
+                    (current_price - pos.entry_price) * pos.shares
                     if pos.direction == "LONG"
-                    else (pos.entry_price - current_price) * pos.quantity,
+                    else (pos.entry_price - current_price) * pos.shares,
                 )
 
         # Write account state (read by risk service)
@@ -315,8 +315,8 @@ async def run_exit_loop(
         OPEN_POSITIONS_COUNT.set(len(remaining_positions))
         for pos in remaining_positions:
             cur = engine.get_price(pos.ticker) or pos.entry_price
-            pnl = (cur - pos.entry_price) * pos.quantity if pos.direction == "LONG" \
-                else (pos.entry_price - cur) * pos.quantity
+            pnl = (cur - pos.entry_price) * pos.shares if pos.direction == "LONG" \
+                else (pos.entry_price - cur) * pos.shares
             POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
         # Write VIX to a shared key (read by risk service)

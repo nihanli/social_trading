@@ -137,9 +137,9 @@ class PaperTradingEngine:
         pos = Position(
             ticker=ticker,
             direction=signal.direction,
-            quantity=quantity,
+            shares=quantity,
             entry_price=fill_price,
-            entry_time=datetime.now(UTC),
+            opened_at=datetime.now(UTC),
             stop_loss=stop_loss,
             take_profit=take_profit,
             high_water_mark=fill_price,
@@ -182,15 +182,15 @@ class PaperTradingEngine:
         # Slippage is adverse on close too
         close_direction: Direction = "SHORT" if pos.direction == "LONG" else "LONG"
         fill_price = _apply_slippage(price, close_direction, self._slippage_bps)
-        commission = self._commission * pos.quantity
+        commission = self._commission * pos.shares
 
         # P&L calculation
         if pos.direction == "LONG":
-            pnl = (fill_price - pos.entry_price) * pos.quantity - commission
-            proceeds = fill_price * pos.quantity - commission
+            pnl = (fill_price - pos.entry_price) * pos.shares - commission
+            proceeds = fill_price * pos.shares - commission
         else:
-            pnl = (pos.entry_price - fill_price) * pos.quantity - commission
-            proceeds = pos.entry_price * pos.quantity + (pos.entry_price - fill_price) * pos.quantity - commission
+            pnl = (pos.entry_price - fill_price) * pos.shares - commission
+            proceeds = pos.entry_price * pos.shares + (pos.entry_price - fill_price) * pos.shares - commission
 
         self._cash += proceeds
 
@@ -202,13 +202,13 @@ class PaperTradingEngine:
             "order_id": order_id,
             "ticker": ticker,
             "direction": pos.direction,
-            "quantity": pos.quantity,
+            "shares": pos.shares,
             "entry_price": pos.entry_price,
             "exit_price": fill_price,
             "pnl": pnl,
-            "reason": reason,
-            "entry_time": pos.entry_time.isoformat(),
-            "exit_time": datetime.now(UTC).isoformat(),
+            "exit_reason": reason,
+            "opened_at": pos.opened_at.isoformat(),
+            "closed_at": datetime.now(UTC).isoformat(),
             "signal_id": pos.signal_id,
         })
 
@@ -216,14 +216,14 @@ class PaperTradingEngine:
 
         logger.info(
             "[PAPER] CLOSE %s %s qty=%d @ %.4f pnl=%+.2f reason=%s",
-            pos.direction, ticker, pos.quantity, fill_price, pnl, reason,
+            pos.direction, ticker, pos.shares, fill_price, pnl, reason,
         )
 
         return OrderResult(
             order_id=order_id,
             ticker=ticker,
             direction=pos.direction,
-            quantity=pos.quantity,
+            quantity=pos.shares,
             fill_price=fill_price,
             status="filled",
         )
@@ -239,7 +239,7 @@ class PaperTradingEngine:
             for pos in self._positions.values()
         )
         nlv = self._cash + sum(
-            pos.entry_price * pos.quantity for pos in self._positions.values()
+            pos.entry_price * pos.shares for pos in self._positions.values()
         ) + unrealised
 
         self._peak_equity = max(self._peak_equity, nlv)
@@ -291,5 +291,5 @@ def _apply_slippage(price: float, direction: Direction, slippage_bps: float) -> 
 
 def _unrealised_pnl(pos: Position, current_price: float) -> float:
     if pos.direction == "LONG":
-        return (current_price - pos.entry_price) * pos.quantity
-    return (pos.entry_price - current_price) * pos.quantity
+        return (current_price - pos.entry_price) * pos.shares
+    return (pos.entry_price - current_price) * pos.shares

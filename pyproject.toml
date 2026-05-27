@@ -49,6 +49,7 @@ dev = [
     "mypy>=1.8.0",
     "types-redis>=4.6.0",
     "types-psycopg2>=2.9.0",
+    "honcho>=1.1.0",
 ]
 backtest = [
     "vectorbt>=0.26.0",

@@ -40,10 +40,18 @@ def query(sql: str, params: tuple | None = None) -> pd.DataFrame:
     """
     Execute *sql* and return results as a DataFrame.
     Returns an empty DataFrame on any database error.
+    Rolls back and reconnects automatically if the connection is in a broken
+    transaction state (e.g. after a failed query on a missing table).
     """
+    conn = get_connection()
     try:
-        conn = get_connection()
         return pd.read_sql(sql, conn, params=params)
     except Exception as exc:
+        # Roll back the broken transaction so the connection is reusable
+        try:
+            conn.rollback()
+        except Exception:
+            # Connection is dead — clear the cache so next call reconnects
+            get_connection.clear()
         st.warning(f"Database query failed: {exc}")
         return pd.DataFrame()

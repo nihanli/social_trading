@@ -147,7 +147,7 @@ async def test_trade_recorded_on_close(engine: PaperTradingEngine) -> None:
     await engine.submit_signal(make_signal(), quantity=10, stop_loss=90.0, take_profit=110.0)
     await engine.close_position("AAPL", reason="TIME_STOP")
     assert len(engine.trades) == 1
-    assert engine.trades[0]["reason"] == "TIME_STOP"
+    assert engine.trades[0]["exit_reason"] == "TIME_STOP"
     assert engine.trades[0]["ticker"] == "AAPL"
 
 
@@ -234,8 +234,8 @@ def test_apply_slippage_zero() -> None:
 
 def test_unrealised_pnl_long() -> None:
     pos = Position(
-        ticker="X", direction="LONG", quantity=10,
-        entry_price=100.0, entry_time=datetime.utcnow(),
+        ticker="X", direction="LONG", shares=10,
+        entry_price=100.0, opened_at=datetime.utcnow(),
         stop_loss=90.0, take_profit=110.0,
     )
     assert _unrealised_pnl(pos, 105.0) == pytest.approx(50.0)
@@ -243,8 +243,8 @@ def test_unrealised_pnl_long() -> None:
 
 def test_unrealised_pnl_short() -> None:
     pos = Position(
-        ticker="X", direction="SHORT", quantity=10,
-        entry_price=100.0, entry_time=datetime.utcnow(),
+        ticker="X", direction="SHORT", shares=10,
+        entry_price=100.0, opened_at=datetime.utcnow(),
         stop_loss=110.0, take_profit=90.0,
     )
     assert _unrealised_pnl(pos, 90.0) == pytest.approx(100.0)

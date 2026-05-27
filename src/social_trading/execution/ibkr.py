@@ -233,12 +233,12 @@ class IBKRExecutionEngine:
             positions.append(Position(
                 ticker=p.contract.symbol,
                 direction=direction,
-                quantity=abs(int(p.position)),
+                shares=abs(int(p.position)),
                 entry_price=entry_price,
-                entry_time=datetime.now(UTC),   # IBKR doesn't provide this directly
+                opened_at=datetime.now(UTC),   # IBKR doesn't provide this directly
                 stop_loss=0.0,
                 take_profit=0.0,
-                unrealised_pnl=float(p.unrealizedPNL or 0),
+                unrealized_pnl=float(p.unrealizedPNL or 0),
             ))
         return positions
 

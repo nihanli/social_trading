@@ -157,7 +157,7 @@ class PositionExitManager:
             )
 
         # ── 7. Hard time stop ─────────────────────────────────────────────────
-        hours_held = (now - position.entry_time.replace(tzinfo=UTC)).total_seconds() / 3600
+        hours_held = (now - position.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
         if hours_held >= cfg.max_hold_hours:
             return ExitDecision(
                 should_exit=True,
@@ -173,8 +173,8 @@ class PositionExitManager:
 def _unrealised_pnl(position: Position, current_price: float) -> float:
     """P&L before fees. Positive = profit."""
     if position.direction == "LONG":
-        return (current_price - position.entry_price) * position.quantity
-    return (position.entry_price - current_price) * position.quantity
+        return (current_price - position.entry_price) * position.shares
+    return (position.entry_price - current_price) * position.shares
 
 
 def _breaches_stop_loss(position: Position, current_price: float) -> bool:

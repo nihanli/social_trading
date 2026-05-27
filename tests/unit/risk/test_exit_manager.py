@@ -48,9 +48,9 @@ def make_long(
     return Position(
         ticker="AAPL",
         direction="LONG",
-        quantity=quantity,
+        shares=quantity,
         entry_price=entry_price,
-        entry_time=entry_time,
+        opened_at=entry_time,
         stop_loss=stop_loss,
         take_profit=take_profit,
         high_water_mark=hwm,
@@ -69,9 +69,9 @@ def make_short(
     return Position(
         ticker="AAPL",
         direction="SHORT",
-        quantity=quantity,
+        shares=quantity,
         entry_price=entry_price,
-        entry_time=entry_time,
+        opened_at=entry_time,
         stop_loss=stop_loss,
         take_profit=take_profit,
         high_water_mark=hwm,

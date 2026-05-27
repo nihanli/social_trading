@@ -131,7 +131,7 @@ class CircuitBreaker:
         ps = await self.load_state()
         cs = CircuitState(ps.state)
         now = datetime.now(UTC)
-        today = date.today().isoformat()
+        today = datetime.now(UTC).date().isoformat()
 
         # ── Auto-reset DAILY_HALT at start of new day ─────────────────────────
         if cs == CircuitState.DAILY_HALT and ps.halt_date != today:

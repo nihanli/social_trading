@@ -117,8 +117,9 @@ with col_left:
     st.subheader("Posts by Source")
     source_df = query(f"""
         SELECT source, COUNT(*) AS posts
-        FROM sentiment_results
-        WHERE classified_at > NOW() - INTERVAL '{hours} hours'
+        FROM sentiment_scores
+        JOIN social_raw ON sentiment_scores.post_id = social_raw.post_id
+        WHERE sentiment_scores.scored_at > NOW() - INTERVAL '{hours} hours'
         GROUP BY source
         ORDER BY posts DESC
     """)
@@ -139,13 +140,13 @@ with col_right:
     label_df = query(f"""
         SELECT
           CASE
-            WHEN score > 0.1  THEN 'Positive'
-            WHEN score < -0.1 THEN 'Negative'
+            WHEN (pos_prob - neg_prob) > 0.1  THEN 'Positive'
+            WHEN (pos_prob - neg_prob) < -0.1 THEN 'Negative'
             ELSE 'Neutral'
           END AS label,
           COUNT(*) AS count
-        FROM sentiment_results
-        WHERE classified_at > NOW() - INTERVAL '{hours} hours'
+        FROM sentiment_scores
+        WHERE scored_at > NOW() - INTERVAL '{hours} hours'
         GROUP BY 1
         ORDER BY count DESC
     """)

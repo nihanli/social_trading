@@ -166,9 +166,9 @@ def test_compute_social_exposure_exceeded(
     pos = Position(
         ticker="TSLA",
         direction="LONG",
-        quantity=200,
+        shares=200,
         entry_price=100.0,
-        entry_time=datetime.utcnow(),
+        opened_at=datetime.utcnow(),
         stop_loss=90.0,
         take_profit=110.0,
     )

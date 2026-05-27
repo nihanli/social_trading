@@ -31,13 +31,17 @@ services:
       timeout: 3s
       retries: 5
 
-  # ── Application Services ────────────────────────────────────────────────────
+  # ── Application Services (profile: services) ───────────────────────────────
+  # Run with: docker compose --profile services up -d
+  # For development, run these directly on the host instead (see docs/live-run-guide.md)
 
   ingest:
+    profiles: [services]
     build: .
     command: python -m social_trading.services.ingest_service
     env_file: .env
     environment:
+      REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "8000"
     ports:
       - "8001:8000"
@@ -47,10 +51,12 @@ services:
     restart: unless-stopped
 
   nlp:
+    profiles: [services]
     build: .
     command: python -m social_trading.services.nlp_service
     env_file: .env
     environment:
+      REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "8000"
     ports:
       - "8002:8000"
@@ -60,10 +66,12 @@ services:
     restart: unless-stopped
 
   signal:
+    profiles: [services]
     build: .
     command: python -m social_trading.services.signal_service
     env_file: .env
     environment:
+      REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "8000"
     ports:
       - "8003:8000"
@@ -73,10 +81,12 @@ services:
     restart: unless-stopped
 
   risk:
+    profiles: [services]
     build: .
     command: python -m social_trading.services.risk_service
     env_file: .env
     environment:
+      REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "8000"
     ports:
       - "8004:8000"
@@ -86,10 +96,12 @@ services:
     restart: unless-stopped
 
   execution:
+    profiles: [services]
     build: .
     command: python -m social_trading.services.execution_service
     env_file: .env
     environment:
+      REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "8000"
     ports:
       - "8005:8000"
@@ -100,9 +112,12 @@ services:
     restart: unless-stopped
 
   streamlit:
+    profiles: [services]
     build: .
     command: streamlit run src/social_trading/monitoring/streamlit/app.py --server.port 8501
     env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8501:8501"
     depends_on:

@@ -105,23 +105,23 @@ class OrderResult(BaseModel):
 
 @dataclass
 class Position:
-    """Currently open position."""
+    """Currently open position. Field names match the DB positions table."""
 
     ticker: str
     direction: Direction
-    quantity: int
+    shares: int               # DB: shares
     entry_price: float
-    entry_time: datetime
+    opened_at: datetime       # DB: opened_at
     stop_loss: float
     take_profit: float
-    unrealised_pnl: float = 0.0
-    high_water_mark: float = 0.0     # for trailing stop
+    unrealized_pnl: float = 0.0   # DB: unrealized_pnl
+    high_water_mark: float = 0.0  # for trailing stop
     signal_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def cost_basis(self) -> float:
-        return self.entry_price * self.quantity
+        return self.entry_price * self.shares
 
     def update_hwm(self, current_price: float) -> None:
         if self.direction == "LONG":
