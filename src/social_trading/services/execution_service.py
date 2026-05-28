@@ -45,6 +45,7 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import STREAM_SELECTED_SIGNALS
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
+from social_trading.market_data.composite import FallbackMarketData
 from social_trading.market_data.yfinance import YFinanceMarketData
 from social_trading.monitoring.metrics import (
     DAILY_PNL_PCT,
@@ -66,6 +67,9 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# Warning 10167 ("not subscribed, showing delayed data") is expected for paper
+# accounts; suppress ib_async wrapper noise to WARNING level.
+logging.getLogger("ib_async.wrapper").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _GROUP = "execution"
@@ -166,6 +170,7 @@ async def run_trade_loop(
     bus: TradingEventBus,
     engine: PaperTradingEngine,
     redis: aioredis.Redis,
+    market_data: YFinanceMarketData | None = None,
 ) -> None:
     """
     Consume selected_signals and submit to execution engine.
@@ -203,6 +208,17 @@ async def run_trade_loop(
                 skipped += 1
                 await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                 continue
+
+            # Ensure price is in cache; fetch on-demand if exit loop hasn't warmed it yet
+            if engine.get_price(signal.ticker) is None and market_data is not None:
+                try:
+                    quote = await market_data.get_quote(signal.ticker)
+                    last = quote.get("last", 0.0)
+                    if last > 0:
+                        engine.set_price(signal.ticker, last)
+                        logger.debug("On-demand price fetch for %s: %.4f", signal.ticker, last)
+                except Exception as exc:
+                    logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
 
             result = await engine.submit_signal(
                 signal=signal,
@@ -260,33 +276,49 @@ async def run_exit_loop(
     """
     logger.info("Execution exit loop started")
 
+    # Watchlist tickers are refreshed at most once every WATCHLIST_REFRESH_SECS
+    # to avoid hammering yfinance/DNS with hundreds of concurrent requests.
+    WATCHLIST_REFRESH_SECS = 300  # 5 minutes
+    _watchlist_last_refresh: dict[str, float] = {}
+
     while True:
         cfg = await SystemConfig.load(redis)
+
+        # Fetch VIX once per cycle (shared across all ticker snapshots)
+        vix = await market_data.get_vix()
+        await redis.set("market:vix", str(vix))
 
         # Refresh market data for all open tickers
         open_positions = await engine.get_positions()
         open_tickers = {p.ticker for p in open_positions}
 
-        # Also refresh watchlist tickers so risk/signal services have fresh data
+        # Also refresh watchlist tickers so risk/signal services have fresh data,
+        # but throttle to at most once every WATCHLIST_REFRESH_SECS per ticker.
         watchlist_raw = await redis.zrange("watchlist:active", 0, -1)
         watchlist_tickers = {
             (t.decode() if isinstance(t, bytes) else t) for t in watchlist_raw
         }
-        all_tickers = open_tickers | watchlist_tickers
+        now_ts = datetime.now(UTC).timestamp()
+        stale_watchlist = {
+            t for t in watchlist_tickers
+            if now_ts - _watchlist_last_refresh.get(t, 0) >= WATCHLIST_REFRESH_SECS
+        }
+        all_tickers = open_tickers | stale_watchlist
 
         for ticker in all_tickers:
             try:
                 snapshot = await _write_market_snapshot_and_get_price(
-                    redis, ticker, market_data
+                    redis, ticker, market_data, vix=vix
                 )
-                if snapshot is not None and ticker in open_tickers:
+                if snapshot is not None:
                     engine.set_price(ticker, snapshot)
+                if ticker in stale_watchlist:
+                    _watchlist_last_refresh[ticker] = now_ts
             except Exception as exc:
                 logger.debug("Price refresh failed for %s: %s", ticker, exc)
 
         # Re-fetch positions after price updates (HWM may have moved)
         open_positions = await engine.get_positions()
-        vix = await market_data.get_vix()
         now = datetime.now(UTC)
 
         for pos in open_positions:
@@ -319,9 +351,6 @@ async def run_exit_loop(
                 else (pos.entry_price - cur) * pos.shares
             POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
-        # Write VIX to a shared key (read by risk service)
-        await redis.set("market:vix", str(vix))
-
         await asyncio.sleep(cfg.signal_poll_interval_sec)
 
 
@@ -329,6 +358,7 @@ async def _write_market_snapshot_and_get_price(
     redis: aioredis.Redis,
     ticker: str,
     market_data: YFinanceMarketData,
+    vix: float = 20.0,
 ) -> float | None:
     """Fetch snapshot, write to Redis, return last price."""
     try:
@@ -337,7 +367,6 @@ async def _write_market_snapshot_and_get_price(
         if last > 0:
             atr = await market_data.get_atr(ticker)
             realised_vol = await market_data.get_realised_vol(ticker)
-            vix = await market_data.get_vix()
             adv_shares = quote.get("avg_volume_30d", 1_000_000.0)
             adv_usd = adv_shares * last
 
@@ -444,28 +473,34 @@ async def main(use_ibkr: bool = False) -> None:
             from ib_async import IB  # noqa: PLC0415
 
             from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
+            from social_trading.market_data.ibkr import IBKRMarketData  # noqa: PLC0415
             ib = IB()
             port = int(os.getenv("IBKR_PORT", "7497"))  # default paper
             client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
             await ib.connectAsync("127.0.0.1", port, clientId=client_id)
             engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib)  # type: ignore[assignment]
-            logger.info("Connected to IBKR port=%d clientId=%d", port, client_id)
+            # Use IB for real-time prices; yfinance as fallback for any gaps
+            market_data: YFinanceMarketData = FallbackMarketData(  # type: ignore[assignment]
+                primary=IBKRMarketData(ib=ib),
+                secondary=YFinanceMarketData(),
+            )
+            logger.info("Connected to IBKR port=%d clientId=%d (IB market data primary)", port, client_id)
         except Exception as exc:
             logger.error("IBKR connection failed: %s — falling back to paper mode", exc)
             engine = PaperTradingEngine(initial_cash=100_000.0)
+            market_data = YFinanceMarketData()
     else:
         initial_cash = float(os.getenv("PAPER_INITIAL_CASH", "100000"))
         engine = PaperTradingEngine(initial_cash=initial_cash)
+        market_data = YFinanceMarketData()
         logger.info("Paper trading mode — initial cash $%.2f", initial_cash)
-
-    market_data = YFinanceMarketData()
     exit_manager = PositionExitManager()
     breaker = CircuitBreaker(redis)
     bus = TradingEventBus(redis)
 
     tasks = [
         asyncio.create_task(
-            run_trade_loop(bus, engine, redis),
+            run_trade_loop(bus, engine, redis, market_data),
             name="exec:trade",
         ),
         asyncio.create_task(

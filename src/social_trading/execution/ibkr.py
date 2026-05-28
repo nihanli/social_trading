@@ -63,6 +63,21 @@ class IBKRExecutionEngine:
     ) -> None:
         self._ib = ib
         self._paper_prices = paper_prices or {}
+        self._prices: dict[str, float] = {}
+
+    # ── Price cache (mirrors PaperTradingEngine interface) ────────────────────
+
+    def set_price(self, ticker: str, price: float) -> None:
+        """Cache latest price for a ticker (called by exit loop)."""
+        self._prices[ticker] = price
+
+    def get_price(self, ticker: str) -> float | None:
+        return self._prices.get(ticker)
+
+    @property
+    def open_tickers(self) -> set[str]:
+        """Return set of tickers with open IBKR positions."""
+        return {p.contract.symbol for p in self._ib.positions() if p.position != 0}
 
     async def submit_signal(
         self,

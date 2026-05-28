@@ -138,6 +138,9 @@ class YFinanceMarketData:
             )
             if df is None or df.empty:
                 return []
+            # Newer yfinance returns MultiIndex columns (e.g. ('Close', 'MWC')); flatten them.
+            if hasattr(df.columns, "levels"):
+                df.columns = df.columns.droplevel(1)
             bars = []
             for ts, row in df.iterrows():
                 bars.append({
@@ -172,6 +175,9 @@ class YFinanceMarketData:
             )
             if df is None or len(df) < period:
                 return 0.0
+            # Newer yfinance returns MultiIndex columns; flatten them.
+            if hasattr(df.columns, "levels"):
+                df.columns = df.columns.droplevel(1)
 
             highs = df["High"].values
             lows = df["Low"].values
