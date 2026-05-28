@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from social_trading.monitoring.streamlit.utils.db import query
+from social_trading.monitoring.streamlit.utils.db import query, localize_datetimes
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
@@ -74,6 +74,7 @@ cum_pnl = query(f"""
     ORDER BY closed_at
 """)
 if not cum_pnl.empty:
+    localize_datetimes(cum_pnl)
     last_val = cum_pnl["cumulative_pnl"].iloc[-1]
     fig = go.Figure(go.Scatter(
         x=cum_pnl["time"],
@@ -101,6 +102,7 @@ daily_pnl = query(f"""
     ORDER BY 1
 """)
 if not daily_pnl.empty:
+    localize_datetimes(daily_pnl)
     fig2 = px.bar(
         daily_pnl,
         x="day",

@@ -27,7 +27,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from social_trading.monitoring.streamlit.utils.db import query
+from social_trading.monitoring.streamlit.utils.db import query, localize_datetimes
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
@@ -162,6 +162,7 @@ eq_hist = query("""
     ORDER BY timestamp
 """)
 if not eq_hist.empty:
+    localize_datetimes(eq_hist)
     fig = go.Figure(go.Scatter(
         x=eq_hist["timestamp"],
         y=eq_hist["equity"],
@@ -228,14 +229,19 @@ with col_right:
 # ═══════════════════════════════════════
 st.subheader("Sentiment Heatmap — Top Tickers (Last Hour)")
 heatmap_df = query("""
-    SELECT ticker,
-           SUM(post_count)     AS mentions,
-           AVG(weighted_score) AS avg_sentiment,
-           AVG(mention_zscore) AS vol_z
-    FROM sentiment_aggregates
-    WHERE window_start > NOW() - INTERVAL '1 hour'
-      AND window_minutes = 15
-    GROUP BY ticker
+    WITH agg AS (
+        SELECT ticker,
+               SUM(post_count)     AS mentions,
+               AVG(weighted_score) AS avg_sentiment
+        FROM sentiment_aggregates
+        WHERE window_start > NOW() - INTERVAL '1 hour'
+          AND window_minutes = 15
+        GROUP BY ticker
+    )
+    SELECT ticker, mentions, avg_sentiment,
+           (mentions - AVG(mentions) OVER ())
+               / NULLIF(STDDEV_SAMP(mentions) OVER (), 0) AS vol_z
+    FROM agg
     ORDER BY mentions DESC
     LIMIT 20
 """)
@@ -283,3 +289,11 @@ if not trades.empty:
     st.dataframe(trades, use_container_width=True, hide_index=True)
 else:
     st.info("No closed trades yet")
+
+# ═══════════════════════════════════════
+# FOOTNOTE — DB size
+# ═══════════════════════════════════════
+st.divider()
+db_size = query("SELECT ROUND(pg_database_size(current_database()) / 1024.0 / 1024.0, 2) AS size_mb")
+if not db_size.empty:
+    st.caption(f"🗄️ Database size: {db_size.iloc[0]['size_mb']:.2f} MB")

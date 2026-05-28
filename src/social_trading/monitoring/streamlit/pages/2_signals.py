@@ -17,7 +17,7 @@ import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from social_trading.monitoring.streamlit.utils.db import query
+from social_trading.monitoring.streamlit.utils.db import query, localize_datetimes
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
@@ -62,6 +62,7 @@ with col_right:
         ORDER BY 1
     """)
     if not signal_ts.empty:
+        localize_datetimes(signal_ts)
         fig2 = px.bar(
             signal_ts,
             x="hour",
@@ -114,7 +115,7 @@ full_signals = query(f"""
            ROUND(sentiment_score::numeric, 3) AS sentiment,
            ROUND(mention_zscore::numeric, 2)  AS vol_z,
            approved, executed,
-           generated_at
+           TO_CHAR(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS time
     FROM signals
     {where}
     ORDER BY generated_at DESC

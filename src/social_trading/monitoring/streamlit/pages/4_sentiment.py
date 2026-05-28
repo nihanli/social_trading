@@ -19,7 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from social_trading.monitoring.streamlit.utils.db import query
+from social_trading.monitoring.streamlit.utils.db import query, localize_datetimes
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
@@ -34,14 +34,19 @@ hours = st.slider("Look-back window (hours)", 1, 24, 4)
 
 # ── Top tickers heatmap ───────────────────────────────────────────────────────
 heatmap_df = query(f"""
-    SELECT ticker,
-           SUM(post_count)     AS mentions,
-           AVG(weighted_score) AS avg_sentiment,
-           AVG(mention_zscore) AS avg_vol_z
-    FROM sentiment_aggregates
-    WHERE window_start > NOW() - INTERVAL '{hours} hours'
-      AND window_minutes = 15
-    GROUP BY ticker
+    WITH agg AS (
+        SELECT ticker,
+               SUM(post_count)     AS mentions,
+               AVG(weighted_score) AS avg_sentiment
+        FROM sentiment_aggregates
+        WHERE window_start > NOW() - INTERVAL '{hours} hours'
+          AND window_minutes = 15
+        GROUP BY ticker
+    )
+    SELECT ticker, mentions, avg_sentiment,
+           (mentions - AVG(mentions) OVER ())
+               / NULLIF(STDDEV_SAMP(mentions) OVER (), 0) AS avg_vol_z
+    FROM agg
     ORDER BY mentions DESC
     LIMIT 25
 """)
@@ -102,6 +107,7 @@ if ticker_select:
         ORDER BY time
     """)
     if not timeline.empty:
+        localize_datetimes(timeline)
         fig2 = px.line(
             timeline,
             x="time",
