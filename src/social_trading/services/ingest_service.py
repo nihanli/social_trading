@@ -33,6 +33,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -97,10 +98,17 @@ async def run_poll_loop(
         # Discover trending tickers on this source
         await source.get_trending()
 
+        # Stamp the last discovery poll time so the UI countdown can show
+        # "next discovery in X seconds" relative to the real last run.
+        await redis.set("discovery:last_poll_ts", str(time.time()))
+
         # Poll active watchlist for social posts (no-op for discovery-only sources)
         tickers = await watchlist.get_active()
         if tickers:
             await source.poll(tickers)
+            # Stamp sentiment poll time for social sources so the UI countdown works.
+            if source.name in ("stocktwits", "bluesky", "twitter"):
+                await redis.set("sentiment:last_poll_ts", str(time.time()))
 
         interval_attr = _POLL_INTERVAL_ATTR.get(source.name, "discovery_poll_interval_sec")
         interval = getattr(cfg, interval_attr)
@@ -140,6 +148,10 @@ async def main() -> None:
 
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())
+
+    # Clear poll-time stamps so the UI countdown resets on every service restart.
+    await redis.delete("discovery:last_poll_ts", "sentiment:last_poll_ts")
+    logger.info("Countdown timestamps cleared (service restart)")
 
     watchlist = WatchlistManager(redis=redis, cfg=cfg)
     await watchlist.seed_from_config()

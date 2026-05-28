@@ -18,9 +18,13 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.db import query
+from social_trading.monitoring.streamlit.utils.refresh_countdown import (
+    sidebar_refresh_countdown,
+)
 
 st.set_page_config(page_title="Signal Feed", page_icon="⚡", layout="wide")
 st_autorefresh(interval=15_000, key="signals_refresh")
+sidebar_refresh_countdown()
 st.title("Signal Feed")
 
 # ── Quality distribution + volume timeline ────────────────────────────────────

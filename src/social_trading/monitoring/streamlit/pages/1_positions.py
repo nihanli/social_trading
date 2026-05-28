@@ -24,9 +24,13 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_position,
     get_system_state,
 )
+from social_trading.monitoring.streamlit.utils.refresh_countdown import (
+    sidebar_refresh_countdown,
+)
 
 st.set_page_config(page_title="Positions", page_icon="📂", layout="wide")
 st_autorefresh(interval=15_000, key="positions_refresh")
+sidebar_refresh_countdown()
 st.title("Open Positions")
 
 state = get_system_state()

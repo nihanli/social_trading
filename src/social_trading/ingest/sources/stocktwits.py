@@ -131,10 +131,10 @@ class StockTwitsDataSource(BaseDataSource):
         try:
             resp = await self._http.get(TRENDING_URL)
             self._handle_http_error(resp, "trending")
-            messages = resp.json().get("messages", [])
+            messages = resp.json().get("messages") or []
             tickers: list[str] = []
             for msg in messages:
-                for sym in msg.get("symbols", []):
+                for sym in (msg.get("symbols") or []):
                     ticker = sym.get("symbol", "").upper()
                     if ticker:
                         tickers.append(ticker)
@@ -185,20 +185,20 @@ class StockTwitsDataSource(BaseDataSource):
         data = resp.json()
 
         # Persist new cursor for next cycle
-        new_cursor = data.get("cursor", {}).get("since")
+        new_cursor = (data.get("cursor") or {}).get("since")
         if new_cursor:
             await self._redis.set(cursor_key, str(new_cursor), ex=86400)
 
-        messages = data.get("messages", [])
+        messages = data.get("messages") or []
         new_count = len(messages)   # delta since last cursor = volume signal
 
         posts: list[SocialPost] = []
         for msg in messages:
-            sentiment_label = (
-                msg.get("entities", {}).get("sentiment", {}).get("basic")
-            )  # "Bullish", "Bearish", or None
+            entities = msg.get("entities") or {}
+            sentiment_raw = entities.get("sentiment") or {}
+            sentiment_label = sentiment_raw.get("basic")  # "Bullish", "Bearish", or None
 
-            user = msg.get("user", {})
+            user = msg.get("user") or {}
             created_str = msg.get("created_at", "")
             try:
                 created_at = datetime.fromisoformat(
@@ -216,7 +216,7 @@ class StockTwitsDataSource(BaseDataSource):
                 author_followers=user.get("followers", 0),
                 author_following=user.get("following", 0),
                 author_account_age_days=0,  # not available in API
-                likes=msg.get("likes", {}).get("total", 0),
+                likes=(msg.get("likes") or {}).get("total", 0),
                 reposts=0,
                 is_original=True,
                 collected_at=datetime.now(timezone.utc),

@@ -35,6 +35,9 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     halt_new_trades,
     resume_trading,
 )
+from social_trading.monitoring.streamlit.utils.refresh_countdown import (
+    sidebar_refresh_countdown,
+)
 
 st.set_page_config(
     page_title="Social Trading Monitor",
@@ -49,6 +52,8 @@ st_autorefresh(interval=15_000, key="main_dashboard_refresh")
 # ═══════════════════════════════════════
 # SIDEBAR — System Controls
 # ═══════════════════════════════════════
+sidebar_refresh_countdown()
+
 with st.sidebar:
     st.title("System Controls")
 
