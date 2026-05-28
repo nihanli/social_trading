@@ -98,3 +98,16 @@ ALL_STREAMS = [
     STREAM_STRATEGY_SIGNALS,
     STREAM_SELECTED_SIGNALS,
 ]
+
+# Maximum entries to retain per stream (approximate trim — Redis `MAXLEN ~`).
+# Sized to cover several hours of consumer lag at peak ingest rates.
+#   raw_social / sentiment_signals: ~35K posts/hr from Bluesky → 250K ≈ 7 hours
+#   strategy_signals: one evaluation/ticker/minute, ~300 tickers → 25K ≈ 1.4 hrs
+#   selected_signals: risk-filtered subset → 10K
+STREAM_MAXLEN: dict[str, int] = {
+    STREAM_RAW_SOCIAL:        250_000,
+    STREAM_SENTIMENT:         250_000,
+    STREAM_MARKET_DATA:        50_000,
+    STREAM_STRATEGY_SIGNALS:   25_000,
+    STREAM_SELECTED_SIGNALS:   10_000,
+}

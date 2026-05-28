@@ -30,7 +30,7 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_RAW_SOCIAL, STREAM_SENTIMENT
+from social_trading.core.events import STREAM_RAW_SOCIAL, STREAM_SENTIMENT, STREAM_MAXLEN
 from social_trading.core.models import SentimentResult, SocialPost
 from social_trading.monitoring.metrics import (
     POSTS_CLASSIFIED,
@@ -148,7 +148,8 @@ async def run_nlp_service(
         if posts:
             results = await pipeline.process_batch(posts)
             for result in results:
-                await redis.xadd(STREAM_SENTIMENT, _result_to_stream_dict(result))
+                await redis.xadd(STREAM_SENTIMENT, _result_to_stream_dict(result),
+                                 maxlen=STREAM_MAXLEN.get(STREAM_SENTIMENT), approximate=True)
                 SENTIMENT_LATENCY.observe(result.latency_ms)
                 label = "positive" if result.score > 0 else "negative" if result.score < 0 else "neutral"
                 POSTS_CLASSIFIED.labels(model=result.model, label=label).inc()

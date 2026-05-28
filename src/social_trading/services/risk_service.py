@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import (
+    STREAM_MAXLEN,
     STREAM_SELECTED_SIGNALS,
     STREAM_STRATEGY_SIGNALS,
 )
@@ -296,7 +297,8 @@ async def run_risk_service(
                 stream_dict = _approved_signal_to_stream_dict(
                     signal, shares, stop_loss, take_profit
                 )
-                await redis.xadd(STREAM_SELECTED_SIGNALS, stream_dict)
+                await redis.xadd(STREAM_SELECTED_SIGNALS, stream_dict,
+                                 maxlen=STREAM_MAXLEN.get(STREAM_SELECTED_SIGNALS), approximate=True)
                 approved_total += 1
                 SIGNALS_APPROVED.labels(ticker=signal.ticker, direction=signal.direction).inc()
                 logger.info(

@@ -31,7 +31,7 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_SENTIMENT, STREAM_STRATEGY_SIGNALS
+from social_trading.core.events import STREAM_SENTIMENT, STREAM_STRATEGY_SIGNALS, STREAM_MAXLEN
 from social_trading.core.models import SentimentResult, Signal
 from social_trading.ingest.watchlist.manager import WatchlistManager
 from social_trading.monitoring.metrics import (
@@ -170,7 +170,8 @@ async def run_evaluate_task(
 
         if batch_signals:
             for sig in batch_signals:
-                await redis.xadd(STREAM_STRATEGY_SIGNALS, _signal_to_stream_dict(sig))
+                await redis.xadd(STREAM_STRATEGY_SIGNALS, _signal_to_stream_dict(sig),
+                                 maxlen=STREAM_MAXLEN.get(STREAM_STRATEGY_SIGNALS), approximate=True)
             signals_generated += len(batch_signals)
             logger.info(
                 "signals: generated=%d this_cycle=%d tickers_scanned=%d",

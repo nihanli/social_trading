@@ -104,6 +104,108 @@ def is_signal_expired(hours_since_detection: float, cfg: SystemConfig = None) ->
 
 ---
 
+### 5d. Quality Score — Implementation Reference
+
+The `SignalGenerator` class (`src/social_trading/signals/generator.py`) implements the
+quality formula from §5b with the following exact computation and default weights.
+
+#### Formula
+
+```
+quality = (w_volume × v  +  w_sentiment × s  +  w_proactivity × p
+           +  w_momentum × m  +  w_convergence × c)
+          ÷ sum_of_active_weights
+```
+
+The raw weighted sum is **normalised by the sum of active weights** so that factors that
+are unavailable (e.g. `price_momentum = 0.0` before the market-data service is live) do
+not permanently lower the score ceiling.  A signal fires when:
+
+- `quality ≥ signal_quality_threshold` (default **0.50**)
+- `|mean_sentiment| ≥ sentiment_strength_min` (default **0.30**)
+- If market data is available: price direction must not strongly contradict sentiment
+
+#### The 5 Factors
+
+| Factor | Weight | Symbol | Range | Description |
+|--------|--------|--------|-------|-------------|
+| Volume Z-score | **0.30** | `v` | 0–1 | Abnormality of current mention volume vs 7-day baseline |
+| Sentiment strength | **0.25** | `s` | 0–1 | Magnitude of mean NLP sentiment score across the window |
+| Proactivity | **0.20** | `p` | 0 or 1 | Whether chatter **led** the price move (1) or merely reacted (0) |
+| Price momentum | **0.15** | `m` | 0–1 | Price movement confirming the direction |
+| Convergence | **0.10** | `c` | 0–0.20 | Cross-platform agreement, scaled by `convergence_bonus` cap |
+
+**`v` — Volume Z-score** (weight 0.30, highest)
+```
+v = min(mention_zscore / 3.0, 1.0)
+```
+The rolling mention count for the ticker is compared against its 7-day hourly baseline
+(mean ± std).  A Z-score ≥ 3.0 scores a full `1.0`.  Captures *unusual* activity, not
+just high absolute volume.
+
+**`s` — Sentiment Strength** (weight 0.25)
+```
+s = min(|mean_score|, 1.0)
+```
+The NLP model assigns each post a signed score in `[−1, 1]`.  The window mean is taken
+across all posts; its absolute value is `s`.  The sign determines direction (LONG/SHORT);
+the magnitude is the quality contribution.
+
+**`p` — Proactivity** (weight 0.20)
+```
+p = 0.0 if is_reactive else 1.0
+```
+If the price moved significantly *before* the mention spike, the social activity is
+likely noise (the crowd reacting to price, not leading it).  The `is_reactive` flag is
+set by comparing price returns in the hours preceding vs following the spike.
+Currently `1.0` until the market-data service (Phase 5) is live.
+
+**`m` — Price Momentum** (weight 0.15)
+```
+m = min(|price_change| / 0.10, 1.0)
+```
+Confirms that price is already moving in the same direction as sentiment.  A 10% move
+scores a full `1.0`.  When `price_momentum = 0.0` (no market data), this factor is
+excluded from the denominator of the normalisation so the score ceiling is not lowered.
+Currently `0.0` until the market-data service (Phase 5) is live.
+
+**`c` — Convergence** (weight 0.10, lowest)
+```
+c = (agreeing_platforms / total_platforms) × convergence_bonus
+```
+Counts how many social platforms agree on the signal direction, scaled by
+`convergence_bonus` (default **0.20**).  Maximum possible value is `0.20` (all platforms
+agree).  With a single active source (e.g. only Bluesky), the single source always
+"agrees" with itself → `c = 1.0 × 0.20 = 0.20`.
+
+#### Effective Score Ceiling
+
+Without price momentum (Phase 5 not yet live), the normalisation denominator is `0.85`
+(excludes `w_momentum = 0.15`).  Maximum possible quality in this state:
+
+```
+max_quality = (0.30×1.0 + 0.25×1.0 + 0.20×1.0 + 0.10×0.20) / 0.85 ≈ 0.906
+```
+
+With multiple active platforms adding convergence and a volume spike, typical signals
+score in the **0.50–0.65** range.  Enabling Phase 5 market data raises the ceiling
+toward `1.0` by contributing the `w_momentum = 0.15` term.
+
+#### Configuration (all tunable via UI → Config page)
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `signal_quality_threshold` | 0.50 | Minimum quality to fire a signal |
+| `sentiment_strength_min` | 0.30 | Minimum \|mean_score\| for LONG/SHORT direction |
+| `convergence_bonus` | 0.20 | Cap on the convergence factor `c` |
+| `w_volume` | 0.30 | Weight for mention volume Z-score |
+| `w_sentiment` | 0.25 | Weight for sentiment strength |
+| `w_proactivity` | 0.20 | Weight for proactivity flag |
+| `w_momentum` | 0.15 | Weight for price momentum |
+| `w_convergence` | 0.10 | Weight for cross-platform convergence |
+
+---
+
 ---
 
 *[⬆ Back to main index](README.md)*

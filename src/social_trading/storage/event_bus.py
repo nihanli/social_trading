@@ -19,7 +19,7 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
-logger = logging.getLogger(__name__)
+from social_trading.core.events import STREAM_MAXLEN
 
 
 class TradingEventBus:
@@ -32,10 +32,15 @@ class TradingEventBus:
         """
         Append event to stream.
         All values are coerced to str (Redis Streams requirement).
+        Applies approximate MAXLEN trimming to keep stream size bounded.
         Returns the message ID assigned by Redis.
         """
         str_event = {k: str(v) for k, v in event.items()}
-        msg_id: bytes = await self._redis.xadd(stream, str_event)  # type: ignore[assignment]
+        maxlen = STREAM_MAXLEN.get(stream)
+        msg_id: bytes = await self._redis.xadd(  # type: ignore[assignment]
+            stream, str_event,
+            maxlen=maxlen, approximate=True,
+        )
         return msg_id.decode() if isinstance(msg_id, bytes) else msg_id
 
     async def consume(

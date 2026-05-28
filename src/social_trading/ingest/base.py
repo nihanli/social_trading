@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 import redis.asyncio as aioredis
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_RAW_SOCIAL
+from social_trading.core.events import STREAM_RAW_SOCIAL, STREAM_MAXLEN
 from social_trading.core.exceptions import RateLimitError
 from social_trading.core.models import SocialPost
 
@@ -99,16 +99,18 @@ class BaseDataSource(ABC):
     async def _publish(self, post: SocialPost) -> str:
         """Publish a normalised SocialPost to the raw_social Redis Stream."""
         payload = _post_to_stream_dict(post)
-        msg_id: bytes = await self._redis.xadd(STREAM_RAW_SOCIAL, payload)
+        maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
+        msg_id: bytes = await self._redis.xadd(STREAM_RAW_SOCIAL, payload, maxlen=maxlen, approximate=True)
         return msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
 
     async def _publish_batch(self, posts: list[SocialPost]) -> int:
         """Publish multiple posts in one pipeline. Returns count published."""
         if not posts:
             return 0
+        maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
         async with self._redis.pipeline(transaction=False) as pipe:
             for post in posts:
-                pipe.xadd(STREAM_RAW_SOCIAL, _post_to_stream_dict(post))
+                pipe.xadd(STREAM_RAW_SOCIAL, _post_to_stream_dict(post), maxlen=maxlen, approximate=True)
             await pipe.execute()
         logger.debug("%s published %d posts", self.name, len(posts))
         return len(posts)
