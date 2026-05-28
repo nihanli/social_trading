@@ -4,12 +4,15 @@ StockTwitsDataSource — Finance-native discovery + directional sentiment.
 StockTwits serves two roles (see docs/design/03-data-sources.md §3d):
   1. Discovery: /streams/trending.json reveals tickers the finance community is
      talking about right now → proposed to WatchlistManager every 5 minutes.
-  2. Directional signal: users explicitly tag posts as Bullish/Bearish.
-     This bypasses NLP entirely and provides a clean directional label.
+  2. Spike detection + content: cursor-based message counting provides a
+     zero-cost replacement for the X Counts API (Tier 1). Post text and the
+     native Bullish/Bearish sentiment labels feed the NLP pipeline (Tier 2)
+     from the same response — no extra API call required on spike.
 
-Both endpoints are free tier with ~200 requests/hour limit.
-Polling 25 tickers every 6 minutes = 250 req/hr — slightly over free limit.
-Rate limiting ensures we stay safely within 200 req/hr.
+All endpoints are public and work without authentication.
+Rate limit: ~200 requests/hour (unauthenticated, community-reported).
+Polling 25 tickers every 6 minutes = 250 req/hr — stay conservative with
+MIN_REQUEST_INTERVAL to avoid hitting the limit.
 
 is_streaming = False — driven by the ingest service poll loop.
 """
@@ -41,14 +44,24 @@ SYMBOL_URL = f"{STOCKTWITS_BASE}/streams/symbol/{{symbol}}.json"
 # StockTwits free tier: ~200 requests/hour → 1 request every 18 seconds minimum
 MIN_REQUEST_INTERVAL = 2.0   # seconds between requests (conservative)
 
+# Redis key for last-seen cursor per ticker (used for delta-based spike counting)
+_CURSOR_KEY = "stocktwits:cursor:{ticker}"
+
 
 class StockTwitsDataSource(BaseDataSource):
     """
-    Polling StockTwits data source.
+    Polling StockTwits data source — no authentication required.
 
     Poll cycle (driven by ingest service):
       1. get_trending() → proposes tickers to watchlist
-      2. poll(tickers) → fetches labelled messages per ticker → raw_social stream
+      2. poll(tickers) → fetches labelled messages per ticker, runs spike
+         detection, publishes posts to raw_social stream.
+
+    Spike detection mirrors the X Counts approach:
+      - Count new messages since last cursor each cycle
+      - Maintain 7-day rolling history in Redis (mention_history:{ticker})
+      - Fire on Z-score ≥ cfg.spike_zscore_threshold
+      - Posts are already in the response → zero additional API calls
     """
 
     def __init__(
@@ -79,15 +92,25 @@ class StockTwitsDataSource(BaseDataSource):
 
     async def poll(self, tickers: list[str]) -> list[SocialPost]:
         """
-        Fetch the 30 most recent labelled messages for each ticker.
-        Publishes to raw_social stream and returns posts.
-        Respects rate limiting with MIN_REQUEST_INTERVAL between requests.
+        Fetch recent labelled messages for each ticker.
+        Runs spike detection via cursor-based delta counting.
+        Publishes posts to raw_social stream and returns them.
         """
         all_posts: list[SocialPost] = []
         for ticker in tickers:
             try:
-                posts = await self._fetch_symbol_messages(ticker)
-                all_posts.extend(posts)
+                posts, new_count = await self._fetch_symbol_messages(ticker)
+                is_spike = await self._check_spike(ticker, new_count)
+                if is_spike:
+                    logger.info(
+                        "stocktwits spike: %s new_msgs=%d — publishing %d posts",
+                        ticker, new_count, len(posts),
+                    )
+                    all_posts.extend(posts)
+                elif posts:
+                    # Always publish a sample even without spike (feeds NLP baseline)
+                    await self._publish_batch(posts[:5])
+                    all_posts.extend(posts[:5])
                 await self._watchlist.touch(ticker)
                 self._reset_errors()
             except RateLimitError as exc:
@@ -116,7 +139,7 @@ class StockTwitsDataSource(BaseDataSource):
                     if ticker:
                         tickers.append(ticker)
                         await self._watchlist.propose(ticker, source="stocktwits_trending")
-            logger.debug("StockTwits trending: %d tickers discovered", len(tickers))
+            logger.info("stocktwits trending: %d tickers discovered", len(tickers))
             self._reset_errors()
             return list(set(tickers))
         except RateLimitError:
@@ -135,19 +158,41 @@ class StockTwitsDataSource(BaseDataSource):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    async def _fetch_symbol_messages(self, ticker: str) -> list[SocialPost]:
+    async def _fetch_symbol_messages(
+        self, ticker: str
+    ) -> tuple[list[SocialPost], int]:
         """
-        GET /streams/symbol/{symbol}.json — free endpoint.
-        Retrieves up to 30 most recent messages with native Bullish/Bearish labels.
+        GET /streams/symbol/{symbol}.json — public endpoint, no auth required.
+        Returns (posts, new_message_count).
+
+        new_message_count is the number of messages published since the last
+        cursor, used as the spike-detection volume signal.
         """
         await self._rate_limit()
+
+        # Retrieve last-seen cursor from Redis
+        cursor_key = _CURSOR_KEY.format(ticker=ticker)
+        last_cursor_raw = await self._redis.get(cursor_key)
+        last_cursor = int(last_cursor_raw) if last_cursor_raw else None
+
         url = SYMBOL_URL.format(symbol=ticker)
-        resp = await self._http.get(url, params={"limit": 30})
+        params: dict = {"limit": 30}
+        if last_cursor:
+            params["since"] = last_cursor
+
+        resp = await self._http.get(url, params=params)
         self._handle_http_error(resp, f"symbol/{ticker}")
+        data = resp.json()
 
-        messages = resp.json().get("messages", [])
+        # Persist new cursor for next cycle
+        new_cursor = data.get("cursor", {}).get("since")
+        if new_cursor:
+            await self._redis.set(cursor_key, str(new_cursor), ex=86400)
+
+        messages = data.get("messages", [])
+        new_count = len(messages)   # delta since last cursor = volume signal
+
         posts: list[SocialPost] = []
-
         for msg in messages:
             sentiment_label = (
                 msg.get("entities", {}).get("sentiment", {}).get("basic")
@@ -184,10 +229,9 @@ class StockTwitsDataSource(BaseDataSource):
             posts.append(post)
 
         if posts:
-            await self._publish_batch(posts)
-            logger.debug("StockTwits: %d posts for %s", len(posts), ticker)
+            logger.debug("StockTwits: %d new posts for %s", len(posts), ticker)
 
-        return posts
+        return posts, new_count
 
     async def _rate_limit(self) -> None:
         """Ensure at least MIN_REQUEST_INTERVAL seconds between API requests."""

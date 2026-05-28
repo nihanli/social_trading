@@ -3,7 +3,7 @@ Ingest Service — entry point for Phase 1.
 
 Wires up all registered data sources and runs them concurrently:
   - Streaming sources (Reddit): run as persistent async tasks
-  - Polling sources (Twitter, StockTwits): run in timed loops
+  - Polling sources (StockTwits, Bluesky): run in timed loops
   - Discovery sources (YFinance, AlphaVantage, IBKR): run in timed loops
   - Watchlist: runs promote_candidates + expire_stale periodically
 
@@ -12,15 +12,19 @@ Run:
 
 Environment variables (from .env):
     REDIS_URL             redis://localhost:6379/0
-    X_BEARER_TOKEN        X API v2 bearer token
-    REDDIT_CLIENT_ID      PRAW client ID
+    BLUESKY_HANDLE        Bluesky handle, e.g. "you.bsky.social" (free account)
+    BLUESKY_APP_PASSWORD  App password from bsky.app → Settings → App Passwords
+    REDDIT_CLIENT_ID      PRAW client ID (optional — Reddit works without auth too)
     REDDIT_CLIENT_SECRET  PRAW client secret
     REDDIT_USER_AGENT     PRAW user agent string
-    STOCKTWITS_TOKEN      StockTwits OAuth token (optional — API closed to new accounts)
     ALPHA_VANTAGE_API_KEY Alpha Vantage free API key (optional)
     IBKR_HOST             TWS/Gateway host (default: 127.0.0.1)
     IBKR_SCANNER_PORT     TWS/Gateway port for scanner (default: 7497)
     IBKR_SCANNER_CLIENT_ID Client ID for scanner, must differ from execution (default: 99)
+
+    X_BEARER_TOKEN        X API bearer token — ONLY used when x_api_enabled=True
+                          in SystemConfig. X API now charges $0.005/request;
+                          50 tickers × 288 polls/day ≈ $72/day. Disabled by default.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.ingest.base import BaseDataSource
 from social_trading.ingest.registry import DataSourceRegistry
 from social_trading.ingest.sources.alpha_vantage import AlphaVantageDataSource
+from social_trading.ingest.sources.bluesky import BlueskyDataSource
 from social_trading.ingest.sources.ibkr_scanner import IBKRScannerDataSource
 from social_trading.ingest.sources.reddit import RedditDataSource
 from social_trading.ingest.sources.stocktwits import StockTwitsDataSource
@@ -61,6 +66,7 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_ATTR: dict[str, str] = {
     "twitter":       "counts_poll_interval_sec",
     "stocktwits":    "stocktwits_poll_interval_sec",
+    "bluesky":       "stocktwits_poll_interval_sec",   # same cadence as stocktwits
     "yfinance":      "discovery_poll_interval_sec",
     "alpha_vantage": "discovery_poll_interval_sec",
     "ibkr":          "discovery_poll_interval_sec",
@@ -142,20 +148,40 @@ async def main() -> None:
 
     # ── Social sources (produce SocialPost objects) ───────────────────────────
 
-    if os.getenv("X_BEARER_TOKEN"):
+    # X / Twitter — DISABLED BY DEFAULT (pay-per-use: ~$0.005/request).
+    # Enable via x_api_enabled=True in SystemConfig (Config UI → X API section).
+    if os.getenv("X_BEARER_TOKEN") and cfg.x_api_enabled:
         registry.register(TwitterDataSource(redis=redis, cfg=cfg))
-    else:
-        logger.warning("X_BEARER_TOKEN not set — Twitter source disabled")
+        logger.warning(
+            "X API enabled — cost ~$%.2f/day for %d tickers at %ds interval",
+            len(cfg.seed_tickers) * (86400 / cfg.counts_poll_interval_sec) * 0.005,
+            len(cfg.seed_tickers),
+            cfg.counts_poll_interval_sec,
+        )
+    elif os.getenv("X_BEARER_TOKEN") and not cfg.x_api_enabled:
+        logger.warning(
+            "X_BEARER_TOKEN set but x_api_enabled=False — X API is disabled to prevent "
+            "surprise billing ($0.005/request). Enable via Config UI → X API section."
+        )
 
+    # Reddit — PRAW streaming (requires REDDIT_CLIENT_ID)
     if os.getenv("REDDIT_CLIENT_ID"):
         registry.register(RedditDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
     else:
         logger.warning("REDDIT_CLIENT_ID not set — Reddit source disabled")
 
-    if os.getenv("STOCKTWITS_TOKEN"):
-        registry.register(StockTwitsDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+    # StockTwits — no authentication required; public endpoints always available
+    registry.register(StockTwitsDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+    logger.info("StockTwits source enabled (unauthenticated public API)")
+
+    # Bluesky — free AT Protocol API; requires bsky.app account + app password
+    if os.getenv("BLUESKY_HANDLE") and os.getenv("BLUESKY_APP_PASSWORD"):
+        registry.register(BlueskyDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
     else:
-        logger.warning("STOCKTWITS_TOKEN not set — StockTwits source disabled")
+        logger.warning(
+            "BLUESKY_HANDLE / BLUESKY_APP_PASSWORD not set — Bluesky source disabled. "
+            "Create a free account at bsky.app and set an App Password."
+        )
 
     # ── Discovery sources (trending ticker candidates only) ───────────────────
 
@@ -216,3 +242,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
+

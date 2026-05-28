@@ -8,8 +8,8 @@ Changes are written to Redis and picked up by all services within one loop cycle
 Sections:
   1. Watchlist management (active tickers, pin/unpin)
   2. Discovery & spike detection thresholds
-     2a. X (Twitter) spike detection
-     2b. Trending ticker sources (yfinance, Alpha Vantage, IBKR scanner)
+     2b. Trending ticker sources (yfinance, Alpha Vantage, IBKR, StockTwits, Bluesky)
+     X API opt-in (disabled by default — pay-per-use)
   3. Signal quality (threshold + factor weights)
   4. Position sizing
   5. Exit rules
@@ -88,12 +88,15 @@ with col1:
         "Mention count window (min)", 15, 240, int(cfg.mention_window_minutes), 15,
     )
 with col2:
-    cfg.x_search_max_results = st.slider(
-        "X posts pulled per spike", 10, 100, int(cfg.x_search_max_results), 10,
-        help=f"API cost ≈ ${cfg.x_search_max_results * 0.005:.2f} per spike.",
+    cfg.bluesky_search_count = st.slider(
+        "Bluesky posts per search", 10, 100, int(cfg.bluesky_search_count), 5,
+        help="Posts fetched per ticker per Bluesky search call. Free — no cost per request.",
     )
-    cfg.counts_poll_interval_sec = st.select_slider(
-        "X Counts poll interval (sec)", [60, 120, 300, 600], int(cfg.counts_poll_interval_sec),
+    cfg.stocktwits_poll_interval_sec = st.select_slider(
+        "StockTwits/Bluesky poll interval (sec)",
+        options=[60, 120, 300, 600],
+        value=min([60, 120, 300, 600], key=lambda x: abs(x - int(cfg.stocktwits_poll_interval_sec))),
+        help="How often StockTwits and Bluesky run their mention-count spike detection cycle.",
     )
 with col3:
     cfg.watchlist_stale_hours = st.number_input(
@@ -111,8 +114,8 @@ st.divider()
 # ═══════════════════════════════════════════════════════════════
 st.subheader("2b. Trending Ticker Sources")
 st.caption(
-    "Controls for the three supplementary discovery sources that replace StockTwits. "
-    "Discovered tickers are proposed to the watchlist and subject to the liquidity gate."
+    "Discovery sources propose new watchlist candidates. StockTwits also provides "
+    "spike detection at zero cost — it replaces the expensive X Counts API."
 )
 
 cfg.discovery_poll_interval_sec = st.select_slider(
@@ -158,6 +161,34 @@ st.info(
     "`.env` — set `IBKR_SCANNER_PORT` and `IBKR_SCANNER_CLIENT_ID` there.",
     icon="ℹ️",
 )
+
+# X API opt-in — disabled by default to prevent surprise billing
+with st.expander("⚠️  X (Twitter) API — disabled by default"):
+    st.warning(
+        "X API is now **pay-per-use** with no free tier. Enabling this with 50 tickers "
+        "at 5-min intervals costs approximately **$72/day** ($2,160/month) for Counts "
+        "alone. StockTwits + Bluesky provide equivalent spike detection at zero cost."
+    )
+    cfg.x_api_enabled = st.toggle(
+        "Enable X API (requires X_BEARER_TOKEN in .env)",
+        value=bool(cfg.x_api_enabled),
+        help="Only enable if you have a paid X API plan and have set X_BEARER_TOKEN.",
+    )
+    if cfg.x_api_enabled:
+        col_xa, col_xb = st.columns(2)
+        with col_xa:
+            cfg.x_search_max_results = st.slider(
+                "X posts pulled per spike", 10, 100, int(cfg.x_search_max_results), 10,
+                help=f"API cost ≈ ${cfg.x_search_max_results * 0.005:.2f} per spike.",
+                key="x_max_results",
+            )
+        with col_xb:
+            cfg.counts_poll_interval_sec = st.select_slider(
+                "X Counts poll interval (sec)",
+                options=[60, 120, 300, 600],
+                value=min([60, 120, 300, 600], key=lambda x: abs(x - int(cfg.counts_poll_interval_sec))),
+                key="x_poll_interval",
+            )
 
 st.divider()
 # ═══════════════════════════════════════════════════════════════

@@ -30,6 +30,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Redis key pattern for mention-volume history used by spike detection
+MENTION_HISTORY_KEY = "mention_history:{ticker}"
+MENTION_HISTORY_LEN = 168   # 7 days × 24 hourly samples
+
 # Maximum backoff between retries (seconds)
 _MAX_BACKOFF = 300
 
@@ -140,6 +144,43 @@ class BaseDataSource(ABC):
         if self._consecutive_errors > 0:
             logger.info("%s recovered after %d errors", self.name, self._consecutive_errors)
         self._consecutive_errors = 0
+
+    # ── Spike detection (shared Z-score logic) ───────────────────────────────
+
+    async def _check_spike(self, ticker: str, count: int) -> bool:
+        """
+        Z-score spike detector shared by all volume-counting sources.
+
+        Appends *count* to the rolling 7-day history stored at
+        ``mention_history:{ticker}`` and returns True when the current
+        count's Z-score exceeds ``cfg.spike_zscore_threshold``.
+
+        At least 24 samples are required before detection activates so a
+        flat baseline can be established first.
+        """
+        import numpy as np
+
+        key = MENTION_HISTORY_KEY.format(ticker=ticker)
+        raw_history = await self._redis.lrange(key, 0, -1)
+        history = [float(x) for x in raw_history]
+
+        await self._redis.rpush(key, count)
+        await self._redis.ltrim(key, -MENTION_HISTORY_LEN, -1)
+
+        if len(history) < 24:
+            return False
+
+        mean = float(np.mean(history))
+        raw_std = float(np.std(history))
+        std = max(raw_std, mean * 0.10, 1.0)
+        zscore = (count - mean) / std
+
+        logger.debug(
+            "%s %s count=%d mean=%.1f std=%.1f zscore=%.2f threshold=%.1f",
+            self.name, ticker, count, mean, std, zscore,
+            self._cfg.spike_zscore_threshold,
+        )
+        return zscore >= self._cfg.spike_zscore_threshold
 
     # ── Config reload ─────────────────────────────────────────────────────────
 

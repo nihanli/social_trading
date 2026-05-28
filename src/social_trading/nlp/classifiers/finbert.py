@@ -108,14 +108,21 @@ class FinBERTClassifier:
     def _get_pipeline(self) -> Any:
         """
         Return the pipeline callable, loading the real model if not injected.
-        Raises ImportError with helpful message if torch/transformers missing.
+
+        Uses explicit BertForSequenceClassification + BertTokenizer to bypass
+        AutoConfig.from_pretrained(), which fails on yiyanghkust/finbert-tone
+        with newer transformers versions (model config lacks 'model_type' key).
         """
         if self._pipeline_fn is not None:
             return self._pipeline_fn
 
         try:
             import torch  # noqa: PLC0415
-            from transformers import pipeline  # noqa: PLC0415
+            from transformers import (  # noqa: PLC0415
+                BertForSequenceClassification,
+                BertTokenizer,
+                pipeline,
+            )
         except ImportError as exc:
             raise ImportError(
                 "FinBERTClassifier requires torch and transformers. "
@@ -129,9 +136,13 @@ class FinBERTClassifier:
             "GPU" if device == 0 else "CPU",
         )
 
+        tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
+        model = BertForSequenceClassification.from_pretrained(MODEL_ID)
+
         self._pipeline_fn = pipeline(
             "text-classification",
-            model=MODEL_ID,
+            model=model,
+            tokenizer=tokenizer,
             top_k=None,           # return all 3 label scores
             device=device,
             truncation=True,

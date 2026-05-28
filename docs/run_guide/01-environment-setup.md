@@ -39,19 +39,35 @@ pip install -e ".[dev]"
 You only need the APIs you intend to use. The system runs with any combination —
 a missing key simply disables that source (logged as a warning, no crash).
 
-#### X (Twitter) API — $100/month Basic tier required
+#### StockTwits — Free, no account required ✅
 
-1. Go to https://developer.twitter.com/en/portal/dashboard
-2. Create a project → create an app inside it → choose **Production** environment
-3. Under **Keys and Tokens**, generate:
-   - `Bearer Token` → `X_BEARER_TOKEN`
-   - `API Key & Secret` → `X_API_KEY` / `X_API_SECRET`
-   - `Access Token & Secret` → `X_ACCESS_TOKEN` / `X_ACCESS_SECRET`
-4. Confirm `Basic` tier (or higher) is active
+`StockTwitsDataSource` uses StockTwits' **public unauthenticated endpoints** for
+both trending discovery and spike detection. No sign-up or API key is required.
+It is **enabled by default** and serves as the primary replacement for the X Counts API:
 
-Rate limits at Basic tier: 10,000 tweets/month, 1 req/second (our usage: ~3,000/month).
+- `/streams/symbol/{TICKER}.json` — counts new messages per cycle (Z-score spike detection)
+- `/streams/trending.json` — trending ticker discovery
 
-#### Reddit API — Free
+Nothing to configure. Rate limit: ~200 requests/hour (unauthenticated). The default
+5-minute poll interval for 50 tickers = ~10 req/5 min, well within quota.
+
+#### Bluesky — Free, requires free bsky.app account
+
+`BlueskyDataSource` uses the official AT Protocol API (open, free, no usage fees).
+It supplements StockTwits with a second independent spike-detection signal.
+
+1. Create a free account at https://bsky.app
+2. Go to **Settings → Privacy and Security → App Passwords**
+3. Click **Add App Password** → name it `social-trading` → copy the password
+4. Set in `.env`:
+   ```dotenv
+   BLUESKY_HANDLE=yourhandle.bsky.social
+   BLUESKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+   ```
+
+The `atproto` SDK is included in the project dependencies. No additional installation needed.
+
+#### Reddit API — Free (optional)
 
 1. Go to https://www.reddit.com/prefs/apps
 2. Click **create another app** → type: `script`, redirect: `http://localhost:8080`
@@ -61,12 +77,29 @@ Rate limits at Basic tier: 10,000 tweets/month, 1 req/second (our usage: ~3,000/
 
 Default subreddits: `wallstreetbets+stocks+options+investing`
 
-#### StockTwits API — ⚠️ No longer available for new registrations
+#### X (Twitter) API — ⚠️ Disabled by default (pay-per-use billing)
 
-StockTwits closed new developer API account creation. Existing tokens continue
-to work; if you have one, set `STOCKTWITS_TOKEN` in `.env`.  
-For new deployments, the three sources below replace StockTwits as the primary
-trending-ticker discovery mechanism.
+X migrated to **pay-per-use pricing with no free tier** in 2025. The Counts endpoint
+used for spike detection now costs **$0.005 per request**:
+
+- 50 tickers × 288 polls/day × $0.005 = **~$72/day (~$2,160/month)** for Counts alone
+
+**X is disabled by default** (`x_api_enabled = False` in SystemConfig) even when
+`X_BEARER_TOKEN` is set, to prevent accidental billing. To enable:
+
+1. Ensure you have a paid X API plan at https://developer.twitter.com
+2. Set `X_BEARER_TOKEN` in `.env`
+3. In the **Config UI → X API section**, toggle **Enable X API** (or set
+   `x_api_enabled = True` in Redis directly)
+
+StockTwits + Bluesky provide equivalent spike detection at zero cost and are the
+recommended replacement.
+
+#### StockTwits (legacy token) — ⚠️ No longer available for new registrations
+
+StockTwits closed new developer API account creation. The `STOCKTWITS_TOKEN` env
+var is no longer used — the source now operates via public unauthenticated endpoints
+and does not require a token. Remove it from `.env` if present.
 
 #### Yahoo Finance Screener — Free, no key required
 
@@ -142,8 +175,8 @@ DB_PASSWORD=changeme
 # ── Redis ─────────────────────────────────────────────────────────────────────
 REDIS_URL=redis://localhost:6379/0
 
-# ── X (Twitter) ───────────────────────────────────────────────────────────────
-X_BEARER_TOKEN=                    # leave empty to disable X source
+# ── X (Twitter) — disabled by default; enable via x_api_enabled in Config UI ──
+X_BEARER_TOKEN=                    # set but x_api_enabled must be True to activate
 X_API_KEY=
 X_API_SECRET=
 X_ACCESS_TOKEN=
@@ -155,7 +188,12 @@ REDDIT_CLIENT_SECRET=
 REDDIT_USER_AGENT=social-trading-bot/0.1 by u/YourUsername
 
 # ── StockTwits ────────────────────────────────────────────────────────────────
-STOCKTWITS_TOKEN=                  # leave empty to disable StockTwits source
+# No token required — public unauthenticated endpoints are used automatically.
+# STOCKTWITS_TOKEN is no longer used; remove it if set.
+
+# ── Bluesky ───────────────────────────────────────────────────────────────────
+BLUESKY_HANDLE=                    # e.g. yourhandle.bsky.social
+BLUESKY_APP_PASSWORD=              # from bsky.app Settings → App Passwords
 
 # ── Trending Ticker Sources ───────────────────────────────────────────────────
 # Yahoo Finance screener: no key needed — zero-config, enabled by default

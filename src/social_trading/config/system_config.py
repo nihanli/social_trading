@@ -25,22 +25,26 @@ class SystemConfig:
     # ── Watchlist & Discovery ─────────────────────────────────────────────────
     watchlist_stale_hours: int = 48          # remove ticker silent for N hours
     watchlist_promote_interval: int = 600   # seconds between liquidity checks
-    counts_poll_interval_sec: int = 300     # X Counts polling cadence
+    counts_poll_interval_sec: int = 300     # X Counts polling cadence (legacy; X disabled by default)
     stocktwits_poll_interval_sec: int = 300
     discovery_poll_interval_sec: int = 300      # yfinance / alpha_vantage / ibkr scanner cadence
     yfinance_screener_count: int = 50           # tickers to fetch per screener call
     alpha_vantage_cache_ttl_sec: int = 3600     # cache TTL — protects 25 req/day quota
+
+    # ── Spike Detection ───────────────────────────────────────────────────────
+    spike_zscore_threshold: float = 2.0     # Z-score to trigger Tier-2 pull
+    mention_window_minutes: int = 60        # rolling window for mention count
+    x_search_max_results: int = 100         # posts per spike ($0.005 each) — X only
+    bluesky_search_count: int = 25          # posts per Bluesky search call
+
+    # ── X API (disabled by default — pay-per-use, ~$0.005/request) ───────────
+    x_api_enabled: bool = False             # explicit opt-in required to prevent surprise billing
 
     # ── Seed tickers (never expire from watchlist) ────────────────────────────
     seed_tickers: list[str] = field(default_factory=lambda: [
         "AAPL", "TSLA", "NVDA", "AMD", "MSFT",
         "META", "AMZN", "GOOGL", "SPY", "QQQ",
     ])
-
-    # ── Spike Detection ───────────────────────────────────────────────────────
-    spike_zscore_threshold: float = 2.0     # Z-score to trigger Tier-2 pull
-    mention_window_minutes: int = 60        # rolling window for mention count
-    x_search_max_results: int = 100         # posts per spike ($0.005 each)
 
     # ── Liquidity Gate (watchlist admission) ──────────────────────────────────
     watchlist_min_adv_usd: int = 500_000
