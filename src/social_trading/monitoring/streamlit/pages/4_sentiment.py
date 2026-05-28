@@ -57,7 +57,7 @@ if not heatmap_df.empty:
             "cmax": 1,
             "colorbar": {"title": "Sentiment", "thickness": 14},
         },
-        text=heatmap_df["avg_vol_z"].round(1).astype(str) + "σ",
+        text=heatmap_df["avg_vol_z"].fillna(0).round(1).astype(str) + "σ",
         textposition="outside",
         hovertemplate=(
             "<b>%{x}</b><br>"

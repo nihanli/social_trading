@@ -250,7 +250,7 @@ if not heatmap_df.empty:
             "cmax": 1,
             "colorbar": {"title": "Sentiment", "thickness": 12},
         },
-        text=heatmap_df["vol_z"].round(1).astype(str) + "σ",
+        text=heatmap_df["vol_z"].fillna(0).round(1).astype(str) + "σ",
         textposition="outside",
     ))
     fig2.update_layout(

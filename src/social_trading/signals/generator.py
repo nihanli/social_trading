@@ -8,6 +8,10 @@ Quality score formula (design §5b):
            + w_momentum   × m   (recent price momentum, normalised)
            + w_convergence × c  (cross-platform agreement fraction)
 
+  The raw sum is then normalised by the sum of *active* weights so that
+  unavailable factors (e.g. price_momentum=0.0 before Phase 5 market data
+  service) do not permanently lower the score ceiling.
+
 Signal fires when:
   quality >= cfg.signal_quality_threshold
   AND |mean_score| >= cfg.sentiment_strength_min
@@ -93,13 +97,22 @@ class SignalGenerator:
         m = _normalise_momentum(price_momentum)
         c = _convergence(stats.source_scores, direction, cfg)
 
-        quality = (
+        raw_quality = (
             cfg.w_volume       * v
             + cfg.w_sentiment  * s
             + cfg.w_proactivity * p
             + cfg.w_momentum   * m
             + cfg.w_convergence * c
         )
+
+        # When price_momentum is unavailable (always 0.0 until Phase 5 market
+        # data service), normalise by the sum of active weights so the missing
+        # factor does not lower the ceiling below the threshold.
+        active_weight_sum = (
+            cfg.w_volume + cfg.w_sentiment + cfg.w_proactivity + cfg.w_convergence
+            + (cfg.w_momentum if price_momentum != 0.0 else 0.0)
+        )
+        quality = raw_quality / max(active_weight_sum, 1e-9)
 
         logger.debug(
             "%s quality=%.3f (v=%.2f s=%.2f p=%.2f m=%.2f c=%.2f) threshold=%.2f",

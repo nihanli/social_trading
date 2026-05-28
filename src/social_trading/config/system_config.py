@@ -52,7 +52,7 @@ class SystemConfig:
     watchlist_max_spread_pct: float = 0.01
 
     # ── Signal Generation ─────────────────────────────────────────────────────
-    signal_quality_threshold: float = 0.60  # minimum score to fire a signal
+    signal_quality_threshold: float = 0.50  # min quality to fire a signal0  # minimum score to fire a signal
     sentiment_strength_min: float = 0.30    # |sentiment| must exceed this
     price_momentum_min_pct: float = 0.02    # min price move for momentum factor
     reactive_price_threshold: float = 0.10  # >10% pre-spike move = reactive
