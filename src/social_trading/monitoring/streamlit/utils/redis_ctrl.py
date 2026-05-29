@@ -177,13 +177,39 @@ def get_pinned_tickers() -> set[str]:
 
 
 def pin_ticker(ticker: str) -> None:
+    """
+    Pin a ticker so it is always active and never auto-expires.
+    Updates both the runtime Redis SET and the durable SystemConfig so pins
+    survive service restarts.
+    """
+    ticker = ticker.upper().strip()
     r = _get_redis()
-    r.zadd("watchlist:active", {ticker.upper(): time.time()})
+    import time as _time
+    r.sadd("watchlist:seed", ticker)
+    r.zadd("watchlist:active", {ticker: _time.time()})
+
+    # Persist to SystemConfig so seed_from_config() re-pins on restart
+    cfg = load_config()
+    if ticker not in cfg.seed_tickers:
+        cfg.seed_tickers = sorted(set(cfg.seed_tickers) | {ticker})
+        save_config(cfg)
 
 
 def unpin_ticker(ticker: str) -> None:
+    """
+    Remove a ticker from the permanent seed list.
+    It will remain in the active watchlist until it expires naturally.
+    Updates both the runtime Redis SET and the durable SystemConfig.
+    """
+    ticker = ticker.upper().strip()
     r = _get_redis()
-    r.zrem("watchlist:active", ticker.upper())
+    r.srem("watchlist:seed", ticker)
+
+    # Persist to SystemConfig so the ticker is not re-pinned on restart
+    cfg = load_config()
+    if ticker in cfg.seed_tickers:
+        cfg.seed_tickers = sorted(set(cfg.seed_tickers) - {ticker})
+        save_config(cfg)
 
 
 def clear_watchlist() -> int:
