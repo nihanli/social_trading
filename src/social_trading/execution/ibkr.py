@@ -64,15 +64,51 @@ class IBKRExecutionEngine:
         self._ib = ib
         self._paper_prices = paper_prices or {}
         self._prices: dict[str, float] = {}
+        self._hwm: dict[str, float] = {}  # high-water marks for trailing stops
+        # Persisted position params: stop_loss, take_profit, opened_at per ticker.
+        # Restored from Redis on restart so exit rules work correctly.
+        self._position_params: dict[str, dict] = {}
 
     # ── Price cache (mirrors PaperTradingEngine interface) ────────────────────
 
     def set_price(self, ticker: str, price: float) -> None:
-        """Cache latest price for a ticker (called by exit loop)."""
+        """Cache latest price and update high-water mark for trailing stop."""
         self._prices[ticker] = price
+        # Ratchet HWM: for LONG track maximum, for SHORT track minimum.
+        # Direction unknown here, so we track both candidates; get_positions()
+        # applies the correct one when building Position objects.
+        prev = self._hwm.get(ticker)
+        if prev is None:
+            self._hwm[ticker] = price
+        else:
+            # Store the maximum seen — get_positions flips for SHORT
+            self._hwm[ticker] = max(prev, price)
 
     def get_price(self, ticker: str) -> float | None:
         return self._prices.get(ticker)
+
+    def get_hwm(self) -> dict[str, float]:
+        """Return a snapshot of all tracked high-water marks."""
+        return dict(self._hwm)
+
+    def seed_hwm(self, ticker: str, value: float) -> None:
+        """Restore a persisted HWM value; only applies when not already tracked."""
+        if ticker not in self._hwm:
+            self._hwm[ticker] = value
+
+    def get_position_params(self) -> dict[str, dict]:
+        """Return a snapshot of persisted position params (sl/tp/opened_at)."""
+        return dict(self._position_params)
+
+    def seed_position_params(self, ticker: str, params: dict) -> None:
+        """Restore position params from persistent store; only if not already set."""
+        if ticker not in self._position_params:
+            self._position_params[ticker] = params
+
+    def forget_position(self, ticker: str) -> None:
+        """Remove all in-memory state for a ticker that was closed externally (e.g. IB bracket fill)."""
+        self._hwm.pop(ticker, None)
+        self._position_params.pop(ticker, None)
 
     @property
     def open_tickers(self) -> set[str]:
@@ -107,39 +143,40 @@ class IBKRExecutionEngine:
             contract = Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
 
-            parent_id = self._ib.client.getReqId()
-            stop_id = self._ib.client.getReqId()
-            target_id = self._ib.client.getReqId()
-
+            # Place parent market order (held until child legs are registered)
             parent = MarketOrder(action, quantity)
-            parent.orderId = parent_id
             parent.transmit = False
+            parent_trade = self._ib.placeOrder(contract, parent)
+            parent_id = parent_trade.order.orderId
 
+            # Stop-loss child
             stop = StopOrder(close_action, quantity, stop_loss)
-            stop.orderId = stop_id
             stop.parentId = parent_id
             stop.transmit = False
+            self._ib.placeOrder(contract, stop)
 
+            # Take-profit child — transmit=True releases the entire bracket atomically
             target = LimitOrder(close_action, quantity, take_profit)
-            target.orderId = target_id
             target.parentId = parent_id
-            target.transmit = True  # releases the entire bracket
-
-            trades = [
-                self._ib.placeOrder(contract, parent),
-                self._ib.placeOrder(contract, stop),
-                self._ib.placeOrder(contract, target),
-            ]
+            target.transmit = True
+            self._ib.placeOrder(contract, target)
 
             # Wait briefly for fill confirmation
             await asyncio.sleep(0.5)
 
             # Read fill price from parent trade
             fill_price: float | None = None
-            if trades[0].fills:
-                fill_price = float(trades[0].fills[0].execution.price)
+            if parent_trade.fills:
+                fill_price = float(parent_trade.fills[0].execution.price)
 
             order_id = str(parent_id)
+            # Save position params so exit rules (sl/tp/time) work correctly after restart
+            self._position_params[ticker] = {
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "opened_at": datetime.now(UTC).isoformat(),
+                "direction": signal.direction,
+            }
             logger.info(
                 "[IBKR] BRACKET %s %s qty=%d sl=%.4f tp=%.4f fill=%.4f",
                 action, ticker, quantity, stop_loss, take_profit,
@@ -178,11 +215,12 @@ class IBKRExecutionEngine:
             contract = Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
 
-            # Cancel open orders for this contract first
-            open_orders = self._ib.openOrders()
-            for order in open_orders:
-                if hasattr(order, "contract") and order.contract.symbol == ticker:
-                    self._ib.cancelOrder(order)
+            # Cancel bracket child orders (stop-loss + take-profit legs).
+            # Must use openTrades() — it exposes both .order and .contract.
+            # openOrders() returns Order objects which have no .contract attribute.
+            for trade in self._ib.openTrades():
+                if trade.contract.symbol == ticker:
+                    self._ib.cancelOrder(trade.order)
 
             # Determine close action from existing position
             positions = self._ib.positions()
@@ -205,12 +243,17 @@ class IBKRExecutionEngine:
             close_action = "SELL" if pos_qty > 0 else "BUY"
             direction: Direction = "LONG" if pos_qty > 0 else "SHORT"
             close_order = MarketOrder(close_action, abs(pos_qty))
+            close_order.transmit = True  # must be explicit — default varies by ib_async version
             trade = self._ib.placeOrder(contract, close_order)
             await asyncio.sleep(0.5)
 
             fill_price: float | None = None
             if trade.fills:
                 fill_price = float(trade.fills[0].execution.price)
+
+            # Clean up in-memory state so re-entry on same ticker starts fresh
+            self._hwm.pop(ticker, None)
+            self._position_params.pop(ticker, None)
 
             logger.info("[IBKR] CLOSE %s qty=%d reason=%s fill=%.4f",
                         ticker, abs(pos_qty), reason, fill_price or 0.0)
@@ -245,15 +288,42 @@ class IBKRExecutionEngine:
                 continue
             direction: Direction = "LONG" if p.position > 0 else "SHORT"
             entry_price = float(p.avgCost / abs(p.position)) if p.position != 0 else 0.0
+            ticker = p.contract.symbol
+
+            # Seed HWM on first encounter (before any set_price call has arrived)
+            if ticker not in self._hwm:
+                current = self._prices.get(ticker, entry_price)
+                self._hwm[ticker] = current
+
+            # Apply correct HWM polarity: LONG tracks max, SHORT tracks min
+            raw_hwm = self._hwm.get(ticker, entry_price)
+            if direction == "SHORT":
+                # For shorts, HWM is the lowest price seen; invert the stored max
+                current_price = self._prices.get(ticker, entry_price)
+                raw_hwm = min(raw_hwm, current_price) if raw_hwm != entry_price else current_price
+                self._hwm[ticker] = raw_hwm
+
+            # Restore persisted position params (sl/tp/opened_at) if available.
+            # Without these, exit rules 2 (STOP_LOSS) and 3 (TAKE_PROFIT) silently skip
+            # on IBKR restart since IB doesn't expose bracket leg prices.
+            params = self._position_params.get(ticker, {})
+            stop_loss = float(params.get("stop_loss", 0.0))
+            take_profit = float(params.get("take_profit", 0.0))
+            try:
+                opened_at = datetime.fromisoformat(params["opened_at"]) if "opened_at" in params else datetime.now(UTC)
+            except (ValueError, KeyError):
+                opened_at = datetime.now(UTC)
+
             positions.append(Position(
-                ticker=p.contract.symbol,
+                ticker=ticker,
                 direction=direction,
                 shares=abs(int(p.position)),
                 entry_price=entry_price,
-                opened_at=datetime.now(UTC),   # IBKR doesn't provide this directly
-                stop_loss=0.0,
-                take_profit=0.0,
+                opened_at=opened_at,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 unrealized_pnl=float(p.unrealizedPNL or 0),
+                high_water_mark=raw_hwm,
             ))
         return positions
 

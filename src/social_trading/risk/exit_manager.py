@@ -178,14 +178,24 @@ def _unrealised_pnl(position: Position, current_price: float) -> float:
 
 
 def _breaches_stop_loss(position: Position, current_price: float) -> bool:
-    """Returns True if current price crosses the ATR stop."""
+    """Returns True if current price crosses the ATR stop.
+    Returns False when stop_loss is 0.0 (unset — e.g. IBKR position after restart
+    where the bracket leg is live on IB's side and Python doesn't know the level).
+    """
+    if position.stop_loss == 0.0:
+        return False
     if position.direction == "LONG":
         return current_price <= position.stop_loss
     return current_price >= position.stop_loss
 
 
 def _breaches_take_profit(position: Position, current_price: float) -> bool:
-    """Returns True if take-profit target is reached."""
+    """Returns True if take-profit target is reached.
+    Returns False when take_profit is 0.0 (unset — e.g. IBKR position after restart
+    where the bracket leg is live on IB's side and Python doesn't know the level).
+    """
+    if position.take_profit == 0.0:
+        return False
     if position.direction == "LONG":
         return current_price >= position.take_profit
     return current_price <= position.take_profit

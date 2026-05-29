@@ -77,6 +77,21 @@ class PaperTradingEngine:
     def get_price(self, ticker: str) -> float | None:
         return self._prices.get(ticker)
 
+    def get_hwm(self) -> dict[str, float]:
+        """Return a snapshot of all tracked high-water marks (open positions only)."""
+        return {t: p.high_water_mark for t, p in self._positions.items()}
+
+    def seed_hwm(self, ticker: str, value: float) -> None:
+        """Restore a persisted HWM; only applies to open positions not yet ratcheted."""
+        if ticker in self._positions:
+            pos = self._positions[ticker]
+            # Only restore if HWM hasn't moved above entry price yet
+            if pos.high_water_mark <= pos.entry_price:
+                pos.high_water_mark = value
+
+    def forget_position(self, ticker: str) -> None:
+        """No-op for paper engine — external closes cannot happen in simulation."""
+
     # ── ExecutionEngine protocol ───────────────────────────────────────────────
 
     async def submit_signal(

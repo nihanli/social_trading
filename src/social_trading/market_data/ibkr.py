@@ -74,17 +74,31 @@ class IBKRMarketData:
         await asyncio.sleep(1.5)  # allow data to arrive
         self._ib.cancelMktData(contract)
 
-        last = ticker_data.last or ticker_data.close or 0.0
-        bid = ticker_data.bid or last * 0.999
-        ask = ticker_data.ask or last * 1.001
-        volume = ticker_data.volume or 0
+        import math  # noqa: PLC0415
+        def _safe(val: Any) -> float | None:
+            """Return float if val is a real finite number, else None."""
+            try:
+                f = float(val)
+                return f if math.isfinite(f) and f != 0.0 else None
+            except (TypeError, ValueError):
+                return None
+
+        last = _safe(ticker_data.last) or _safe(ticker_data.close)
+        if last is None:
+            # Error 10089 / no data received — raise so FallbackMarketData
+            # can retry with yfinance.
+            raise RuntimeError(f"IB returned no price for {ticker} (missing subscription?)")
+
+        bid = _safe(ticker_data.bid) or last * 0.999
+        ask = _safe(ticker_data.ask) or last * 1.001
+        volume = _safe(ticker_data.volume) or 0.0
 
         return {
             "last": float(last),
             "bid": float(bid),
             "ask": float(ask),
             "volume": float(volume),
-            "avg_volume_30d": float(ticker_data.avVolume or 0),
+            "avg_volume_30d": float(_safe(ticker_data.avVolume) or 0.0),
             "market_cap": 0.0,   # not available via reqMktData; use YFinance for this
         }
 
@@ -165,8 +179,15 @@ class IBKRMarketData:
         ticker_data = self._ib.reqMktData(contract, "", False, False)
         await asyncio.sleep(1.5)
         self._ib.cancelMktData(contract)
-        val = ticker_data.last or ticker_data.close or 20.0
-        return float(val)
+        import math  # noqa: PLC0415
+        for candidate in (ticker_data.last, ticker_data.close):
+            try:
+                v = float(candidate)
+                if math.isfinite(v) and v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        raise RuntimeError("IB returned no VIX price")
 
     async def health_check(self) -> bool:
         return bool(self._ib.isConnected())

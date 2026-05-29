@@ -54,6 +54,13 @@ _AGGREGATE_INTERVAL_SEC = 60
 # How often (seconds) to run DB pruning
 _PRUNE_INTERVAL_SEC = 3600  # once per hour
 
+# How often (seconds) to sync open positions and record equity
+_POSITIONS_SYNC_INTERVAL_SEC = 30
+_EQUITY_RECORD_INTERVAL_SEC = 60
+
+# execution:events stream written by the execution service
+_EXEC_EVENTS_STREAM = "execution:events"
+
 # Retention windows
 _RETAIN_SOCIAL_RAW_HOURS = 48
 _RETAIN_SENTIMENT_SCORES_HOURS = 48
@@ -329,6 +336,190 @@ def _prune_old_data() -> dict[str, int]:
     return deleted
 
 
+def _write_trade_opened(data: dict) -> None:
+    """
+    Insert an opening trade record into the trades table.
+    Uses stream_event_id for idempotency (skip if already processed).
+    """
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO trades
+                        (ticker, direction, shares, entry_price, stop_price,
+                         target_price, opened_at, status, mode, stream_event_id)
+                    VALUES
+                        (%(ticker)s, %(direction)s, %(shares)s, %(entry_price)s,
+                         %(stop_price)s, %(target_price)s, %(opened_at)s,
+                         'open', %(mode)s, %(stream_event_id)s)
+                    ON CONFLICT (stream_event_id) DO NOTHING
+                    """,
+                    {
+                        "ticker": data.get("ticker", ""),
+                        "direction": data.get("direction", "LONG"),
+                        "shares": _int(data.get("shares", 0)),
+                        "entry_price": _float(data.get("entry_price", 0)),
+                        "stop_price": _float(data.get("stop_loss", 0)) or None,
+                        "target_price": _float(data.get("take_profit", 0)) or None,
+                        "opened_at": data.get("opened_at") or datetime.now(UTC).isoformat(),
+                        "mode": data.get("mode", "paper"),
+                        "stream_event_id": data.get("stream_event_id"),
+                    },
+                )
+    except psycopg2.Error as exc:
+        logger.warning("trade_opened insert failed (%s): %s", data.get("ticker"), exc)
+    finally:
+        conn.close()
+
+
+def _write_trade_closed(data: dict) -> None:
+    """
+    Update the most recent open trade for this ticker with exit details.
+    Matches on opened_at when available for precision; falls back to latest open.
+    """
+    ticker = data.get("ticker", "")
+    exit_price = _float(data.get("exit_price", 0))
+    closed_at = data.get("closed_at") or datetime.now(UTC).isoformat()
+    exit_reason = data.get("exit_reason", "unknown")
+    opened_at = data.get("opened_at") or None
+
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if opened_at:
+                    cur.execute(
+                        "SELECT id, entry_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND status = 'open' AND opened_at = %s "
+                        "ORDER BY id DESC LIMIT 1",
+                        (ticker, opened_at),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, entry_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND status = 'open' ORDER BY id DESC LIMIT 1",
+                        (ticker,),
+                    )
+                row = cur.fetchone()
+                if not row:
+                    logger.debug("No open trade found for %s to close", ticker)
+                    return
+                trade_id, entry_price, shares, direction = row
+
+                # Calculate P&L (None when exit_price unknown, e.g. IB_EXTERNAL)
+                if exit_price > 0 and entry_price and shares:
+                    if direction == "LONG":
+                        pnl = (exit_price - entry_price) * shares
+                    else:
+                        pnl = (entry_price - exit_price) * shares
+                    pnl_pct = pnl / (entry_price * shares) * 100 if entry_price and shares else 0.0
+                else:
+                    pnl = None
+                    pnl_pct = None
+
+                cur.execute(
+                    """
+                    UPDATE trades
+                    SET exit_price  = %(exit_price)s,
+                        exit_reason = %(exit_reason)s,
+                        closed_at   = %(closed_at)s,
+                        net_pnl     = %(net_pnl)s,
+                        pnl         = %(pnl)s,
+                        pnl_pct     = %(pnl_pct)s,
+                        status      = 'closed'
+                    WHERE id = %(id)s
+                    """,
+                    {
+                        "exit_price": exit_price if exit_price > 0 else None,
+                        "exit_reason": exit_reason,
+                        "closed_at": closed_at,
+                        "net_pnl": pnl,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "id": trade_id,
+                    },
+                )
+    except psycopg2.Error as exc:
+        logger.warning("trade_closed update failed (%s): %s", ticker, exc)
+    finally:
+        conn.close()
+
+
+def _sync_positions(positions: list[dict]) -> None:
+    """
+    Upsert current open positions into the positions table.
+    Deletes any row whose ticker is not in the live list (closed positions).
+    """
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                live_tickers = {p["ticker"] for p in positions}
+                if live_tickers:
+                    cur.execute(
+                        "DELETE FROM positions WHERE ticker NOT IN %s",
+                        (tuple(live_tickers),),
+                    )
+                else:
+                    cur.execute("DELETE FROM positions")
+                for p in positions:
+                    cur.execute(
+                        """
+                        INSERT INTO positions
+                            (ticker, direction, shares, entry_price,
+                             unrealized_pnl, stop_loss, take_profit,
+                             high_water_mark, opened_at, updated_at)
+                        VALUES
+                            (%(ticker)s, %(direction)s, %(shares)s, %(entry_price)s,
+                             %(unrealized_pnl)s, %(stop_loss)s, %(take_profit)s,
+                             %(high_water_mark)s, %(opened_at)s, NOW())
+                        ON CONFLICT (ticker) DO UPDATE SET
+                            direction       = EXCLUDED.direction,
+                            shares          = EXCLUDED.shares,
+                            entry_price     = EXCLUDED.entry_price,
+                            unrealized_pnl  = EXCLUDED.unrealized_pnl,
+                            stop_loss       = EXCLUDED.stop_loss,
+                            take_profit     = EXCLUDED.take_profit,
+                            high_water_mark = EXCLUDED.high_water_mark,
+                            opened_at       = EXCLUDED.opened_at,
+                            updated_at      = NOW()
+                        """,
+                        {
+                            "ticker": p["ticker"],
+                            "direction": p.get("direction", "LONG"),
+                            "shares": _int(p.get("shares", 0)),
+                            "entry_price": _float(p.get("entry_price", 0)),
+                            "unrealized_pnl": _float(p.get("unrealized_pnl", 0)),
+                            "stop_loss": _float(p.get("stop_loss", 0)) or None,
+                            "take_profit": _float(p.get("take_profit", 0)) or None,
+                            "high_water_mark": _float(p.get("high_water_mark", 0)) or None,
+                            "opened_at": p.get("opened_at"),
+                        },
+                    )
+    except psycopg2.Error as exc:
+        logger.warning("positions sync failed: %s", exc)
+    finally:
+        conn.close()
+
+
+def _insert_account_equity(nlv: float, mode: str) -> None:
+    """Insert an equity snapshot into account_equity table."""
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO account_equity (equity, mode) VALUES (%s, %s)",
+                    (nlv, mode),
+                )
+    except psycopg2.Error as exc:
+        logger.warning("account_equity insert failed: %s", exc)
+    finally:
+        conn.close()
+
+
 # ── Consumer tasks ─────────────────────────────────────────────────────────────
 
 async def run_raw_social_task(bus: TradingEventBus) -> None:
@@ -409,6 +600,105 @@ async def run_prune_task() -> None:
             logger.info("DB prune: deleted %d rows (%s)", total_deleted, parts)
 
 
+async def run_execution_events_task(bus: TradingEventBus) -> None:
+    """
+    Consume execution:events stream and persist trade lifecycle to PostgreSQL.
+
+    position_opened → INSERT into trades (status='open')
+    position_closed → UPDATE trades (status='closed', set exit info + P&L)
+    """
+    await bus.create_group(_EXEC_EVENTS_STREAM, _GROUP)
+    logger.info("Execution events consumer started (stream=%s)", _EXEC_EVENTS_STREAM)
+    while True:
+        try:
+            messages = await bus.consume(
+                _EXEC_EVENTS_STREAM, _GROUP, "persist-exec-0", count=_BATCH
+            )
+            for msg_id, fields in messages:
+                event_type = fields.get("event", "")
+                # Include stream message ID for idempotent inserts
+                fields["stream_event_id"] = msg_id
+                try:
+                    if event_type == "position_opened":
+                        await _run_db(_write_trade_opened, fields)
+                        logger.info(
+                            "[EXEC_EVENTS] Trade opened: %s %s",
+                            fields.get("direction", ""), fields.get("ticker", ""),
+                        )
+                    elif event_type == "position_closed":
+                        await _run_db(_write_trade_closed, fields)
+                        logger.info(
+                            "[EXEC_EVENTS] Trade closed: %s reason=%s",
+                            fields.get("ticker", ""), fields.get("exit_reason", ""),
+                        )
+                    else:
+                        logger.debug("Unknown execution event type: %s", event_type)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist execution event %s (%s): %s",
+                        event_type, fields.get("ticker", ""), exc,
+                    )
+                await bus.ack(_EXEC_EVENTS_STREAM, _GROUP, msg_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[EXEC_EVENTS] Unhandled error: %s", exc, exc_info=True)
+            await asyncio.sleep(5.0)
+
+
+async def run_positions_sync_task(redis: aioredis.Redis) -> None:
+    """
+    Periodically sync positions:live Redis hash to the PostgreSQL positions table
+    and record equity snapshots in account_equity.
+
+    Runs every _POSITIONS_SYNC_INTERVAL_SEC seconds.
+    """
+    import json as _json  # noqa: PLC0415
+
+    loop = asyncio.get_event_loop()
+    last_equity = 0.0
+    last_equity_ts = 0.0
+
+    while True:
+        try:
+            await asyncio.sleep(_POSITIONS_SYNC_INTERVAL_SEC)
+
+            # ── Sync open positions ───────────────────────────────────────────
+            raw = await redis.hgetall("positions:live")
+            positions: list[dict] = []
+            for _, v in raw.items():
+                try:
+                    p = _json.loads(v.decode() if isinstance(v, bytes) else v)
+                    positions.append(p)
+                except Exception:
+                    continue
+            await _run_db(_sync_positions, positions)
+            logger.debug(
+                "positions: synced %d open position(s) to DB", len(positions)
+            )
+
+            # ── Record equity snapshot ────────────────────────────────────────
+            now = loop.time()
+            if now - last_equity_ts >= _EQUITY_RECORD_INTERVAL_SEC:
+                account = await redis.hgetall("account:state")
+                if account:
+                    nlv_raw = account.get(b"net_liquidation", account.get("net_liquidation", b"0"))
+                    nlv = _float(nlv_raw.decode() if isinstance(nlv_raw, bytes) else nlv_raw)
+                    mode_raw = await redis.get("trading:mode")
+                    mode = (mode_raw.decode() if isinstance(mode_raw, bytes) else (mode_raw or "paper"))
+                    # Only write when equity has changed meaningfully
+                    if nlv > 0 and abs(nlv - last_equity) > 0.01:
+                        await _run_db(_insert_account_equity, nlv, mode)
+                        last_equity = nlv
+                last_equity_ts = now
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[POSITIONS_SYNC] Unhandled error: %s", exc, exc_info=True)
+            await asyncio.sleep(10.0)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -441,6 +731,8 @@ async def main() -> None:
         asyncio.create_task(run_sentiment_task(bus), name="sentiment"),
         asyncio.create_task(run_signal_task(bus), name="signal"),
         asyncio.create_task(run_prune_task(), name="prune"),
+        asyncio.create_task(run_execution_events_task(bus), name="exec_events"),
+        asyncio.create_task(run_positions_sync_task(redis), name="positions_sync"),
     ]
 
     try:

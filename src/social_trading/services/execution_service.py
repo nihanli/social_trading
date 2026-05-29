@@ -127,41 +127,55 @@ async def _write_account_state(
     })
 
 
-async def _write_market_snapshot(
+async def _publish_execution_event(
     redis: aioredis.Redis,
-    ticker: str,
-    market_data: YFinanceMarketData,
+    event_type: str,
+    data: dict,
+) -> None:
+    """Publish a position lifecycle event to the execution:events stream."""
+    try:
+        fields = {"event": event_type}
+        fields.update({k: str(v) if v is not None else "" for k, v in data.items()})
+        await redis.xadd(_EXEC_EVENTS_STREAM, fields, maxlen=50_000)
+    except Exception as exc:
+        logger.warning("[EVENTS] Failed to publish %s event: %s", event_type, exc)
+
+
+async def _write_positions_to_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
 ) -> None:
     """
-    Fetch and write market snapshot to Redis hash 'market_data:{ticker}'.
-    Used by risk_service and signal_service (price alignment check).
+    Sync open positions to positions:live Redis hash.
+    Called each exit-loop cycle so the persistence service and UI see current state.
     """
     try:
-        quote = await market_data.get_quote(ticker)
-        atr = await market_data.get_atr(ticker)
-        realised_vol = await market_data.get_realised_vol(ticker)
-        vix = await market_data.get_vix()
-
-        # ADV as shares from volume; use avg_volume_30d
-        adv_shares = quote.get("avg_volume_30d", 1_000_000.0)
-        last = quote.get("last", 0.0)
-        adv_usd = adv_shares * last if last > 0 else 100_000_000.0
-
-        await redis.hset(f"market_data:{ticker}", mapping={
-            "last": str(last),
-            "bid": str(quote.get("bid", 0.0)),
-            "ask": str(quote.get("ask", 0.0)),
-            "adv_shares": str(adv_shares),
-            "adv_usd": str(adv_usd),
-            "market_cap_usd": str(quote.get("market_cap", 0.0)),
-            "atr_14": str(atr),
-            "realised_vol": str(realised_vol),
-            "vix": str(vix),
-            "updated_at": datetime.now(UTC).isoformat(),
-        })
-        # Also update engine price cache
+        positions = await engine.get_positions()
+        pipe = redis.pipeline()
+        pipe.delete(_POSITIONS_LIVE_KEY)
+        for pos in positions:
+            current_price = engine.get_price(pos.ticker) or pos.entry_price
+            if pos.direction == "LONG":
+                computed_upnl = (current_price - pos.entry_price) * pos.shares
+            else:
+                computed_upnl = (pos.entry_price - current_price) * pos.shares
+            # Prefer IB's native unrealizedPNL when available (non-zero)
+            unrealized_pnl = pos.unrealized_pnl if pos.unrealized_pnl != 0.0 else computed_upnl
+            pipe.hset(_POSITIONS_LIVE_KEY, pos.ticker, json.dumps({
+                "ticker": pos.ticker,
+                "direction": pos.direction,
+                "shares": pos.shares,
+                "entry_price": pos.entry_price,
+                "stop_loss": pos.stop_loss,
+                "take_profit": pos.take_profit,
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "high_water_mark": pos.high_water_mark,
+                "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+            }))
+        await pipe.execute()
     except Exception as exc:
-        logger.debug("Market snapshot failed for %s: %s", ticker, exc)
+        logger.warning("[POSITIONS] Failed to write positions:live: %s", exc)
+
 
 
 # ── Service loops ─────────────────────────────────────────────────────────────
@@ -171,6 +185,7 @@ async def run_trade_loop(
     engine: PaperTradingEngine,
     redis: aioredis.Redis,
     market_data: YFinanceMarketData | None = None,
+    mode: str = "paper",
 ) -> None:
     """
     Consume selected_signals and submit to execution engine.
@@ -183,80 +198,115 @@ async def run_trade_loop(
     skipped = 0
 
     while True:
-        messages = await bus.consume(
-            STREAM_SELECTED_SIGNALS, _GROUP, _CONSUMER, count=_INGEST_BATCH
-        )
-
-        for msg_id, fields in messages:
-            parsed = _stream_dict_to_approved(fields)
-            if parsed is None:
-                await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
-                continue
-
-            signal, quantity, stop_loss, take_profit = parsed
-
-            # Skip if new positions are halted via UI command
-            if _halt_flag.is_set():
-                logger.debug("Skip %s — new positions halted", signal.ticker)
-                skipped += 1
-                await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
-                continue
-
-            # Skip if position already open
-            if signal.ticker in engine.open_tickers:
-                logger.debug("Skip %s — position already open", signal.ticker)
-                skipped += 1
-                await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
-                continue
-
-            # Ensure price is in cache; fetch on-demand if exit loop hasn't warmed it yet
-            if engine.get_price(signal.ticker) is None and market_data is not None:
-                try:
-                    quote = await market_data.get_quote(signal.ticker)
-                    last = quote.get("last", 0.0)
-                    if last > 0:
-                        engine.set_price(signal.ticker, last)
-                        logger.debug("On-demand price fetch for %s: %.4f", signal.ticker, last)
-                except Exception as exc:
-                    logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
-
-            result = await engine.submit_signal(
-                signal=signal,
-                quantity=quantity,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
+        try:
+            messages = await bus.consume(
+                STREAM_SELECTED_SIGNALS, _GROUP, _CONSUMER, count=_INGEST_BATCH
             )
 
-            if result.status == "filled":
-                submitted += 1
-                ORDERS_PLACED.labels(ticker=signal.ticker, status="filled").inc()
-                # Persist trade to Redis list for UI
-                await redis.lpush("trades:recent", str({
-                    "ticker": signal.ticker,
-                    "direction": signal.direction,
-                    "quantity": quantity,
-                    "fill_price": result.fill_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "submitted_at": result.submitted_at.isoformat(),
-                    "quality_score": signal.quality_score,
-                }))
-                await redis.ltrim("trades:recent", 0, 999)  # keep last 1000
-                logger.info(
-                    "[EXEC] Submitted %s %s qty=%d fill=%.4f [total=%d]",
-                    signal.direction, signal.ticker, quantity,
-                    result.fill_price or 0.0, submitted,
-                )
-            else:
-                ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
-                logger.warning(
-                    "[EXEC] Rejected %s: %s", signal.ticker, result.error
-                )
+            for msg_id, fields in messages:
+                try:
+                    parsed = _stream_dict_to_approved(fields)
+                    if parsed is None:
+                        await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                        continue
 
-            await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                    signal, quantity, stop_loss, take_profit = parsed
 
-        if not messages:
-            await asyncio.sleep(1.0)
+                    # Skip if new positions are halted via UI command
+                    if _halt_flag.is_set():
+                        logger.debug("Skip %s — new positions halted", signal.ticker)
+                        skipped += 1
+                        await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                        continue
+
+                    # Skip if position already open; guard engine.open_tickers
+                    # against IB disconnection errors
+                    try:
+                        already_open = signal.ticker in engine.open_tickers
+                    except Exception as exc:
+                        logger.warning(
+                            "[EXEC] Could not check open_tickers for %s (%s) — skipping signal",
+                            signal.ticker, exc,
+                        )
+                        await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                        continue
+
+                    if already_open:
+                        logger.debug("Skip %s — position already open", signal.ticker)
+                        skipped += 1
+                        await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                        continue
+
+                    # Ensure price is in cache; fetch on-demand if exit loop hasn't warmed it yet
+                    if engine.get_price(signal.ticker) is None and market_data is not None:
+                        try:
+                            quote = await market_data.get_quote(signal.ticker)
+                            last = quote.get("last", 0.0)
+                            if last > 0:
+                                engine.set_price(signal.ticker, last)
+                                logger.debug("On-demand price fetch for %s: %.4f", signal.ticker, last)
+                        except Exception as exc:
+                            logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
+
+                    result = await engine.submit_signal(
+                        signal=signal,
+                        quantity=quantity,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                    )
+
+                    if result.status in ("filled", "submitted"):
+                        submitted += 1
+                        ORDERS_PLACED.labels(ticker=signal.ticker, status=result.status).inc()
+                        await _publish_execution_event(redis, "position_opened", {
+                            "ticker": signal.ticker,
+                            "direction": signal.direction,
+                            "shares": quantity,
+                            "entry_price": result.fill_price or 0.0,
+                            "stop_loss": stop_loss,
+                            "take_profit": take_profit,
+                            "opened_at": result.submitted_at.isoformat(),
+                            "mode": mode,
+                        })
+                        await redis.lpush("trades:recent", json.dumps({
+                            "ticker": signal.ticker,
+                            "direction": signal.direction,
+                            "quantity": quantity,
+                            "fill_price": result.fill_price,
+                            "stop_loss": stop_loss,
+                            "take_profit": take_profit,
+                            "submitted_at": result.submitted_at.isoformat(),
+                            "quality_score": signal.quality_score,
+                        }))
+                        await redis.ltrim("trades:recent", 0, 999)
+                        logger.info(
+                            "[EXEC] Submitted %s %s qty=%d fill=%.4f [total=%d]",
+                            signal.direction, signal.ticker, quantity,
+                            result.fill_price or 0.0, submitted,
+                        )
+                    else:
+                        ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
+                        logger.warning("[EXEC] Rejected %s: %s", signal.ticker, result.error)
+
+                    await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "[TRADE LOOP] Error processing msg %s — acking to avoid redelivery: %s",
+                        msg_id, exc, exc_info=True,
+                    )
+                    await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+
+            if not messages:
+                await asyncio.sleep(1.0)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[TRADE LOOP] Unhandled error — will retry: %s", exc, exc_info=True)
+            await asyncio.sleep(5.0)
 
 
 async def run_exit_loop(
@@ -265,93 +315,202 @@ async def run_exit_loop(
     market_data: YFinanceMarketData,
     breaker: CircuitBreaker,
     redis: aioredis.Redis,
+    mode: str = "paper",
 ) -> None:
     """
     Every poll_interval seconds:
-      1. Refresh market data snapshots for open tickers + watchlist
-      2. Update engine price cache
-      3. Evaluate exit rules for every open position
-      4. Close positions that triggered an exit
-      5. Write account state to Redis
+      1. Guard: skip cycle if engine is disconnected
+      2. Refresh market data snapshots for open tickers + watchlist
+      3. Update engine price cache
+      4. Evaluate exit rules for every open position
+      5. Close positions that triggered an exit
+      6. Reconcile: detect tickers closed externally by IB (bracket fills / TWS)
+      7. Persist HWM + position params; write account state to Redis
     """
     logger.info("Execution exit loop started")
 
-    # Watchlist tickers are refreshed at most once every WATCHLIST_REFRESH_SECS
-    # to avoid hammering yfinance/DNS with hundreds of concurrent requests.
     WATCHLIST_REFRESH_SECS = 300  # 5 minutes
     _watchlist_last_refresh: dict[str, float] = {}
+    # Tracks tickers that were open at the end of the previous cycle.
+    # Used to detect positions closed externally by IB between cycles.
+    _prev_open_tickers: set[str] = set()
 
     while True:
-        cfg = await SystemConfig.load(redis)
+        try:
+            cfg = await SystemConfig.load(redis)
 
-        # Fetch VIX once per cycle (shared across all ticker snapshots)
-        vix = await market_data.get_vix()
-        await redis.set("market:vix", str(vix))
-
-        # Refresh market data for all open tickers
-        open_positions = await engine.get_positions()
-        open_tickers = {p.ticker for p in open_positions}
-
-        # Also refresh watchlist tickers so risk/signal services have fresh data,
-        # but throttle to at most once every WATCHLIST_REFRESH_SECS per ticker.
-        watchlist_raw = await redis.zrange("watchlist:active", 0, -1)
-        watchlist_tickers = {
-            (t.decode() if isinstance(t, bytes) else t) for t in watchlist_raw
-        }
-        now_ts = datetime.now(UTC).timestamp()
-        stale_watchlist = {
-            t for t in watchlist_tickers
-            if now_ts - _watchlist_last_refresh.get(t, 0) >= WATCHLIST_REFRESH_SECS
-        }
-        all_tickers = open_tickers | stale_watchlist
-
-        for ticker in all_tickers:
-            try:
-                snapshot = await _write_market_snapshot_and_get_price(
-                    redis, ticker, market_data, vix=vix
+            # ── 1. Connection guard ───────────────────────────────────────────
+            if not await engine.health_check():
+                logger.warning(
+                    "[SYNC] Engine not connected — skipping position evaluation this cycle"
                 )
-                if snapshot is not None:
-                    engine.set_price(ticker, snapshot)
-                if ticker in stale_watchlist:
-                    _watchlist_last_refresh[ticker] = now_ts
-            except Exception as exc:
-                logger.debug("Price refresh failed for %s: %s", ticker, exc)
+                await asyncio.sleep(cfg.signal_poll_interval_sec)
+                continue
 
-        # Re-fetch positions after price updates (HWM may have moved)
-        open_positions = await engine.get_positions()
-        now = datetime.now(UTC)
+            # Fetch VIX once per cycle (shared across all ticker snapshots)
+            vix = await market_data.get_vix()
+            await redis.set("market:vix", str(vix))
 
-        for pos in open_positions:
-            current_price = engine.get_price(pos.ticker) or pos.entry_price
-            decision = exit_manager.evaluate(pos, current_price, cfg, now=now)
-            if decision.should_exit:
-                await engine.close_position(pos.ticker, reason=decision.reason)
-                POSITIONS_CLOSED.labels(reason=decision.reason or "unknown").inc()
-                logger.info(
-                    "[EXIT] %s %s reason=%s pnl_approx=%.2f",
-                    pos.direction, pos.ticker, decision.reason,
-                    (current_price - pos.entry_price) * pos.shares
-                    if pos.direction == "LONG"
-                    else (pos.entry_price - current_price) * pos.shares,
+            # ── 2. Refresh market data ────────────────────────────────────────
+            open_positions = await engine.get_positions()
+            open_tickers = {p.ticker for p in open_positions}
+
+            watchlist_raw = await redis.zrange("watchlist:active", 0, -1)
+            watchlist_tickers = {
+                (t.decode() if isinstance(t, bytes) else t) for t in watchlist_raw
+            }
+            now_ts = datetime.now(UTC).timestamp()
+            stale_watchlist = {
+                t for t in watchlist_tickers
+                if now_ts - _watchlist_last_refresh.get(t, 0) >= WATCHLIST_REFRESH_SECS
+            }
+            all_tickers = open_tickers | stale_watchlist
+
+            for ticker in all_tickers:
+                try:
+                    snapshot = await _write_market_snapshot_and_get_price(
+                        redis, ticker, market_data, vix=vix
+                    )
+                    if snapshot is not None:
+                        engine.set_price(ticker, snapshot)
+                    if ticker in stale_watchlist:
+                        _watchlist_last_refresh[ticker] = now_ts
+                except Exception as exc:
+                    logger.debug("Price refresh failed for %s: %s", ticker, exc)
+
+            # ── 3. Evaluate exit rules ────────────────────────────────────────
+            # Re-fetch positions after price updates (HWM may have moved)
+            open_positions = await engine.get_positions()
+            now = datetime.now(UTC)
+            just_closed: set[str] = set()
+
+            for pos in open_positions:
+                current_price = engine.get_price(pos.ticker) or pos.entry_price
+                sentiment, mention_ratio = await _get_sentiment_context(redis, pos.ticker)
+                decision = exit_manager.evaluate(
+                    pos, current_price, cfg,
+                    current_sentiment=sentiment,
+                    mention_ratio=mention_ratio,
+                    now=now,
                 )
+                if decision.should_exit:
+                    await engine.close_position(pos.ticker, reason=decision.reason)
+                    just_closed.add(pos.ticker)
+                    await _publish_execution_event(redis, "position_closed", {
+                        "ticker": pos.ticker,
+                        "exit_price": current_price,
+                        "exit_reason": decision.reason or "unknown",
+                        "shares": pos.shares,
+                        "direction": pos.direction,
+                        "entry_price": pos.entry_price,
+                        "closed_at": datetime.now(UTC).isoformat(),
+                        "opened_at": pos.opened_at.isoformat() if pos.opened_at else "",
+                        "mode": mode,
+                    })
+                    await redis.hdel(_HWM_REDIS_KEY, pos.ticker)
+                    await redis.hdel(_POSITION_PARAMS_KEY, pos.ticker)
+                    POSITIONS_CLOSED.labels(reason=decision.reason or "unknown").inc()
+                    logger.info(
+                        "[EXIT] %s %s reason=%s pnl_approx=%.2f",
+                        pos.direction, pos.ticker, decision.reason,
+                        (current_price - pos.entry_price) * pos.shares
+                        if pos.direction == "LONG"
+                        else (pos.entry_price - current_price) * pos.shares,
+                    )
 
-        # Write account state (read by risk service)
-        await _write_account_state(redis, engine)
+            # ── 4. Reconcile external IB closes ──────────────────────────────
+            # Tickers that were open last cycle but are now gone (and we didn't
+            # close them) were filled by IB's bracket legs or closed in TWS.
+            now_open_tickers = {p.ticker for p in open_positions} - just_closed
+            if _prev_open_tickers:
+                await _reconcile_external_closes(
+                    redis, engine,
+                    prev_open=_prev_open_tickers,
+                    now_open=now_open_tickers,
+                    just_closed=just_closed,
+                    mode=mode,
+                )
+            _prev_open_tickers = now_open_tickers
 
-        # Update Prometheus account metrics
-        state = await engine.get_account_state()
-        PAPER_EQUITY.set(state.net_liquidation)
-        DAILY_PNL_PCT.set(state.daily_pnl / state.net_liquidation if state.net_liquidation else 0)
-        DRAWDOWN.set(state.drawdown_pct)
-        remaining_positions = await engine.get_positions()
-        OPEN_POSITIONS_COUNT.set(len(remaining_positions))
-        for pos in remaining_positions:
-            cur = engine.get_price(pos.ticker) or pos.entry_price
-            pnl = (cur - pos.entry_price) * pos.shares if pos.direction == "LONG" \
-                else (pos.entry_price - cur) * pos.shares
-            POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
+            # ── 5. Persist state + metrics ────────────────────────────────────
+            await _persist_hwm_to_redis(redis, engine)
+            await _persist_position_params_to_redis(redis, engine)
+            await _write_account_state(redis, engine)
+            await _write_positions_to_redis(redis, engine)
 
-        await asyncio.sleep(cfg.signal_poll_interval_sec)
+            state = await engine.get_account_state()
+            PAPER_EQUITY.set(state.net_liquidation)
+            DAILY_PNL_PCT.set(
+                state.daily_pnl / state.net_liquidation if state.net_liquidation else 0
+            )
+            DRAWDOWN.set(state.drawdown_pct)
+            remaining_positions = await engine.get_positions()
+            OPEN_POSITIONS_COUNT.set(len(remaining_positions))
+            for pos in remaining_positions:
+                cur = engine.get_price(pos.ticker) or pos.entry_price
+                pnl = (cur - pos.entry_price) * pos.shares if pos.direction == "LONG" \
+                    else (pos.entry_price - cur) * pos.shares
+                POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
+
+        except asyncio.CancelledError:
+            raise  # let the task be cancelled normally on shutdown
+        except Exception as exc:
+            logger.error("[EXIT LOOP] Unhandled error — will retry next cycle: %s", exc, exc_info=True)
+
+        await asyncio.sleep(cfg.signal_poll_interval_sec)  # type: ignore[possibly-undefined]
+
+
+async def _get_sentiment_context(
+    redis: aioredis.Redis,
+    ticker: str,
+    window_secs: float = 3600.0,
+) -> tuple[float, float]:
+    """
+    Read current sentiment score and mention ratio for a ticker from Redis.
+
+    Returns:
+        (current_sentiment, mention_ratio)
+        current_sentiment: engagement-weighted avg score ∈ [-1, 1], 0.0 if no data
+        mention_ratio: current_hour_mentions / peak_hour_mentions, 1.0 if no data
+    """
+    import json as _json  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    current_sentiment = 0.0
+    mention_ratio = 1.0
+
+    try:
+        # ── Sentiment: average score of posts in last window_secs ─────────────
+        key = f"sentiment:window:{ticker}"
+        cutoff = _time.time() - window_secs
+        raw_entries = await redis.zrangebyscore(key, cutoff, "+inf")
+        if raw_entries:
+            scores = []
+            for entry in raw_entries:
+                try:
+                    data = _json.loads(entry)
+                    s = float(data.get("score", 0.0))
+                    scores.append(s)
+                except Exception:
+                    pass
+            if scores:
+                current_sentiment = sum(scores) / len(scores)
+    except Exception:
+        pass
+
+    try:
+        # ── Mention ratio: latest hourly count / peak count ───────────────────
+        raw_history = await redis.lrange(f"mention_history:{ticker}", 0, -1)
+        if raw_history:
+            counts = [float(v) for v in raw_history]
+            peak = max(counts)
+            current = counts[-1]
+            if peak > 0:
+                mention_ratio = current / peak
+    except Exception:
+        pass
+
+    return current_sentiment, mention_ratio
 
 
 async def _write_market_snapshot_and_get_price(
@@ -387,6 +546,187 @@ async def _write_market_snapshot_and_get_price(
         logger.debug("Snapshot failed for %s: %s", ticker, exc)
     return None
 
+
+_HWM_REDIS_KEY = "hwm:all"
+_POSITION_PARAMS_KEY = "position:params"
+_EXEC_EVENTS_STREAM = "execution:events"
+_POSITIONS_LIVE_KEY = "positions:live"
+
+
+async def _load_hwm_from_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """Seed engine HWM from Redis at startup so trailing stops survive restarts."""
+    try:
+        raw = await redis.hgetall(_HWM_REDIS_KEY)
+        if not raw:
+            return
+        for field, value in raw.items():
+            ticker = field.decode() if isinstance(field, bytes) else field
+            try:
+                hwm_value = float(value.decode() if isinstance(value, bytes) else value)
+                engine.seed_hwm(ticker, hwm_value)
+            except (ValueError, AttributeError):
+                continue
+        logger.info("[HWM] Loaded %d high-water marks from Redis", len(raw))
+    except Exception as exc:
+        logger.warning("[HWM] Failed to load from Redis: %s", exc)
+
+
+async def _persist_hwm_to_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """Persist engine HWM dict to Redis so trailing stops survive restarts."""
+    try:
+        hwm = engine.get_hwm()
+        if not hwm:
+            return
+        mapping = {ticker: str(value) for ticker, value in hwm.items()}
+        await redis.hset(_HWM_REDIS_KEY, mapping=mapping)
+    except Exception as exc:
+        logger.warning("[HWM] Failed to persist to Redis: %s", exc)
+
+
+async def _load_position_params_from_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """Restore position params (sl/tp/opened_at) from Redis so exit rules work after restart."""
+    import json as _json  # noqa: PLC0415
+    if not hasattr(engine, "seed_position_params"):
+        return  # PaperTradingEngine doesn't need this (state is in-memory)
+    try:
+        raw = await redis.hgetall(_POSITION_PARAMS_KEY)
+        if not raw:
+            return
+        for field, value in raw.items():
+            ticker = field.decode() if isinstance(field, bytes) else field
+            try:
+                params = _json.loads(value.decode() if isinstance(value, bytes) else value)
+                engine.seed_position_params(ticker, params)  # type: ignore[union-attr]
+            except Exception:
+                continue
+        logger.info("[PARAMS] Loaded position params for %d tickers from Redis", len(raw))
+    except Exception as exc:
+        logger.warning("[PARAMS] Failed to load from Redis: %s", exc)
+
+
+async def _persist_position_params_to_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """Persist position params (sl/tp/opened_at) to Redis so exit rules survive restarts."""
+    import json as _json  # noqa: PLC0415
+    if not hasattr(engine, "get_position_params"):
+        return  # PaperTradingEngine doesn't need this
+    try:
+        params = engine.get_position_params()  # type: ignore[union-attr]
+        if not params:
+            return
+        mapping = {ticker: _json.dumps(p) for ticker, p in params.items()}
+        await redis.hset(_POSITION_PARAMS_KEY, mapping=mapping)
+    except Exception as exc:
+        logger.warning("[PARAMS] Failed to persist to Redis: %s", exc)
+
+
+async def _reconcile_startup(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """
+    Compare Redis position:params against IB's current positions on startup.
+
+    Any ticker present in Redis state but absent from IB was closed while the
+    service was offline (bracket fill, manual close in TWS, etc.).  Clean up
+    so stale sl/tp/hwm don't trigger false exits on the first cycle.
+    """
+    if not hasattr(engine, "get_position_params"):
+        return  # Paper engine — no IB to reconcile against
+    params = engine.get_position_params()  # type: ignore[union-attr]
+    if not params:
+        return
+    try:
+        current = await engine.get_positions()
+        current_tickers = {p.ticker for p in current}
+    except Exception as exc:
+        logger.warning("[SYNC] Startup reconciliation skipped — IB unavailable: %s", exc)
+        return
+
+    orphaned = set(params) - current_tickers
+    for ticker in orphaned:
+        engine.forget_position(ticker)  # type: ignore[union-attr]
+        await redis.hdel(_HWM_REDIS_KEY, ticker)
+        await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        logger.warning(
+            "[SYNC] %s: found in persisted state but not in IB — "
+            "likely closed while service was offline; cleaned up",
+            ticker,
+        )
+
+    if current_tickers - set(params):
+        for ticker in current_tickers - set(params):
+            logger.warning(
+                "[SYNC] %s: open in IB but no persisted params — "
+                "orphaned position (opened manually or from prior session)",
+                ticker,
+            )
+
+
+async def _reconcile_external_closes(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+    prev_open: set[str],
+    now_open: set[str],
+    just_closed: set[str],
+    mode: str = "paper",
+) -> None:
+    """
+    Detect tickers that disappeared from IB positions without this service closing them.
+
+    These are positions filled by IB's bracket legs (stop-loss or take-profit
+    executed natively) or closed manually in TWS.  Clean up Redis state and log.
+    """
+    externally_closed = prev_open - now_open - just_closed
+    for ticker in externally_closed:
+        # Read params BEFORE cleanup so we can include them in the close event
+        opened_at = datetime.now(UTC).isoformat()
+        direction = "unknown"
+        params_raw = await redis.hget(_POSITION_PARAMS_KEY, ticker)
+        if params_raw:
+            try:
+                params = json.loads(
+                    params_raw.decode() if isinstance(params_raw, bytes) else params_raw
+                )
+                opened_at = params.get("opened_at", opened_at)
+                direction = params.get("direction", direction)
+            except Exception:
+                pass
+
+        engine.forget_position(ticker)
+        await redis.hdel(_HWM_REDIS_KEY, ticker)
+        await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        POSITIONS_CLOSED.labels(reason="IB_EXTERNAL").inc()
+        logger.info(
+            "[SYNC] %s closed externally by IB (bracket fill or manual TWS close)", ticker
+        )
+        await _publish_execution_event(redis, "position_closed", {
+            "ticker": ticker,
+            "exit_price": 0.0,
+            "exit_reason": "IB_EXTERNAL",
+            "direction": direction,
+            "closed_at": datetime.now(UTC).isoformat(),
+            "opened_at": opened_at,
+            "mode": mode,
+        })
+        await redis.lpush("trades:recent", json.dumps({
+            "ticker": ticker,
+            "direction": direction,
+            "exit_reason": "IB_EXTERNAL",
+            "closed_at": datetime.now(UTC).isoformat(),
+        }))
+        await redis.ltrim("trades:recent", 0, 999)
 
 
 # ── UI command listener ────────────────────────────────────────────────────────
@@ -498,13 +838,23 @@ async def main(use_ibkr: bool = False) -> None:
     breaker = CircuitBreaker(redis)
     bus = TradingEventBus(redis)
 
+    mode = "live" if use_ibkr else "paper"
+    await redis.set("trading:mode", mode)
+
+    # Restore HWM and position params from Redis so trailing stops survive restarts
+    await _load_hwm_from_redis(redis, engine)
+    await _load_position_params_from_redis(redis, engine)
+
+    # Reconcile: clean up Redis state for positions closed while service was offline
+    await _reconcile_startup(redis, engine)
+
     tasks = [
         asyncio.create_task(
-            run_trade_loop(bus, engine, redis, market_data),
+            run_trade_loop(bus, engine, redis, market_data, mode=mode),
             name="exec:trade",
         ),
         asyncio.create_task(
-            run_exit_loop(engine, exit_manager, market_data, breaker, redis),
+            run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode),
             name="exec:exit",
         ),
         asyncio.create_task(
