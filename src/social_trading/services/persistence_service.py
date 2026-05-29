@@ -1,12 +1,15 @@
 """
 Persistence Service — writes Redis stream events to PostgreSQL.
 
-Three concurrent consumer tasks:
+Five concurrent consumer tasks:
 
-  raw_social_task:       Consumes raw_social → inserts into social_raw table.
-  sentiment_task:        Consumes sentiment_signals → inserts into sentiment_scores;
-                         also periodically aggregates into sentiment_aggregates.
-  signal_task:           Consumes strategy_signals → inserts into signals table.
+  raw_social_task:         Consumes raw_social → inserts into social_raw table.
+  sentiment_task:          Consumes sentiment_signals → inserts into sentiment_scores;
+                           also periodically aggregates into sentiment_aggregates.
+  signal_task:             Consumes strategy_signals → inserts into signals table.
+  approved_signals_task:   Consumes selected_signals → marks signals.approved=TRUE.
+  exec_events_task:        Consumes execution:events → writes trades table;
+                           marks signals.executed=TRUE on position_opened.
 
 This service is the bridge between the Redis-based event pipeline and the
 PostgreSQL tables that power the Streamlit monitoring UI.
@@ -31,6 +34,7 @@ from dotenv import load_dotenv
 
 from social_trading.core.events import (
     STREAM_RAW_SOCIAL,
+    STREAM_SELECTED_SIGNALS,
     STREAM_SENTIMENT,
     STREAM_STRATEGY_SIGNALS,
 )
@@ -226,6 +230,45 @@ def _write_signals(rows: list[dict]) -> int:
     return inserted
 
 
+def _mark_signal_approved(ticker: str, generated_at: str) -> None:
+    """Set approved=TRUE on the signal matching (ticker, generated_at)."""
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET    approved = TRUE
+                    WHERE  ticker = %s
+                      AND  generated_at = %s::timestamptz
+                      AND  approved = FALSE
+                    """,
+                    (ticker, generated_at),
+                )
+    finally:
+        conn.close()
+
+
+def _mark_signal_executed(ticker: str, generated_at: str) -> None:
+    """Set executed=TRUE on the signal matching (ticker, generated_at)."""
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET    executed = TRUE
+                    WHERE  ticker = %s
+                      AND  generated_at = %s::timestamptz
+                    """,
+                    (ticker, generated_at),
+                )
+    finally:
+        conn.close()
+
+
 def _aggregate_sentiment() -> int:
     """
     Roll up sentiment_scores into 15-minute sentiment_aggregates buckets.
@@ -350,6 +393,7 @@ def _write_trade_opened(data: dict) -> None:
     """
     Insert an opening trade record into the trades table.
     Uses stream_event_id for idempotency (skip if already processed).
+    Looks up signal_id from the signals table using (ticker, signal_generated_at).
     """
     conn = _get_conn()
     try:
@@ -359,11 +403,16 @@ def _write_trade_opened(data: dict) -> None:
                     """
                     INSERT INTO trades
                         (ticker, direction, shares, entry_price, stop_price,
-                         target_price, opened_at, status, mode, stream_event_id)
+                         target_price, opened_at, status, mode, stream_event_id,
+                         signal_id)
                     VALUES
                         (%(ticker)s, %(direction)s, %(shares)s, %(entry_price)s,
                          %(stop_price)s, %(target_price)s, %(opened_at)s,
-                         'open', %(mode)s, %(stream_event_id)s)
+                         'open', %(mode)s, %(stream_event_id)s,
+                         (SELECT id FROM signals
+                          WHERE ticker = %(ticker)s
+                            AND generated_at = %(signal_generated_at)s::timestamptz
+                          ORDER BY id DESC LIMIT 1))
                     ON CONFLICT (stream_event_id) DO NOTHING
                     """,
                     {
@@ -376,6 +425,7 @@ def _write_trade_opened(data: dict) -> None:
                         "opened_at": data.get("opened_at") or datetime.now(UTC).isoformat(),
                         "mode": data.get("mode", "paper"),
                         "stream_event_id": data.get("stream_event_id"),
+                        "signal_generated_at": data.get("signal_generated_at") or None,
                     },
                 )
     except psycopg2.Error as exc:
@@ -598,6 +648,33 @@ async def run_signal_task(bus: TradingEventBus) -> None:
             logger.info("signals: persisted %d signals (total=%d)", n, total)
 
 
+async def run_approved_signals_task(bus: TradingEventBus) -> None:
+    """
+    Consume selected_signals stream and mark matching DB rows as approved=TRUE.
+
+    The risk service writes to selected_signals after each signal passes all
+    risk checks.  We update signals.approved here rather than in the risk service
+    itself to keep DB writes in one process.
+    """
+    await bus.create_group(STREAM_SELECTED_SIGNALS, _GROUP)
+    while True:
+        messages = await bus.consume(
+            STREAM_SELECTED_SIGNALS, _GROUP, "persist-approved-0", count=_BATCH
+        )
+        if not messages:
+            continue
+        for msg_id, fields in messages:
+            ticker = fields.get("ticker", "")
+            generated_at = fields.get("generated_at", "")
+            if ticker and generated_at:
+                try:
+                    await _run_db(_mark_signal_approved, ticker, generated_at)
+                    logger.debug("signal approved in DB: %s @ %s", ticker, generated_at)
+                except Exception as exc:
+                    logger.warning("Failed to mark signal approved (%s): %s", ticker, exc)
+            await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+
+
 async def run_prune_task() -> None:
     """Periodically delete stale rows from all monitoring DB tables."""
     loop = asyncio.get_event_loop()
@@ -631,6 +708,16 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
                 try:
                     if event_type == "position_opened":
                         await _run_db(_write_trade_opened, fields)
+                        # Also mark the originating signal as executed
+                        signal_ts = fields.get("signal_generated_at", "")
+                        ticker = fields.get("ticker", "")
+                        if ticker and signal_ts:
+                            try:
+                                await _run_db(_mark_signal_executed, ticker, signal_ts)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to mark signal executed (%s): %s", ticker, exc
+                                )
                         logger.info(
                             "[EXEC_EVENTS] Trade opened: %s %s",
                             fields.get("direction", ""), fields.get("ticker", ""),
@@ -740,6 +827,7 @@ async def main() -> None:
         asyncio.create_task(run_raw_social_task(bus), name="raw_social"),
         asyncio.create_task(run_sentiment_task(bus), name="sentiment"),
         asyncio.create_task(run_signal_task(bus), name="signal"),
+        asyncio.create_task(run_approved_signals_task(bus), name="approved_signals"),
         asyncio.create_task(run_prune_task(), name="prune"),
         asyncio.create_task(run_execution_events_task(bus), name="exec_events"),
         asyncio.create_task(run_positions_sync_task(redis), name="positions_sync"),

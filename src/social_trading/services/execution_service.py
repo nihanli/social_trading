@@ -270,6 +270,7 @@ async def run_trade_loop(
                             "stop_loss": stop_loss,
                             "take_profit": take_profit,
                             "opened_at": result.submitted_at.isoformat(),
+                            "signal_generated_at": signal.generated_at.isoformat(),
                             "mode": mode,
                         })
                         await redis.lpush("trades:recent", json.dumps({
