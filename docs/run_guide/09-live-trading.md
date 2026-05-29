@@ -34,7 +34,6 @@ Click **Save Configuration** after changes.
 1. **Update `.env`:**
    ```dotenv
    IBKR_PORT=4001
-   IBKR_PAPER=false
    TRADING_MODE=live
    ```
 

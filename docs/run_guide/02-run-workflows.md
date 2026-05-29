@@ -102,7 +102,6 @@ docker compose up -d prometheus grafana
 2. Update `.env`:
    ```dotenv
    IBKR_PORT=4001        # IB Gateway live port
-   IBKR_PAPER=false
    TRADING_MODE=live
    ```
 

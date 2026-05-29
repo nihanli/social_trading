@@ -251,7 +251,12 @@ def _mark_signal_approved(ticker: str, generated_at: str) -> None:
 
 
 def _mark_signal_executed(ticker: str, generated_at: str) -> None:
-    """Set executed=TRUE on the signal matching (ticker, generated_at)."""
+    """Set executed=TRUE (and approved=TRUE) on the signal matching (ticker, generated_at).
+
+    Setting approved=TRUE here covers the race condition where the execution
+    event is processed before the selected_signals consumer updates approved,
+    and also backfills signals approved before run_approved_signals_task was deployed.
+    """
     conn = _get_conn()
     try:
         with conn:
@@ -259,7 +264,8 @@ def _mark_signal_executed(ticker: str, generated_at: str) -> None:
                 cur.execute(
                     """
                     UPDATE signals
-                    SET    executed = TRUE
+                    SET    executed = TRUE,
+                           approved = TRUE
                     WHERE  ticker = %s
                       AND  generated_at = %s::timestamptz
                     """,

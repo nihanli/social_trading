@@ -59,9 +59,11 @@ class IBKRExecutionEngine:
     def __init__(
         self,
         ib: Any,
+        account: str = "",
         paper_prices: dict[str, float] | None = None,
     ) -> None:
         self._ib = ib
+        self._account = account  # IB account number, e.g. "DU123456" (paper) or "U123456" (live)
         self._paper_prices = paper_prices or {}
         self._prices: dict[str, float] = {}
         self._hwm: dict[str, float] = {}  # high-water marks for trailing stops
@@ -123,67 +125,233 @@ class IBKRExecutionEngine:
         take_profit: float,
     ) -> OrderResult:
         """
-        Place a bracket order for a signal.
+        Submit a market entry order, wait for IB acknowledgement, then attach
+        OCA stop/limit orders as a server-side failsafe.
 
-        Order structure:
-            parent  → MarketOrder (transmit=False)
-            stop    → StopOrder (parentId=parent, transmit=False)
-            target  → LimitOrder (parentId=parent, transmit=True — triggers whole bracket)
+        Sequence:
+            1. MarketOrder(transmit=True) — immediately live on IB side
+            2. Poll until order reaches Submitted/PreSubmitted (IB accepted)
+               OR Filled (paper fill arrived quickly).
+               Reject only if order goes Inactive/Cancelled (IB hard-reject).
+            3. Attach OCA stop + limit (both transmit=True).
+               When fill_price is not yet known we trust the risk service's
+               SL/TP values and skip the directional sanity-check.
+            4. If OCA submission raises a Python exception: immediately close
+               the position to avoid an unprotected open.
+
+        Notes:
+            - IB paper accounts may fill market orders with a delay if market
+              data subscriptions are missing (Error 10089).  Treating
+              "Submitted" as success avoids incorrectly cancelling live orders.
+            - The software exit loop is the primary SL/TP/trailing-stop manager.
+              OCA orders are a server-side failsafe if the service goes offline.
         """
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed — use PaperTradingEngine for testing")
 
-        from ib_async import LimitOrder, MarketOrder, Stock, StopOrder  # noqa: PLC0415
+        from ib_async import LimitOrder, MarketOrder, OrderStatus, Stock, StopOrder  # noqa: PLC0415
+
+        _SUBMIT_TIMEOUT_SEC = 10   # time to wait for IB to acknowledge the order
+        _POLL_INTERVAL      = 0.25
 
         ticker = signal.ticker
         action = "BUY" if signal.direction == "LONG" else "SELL"
         close_action = "SELL" if action == "BUY" else "BUY"
 
+        entry_trade = None
+        entry_id: int = 0
+
         try:
             contract = Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
 
-            # Place parent market order (held until child legs are registered)
-            parent = MarketOrder(action, quantity)
-            parent.transmit = False
-            parent_trade = self._ib.placeOrder(contract, parent)
-            parent_id = parent_trade.order.orderId
+            # ── 1. Entry order — transmit immediately ────────────────────────
+            entry = MarketOrder(action, quantity)
+            entry.transmit = True
+            if self._account:
+                entry.account = self._account
+            entry_trade = self._ib.placeOrder(contract, entry)
+            entry_id = entry_trade.order.orderId
+            logger.info(
+                "[IBKR] ENTRY submitted %s %s qty=%d orderId=%d",
+                action, ticker, quantity, entry_id,
+            )
 
-            # Stop-loss child
-            stop = StopOrder(close_action, quantity, stop_loss)
-            stop.parentId = parent_id
-            stop.transmit = False
-            self._ib.placeOrder(contract, stop)
+            # ── 2. Wait for IB acknowledgement or fill ───────────────────────
+            # We accept Submitted/PreSubmitted (IB received the order) as well as
+            # Filled (paper fill arrived quickly).  We only reject if IB actively
+            # rejects the order (Inactive/Cancelled/ApiCancelled) or if the order
+            # never leaves PendingSubmit within the timeout (connection stall).
+            elapsed = 0.0
+            order_accepted = False
+            while elapsed < _SUBMIT_TIMEOUT_SEC:
+                await asyncio.sleep(_POLL_INTERVAL)
+                elapsed += _POLL_INTERVAL
+                status = entry_trade.orderStatus.status
+                if status in (
+                    OrderStatus.Submitted,
+                    OrderStatus.PreSubmitted,
+                    OrderStatus.Filled,
+                ):
+                    order_accepted = True
+                    break
+                if status in OrderStatus.DoneStates:
+                    # IB rejected the order outright
+                    logger.error(
+                        "[IBKR] ENTRY rejected by IB: %s orderId=%d status=%s",
+                        ticker, entry_id, status,
+                    )
+                    return OrderResult(
+                        order_id=str(entry_id),
+                        ticker=ticker,
+                        direction=signal.direction,
+                        quantity=quantity,
+                        status="rejected",
+                        error=f"IB rejected order: {status}",
+                    )
 
-            # Take-profit child — transmit=True releases the entire bracket atomically
-            target = LimitOrder(close_action, quantity, take_profit)
-            target.parentId = parent_id
-            target.transmit = True
-            self._ib.placeOrder(contract, target)
+            if not order_accepted:
+                # Order stuck in PendingSubmit — connection or TWS issue
+                self._ib.cancelOrder(entry_trade.order)
+                logger.error(
+                    "[IBKR] ENTRY not acknowledged after %.1fs, cancelled: %s orderId=%d",
+                    _SUBMIT_TIMEOUT_SEC, ticker, entry_id,
+                )
+                return OrderResult(
+                    order_id=str(entry_id),
+                    ticker=ticker,
+                    direction=signal.direction,
+                    quantity=quantity,
+                    status="rejected",
+                    error=f"order not acknowledged after {_SUBMIT_TIMEOUT_SEC}s",
+                )
 
-            # Wait briefly for fill confirmation
-            await asyncio.sleep(0.5)
-
-            # Read fill price from parent trade
+            # Use actual fill price if already available; None otherwise
+            # (paper fills with delayed data may arrive after we return)
             fill_price: float | None = None
-            if parent_trade.fills:
-                fill_price = float(parent_trade.fills[0].execution.price)
+            if entry_trade.fills:
+                fill_price = float(entry_trade.fills[0].execution.price)
+                logger.info(
+                    "[IBKR] ENTRY filled %s %s qty=%d fill=%.4f",
+                    action, ticker, quantity, fill_price,
+                )
+            else:
+                logger.info(
+                    "[IBKR] ENTRY accepted %s %s qty=%d status=%s (fill pending)",
+                    action, ticker, quantity, entry_trade.orderStatus.status,
+                )
 
-            order_id = str(parent_id)
-            # Save position params so exit rules (sl/tp/time) work correctly after restart
+            # ── 3. Attach OCA stop + limit ───────────────────────────────────
+            # When fill_price is known, validate direction; otherwise trust the
+            # risk service (SL/TP were computed from the same entry price).
+            def _sl_valid(fp: float | None) -> bool:
+                if stop_loss <= 0:
+                    return False
+                if fp is None:
+                    return True   # trust risk service
+                return (
+                    (signal.direction == "LONG"  and stop_loss  < fp)
+                    or (signal.direction == "SHORT" and stop_loss  > fp)
+                )
+
+            def _tp_valid(fp: float | None) -> bool:
+                if take_profit <= 0:
+                    return False
+                if fp is None:
+                    return True   # trust risk service
+                return (
+                    (signal.direction == "LONG"  and take_profit > fp)
+                    or (signal.direction == "SHORT" and take_profit < fp)
+                )
+
+            oca_group = f"oca_{entry_id}"
+            oca_errors: list[str] = []
+            oca_trades = []
+
+            if _sl_valid(fill_price):
+                try:
+                    stop_order = StopOrder(close_action, quantity, stop_loss)
+                    stop_order.ocaGroup   = oca_group
+                    stop_order.ocaType    = 1     # cancel sibling on fill
+                    stop_order.tif        = "GTC" # persist until triggered or cancelled
+                    stop_order.outsideRth = True  # trigger in after-hours (protective stop)
+                    stop_order.transmit   = True
+                    if self._account:
+                        stop_order.account = self._account
+                    sl_trade = self._ib.placeOrder(contract, stop_order)
+                    oca_trades.append(sl_trade)
+                    logger.info(
+                        "[IBKR] OCA stop placed: %s sl=%.4f orderId=%d",
+                        ticker, stop_loss, sl_trade.order.orderId,
+                    )
+                except Exception as exc:
+                    oca_errors.append(f"stop: {exc}")
+                    logger.error("[IBKR] OCA stop failed for %s: %s", ticker, exc)
+            else:
+                logger.warning(
+                    "[IBKR] stop_loss=%.4f invalid vs fill=%s (%s) — OCA stop skipped",
+                    stop_loss, fill_price, signal.direction,
+                )
+
+            if _tp_valid(fill_price):
+                try:
+                    limit_order = LimitOrder(close_action, quantity, take_profit)
+                    limit_order.ocaGroup = oca_group
+                    limit_order.ocaType  = 1
+                    limit_order.tif      = "GTC"  # persist until triggered or cancelled
+                    limit_order.transmit = True
+                    if self._account:
+                        limit_order.account = self._account
+                    tp_trade = self._ib.placeOrder(contract, limit_order)
+                    oca_trades.append(tp_trade)
+                    logger.info(
+                        "[IBKR] OCA limit placed: %s tp=%.4f orderId=%d",
+                        ticker, take_profit, tp_trade.order.orderId,
+                    )
+                except Exception as exc:
+                    oca_errors.append(f"limit: {exc}")
+                    logger.error("[IBKR] OCA limit failed for %s: %s", ticker, exc)
+            else:
+                logger.warning(
+                    "[IBKR] take_profit=%.4f invalid vs fill=%s (%s) — OCA limit skipped",
+                    take_profit, fill_price, signal.direction,
+                )
+
+            # Flush OCA messages to IB and allow acknowledgement callbacks to fire
+            if oca_trades:
+                await asyncio.sleep(0.5)
+                for t in oca_trades:
+                    logger.debug(
+                        "[IBKR] OCA order status %s orderId=%d status=%s",
+                        ticker, t.order.orderId, t.orderStatus.status,
+                    )
+
+            # ── 4. If OCA raised a Python exception, close immediately ────────
+            if oca_errors:
+                logger.error(
+                    "[IBKR] OCA submission failed (%s), closing position: %s",
+                    oca_errors, ticker,
+                )
+                await self.close_position(ticker, reason="OCA_FAILED")
+                return OrderResult(
+                    order_id=str(entry_id),
+                    ticker=ticker,
+                    direction=signal.direction,
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    status="rejected",
+                    error=f"OCA failed, position closed: {oca_errors}",
+                )
+
+            # Save position params so exit rules work correctly after restart
             self._position_params[ticker] = {
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
                 "opened_at": datetime.now(UTC).isoformat(),
                 "direction": signal.direction,
             }
-            logger.info(
-                "[IBKR] BRACKET %s %s qty=%d sl=%.4f tp=%.4f fill=%.4f",
-                action, ticker, quantity, stop_loss, take_profit,
-                fill_price or 0.0,
-            )
             return OrderResult(
-                order_id=order_id,
+                order_id=str(entry_id),
                 ticker=ticker,
                 direction=signal.direction,
                 quantity=quantity,
@@ -192,9 +360,20 @@ class IBKRExecutionEngine:
             )
 
         except Exception as exc:
-            logger.error("[IBKR] Order failed for %s: %s", ticker, exc)
+            logger.error("[IBKR] submit_signal failed for %s: %s", ticker, exc)
+            # If the entry was placed and accepted, attempt emergency close
+            if entry_trade is not None and (
+                entry_trade.fills or entry_trade.orderStatus.status in (
+                    OrderStatus.Submitted, OrderStatus.Filled
+                )
+            ):
+                logger.warning("[IBKR] Emergency close after submit error: %s", ticker)
+                try:
+                    await self.close_position(ticker, reason="SUBMIT_ERROR")
+                except Exception as close_exc:
+                    logger.error("[IBKR] Emergency close failed: %s", close_exc)
             return OrderResult(
-                order_id=str(uuid.uuid4()),
+                order_id=str(entry_id) if entry_id else str(uuid.uuid4()),
                 ticker=ticker,
                 direction=signal.direction,
                 quantity=quantity,
@@ -244,6 +423,8 @@ class IBKRExecutionEngine:
             direction: Direction = "LONG" if pos_qty > 0 else "SHORT"
             close_order = MarketOrder(close_action, abs(pos_qty))
             close_order.transmit = True  # must be explicit — default varies by ib_async version
+            if self._account:
+                close_order.account = self._account
             trade = self._ib.placeOrder(contract, close_order)
             await asyncio.sleep(0.5)
 

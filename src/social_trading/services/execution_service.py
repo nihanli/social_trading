@@ -827,14 +827,15 @@ async def main(use_ibkr: bool = False) -> None:
             ib = IB()
             port = int(os.getenv("IBKR_PORT", "7497"))  # default paper
             client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
+            ib_account = os.getenv("IBKR_ACCOUNT", "")
             await ib.connectAsync("127.0.0.1", port, clientId=client_id)
-            engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib)  # type: ignore[assignment]
+            engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib, account=ib_account)  # type: ignore[assignment]
             # Use IB for real-time prices; yfinance as fallback for any gaps
             market_data: YFinanceMarketData = FallbackMarketData(  # type: ignore[assignment]
                 primary=IBKRMarketData(ib=ib),
                 secondary=YFinanceMarketData(),
             )
-            logger.info("Connected to IBKR port=%d clientId=%d (IB market data primary)", port, client_id)
+            logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary)", port, client_id, ib_account or "(auto)")
         except Exception as exc:
             logger.error("IBKR connection failed: %s — falling back to paper mode", exc)
             engine = PaperTradingEngine(initial_cash=100_000.0)

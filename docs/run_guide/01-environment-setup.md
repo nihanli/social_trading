@@ -208,7 +208,6 @@ IBKR_HOST=127.0.0.1        # shared by execution layer and market scanner
 # Execution layer
 IBKR_PORT=7497          # 7497=TWS paper, 4002=Gateway paper, 4001=Gateway live
 IBKR_CLIENT_ID=10
-IBKR_PAPER=true
 
 # Market Scanner (discovery) — separate client ID avoids "Already connected" errors
 IBKR_SCANNER_PORT=7497             # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
