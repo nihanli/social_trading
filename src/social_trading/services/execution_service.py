@@ -42,7 +42,7 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_SELECTED_SIGNALS
+from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
 from social_trading.market_data.composite import FallbackMarketData
@@ -136,7 +136,11 @@ async def _publish_execution_event(
     try:
         fields = {"event": event_type}
         fields.update({k: str(v) if v is not None else "" for k, v in data.items()})
-        await redis.xadd(_EXEC_EVENTS_STREAM, fields, maxlen=50_000)
+        await redis.xadd(
+            _EXEC_EVENTS_STREAM, fields,
+            maxlen=STREAM_MAXLEN.get(_EXEC_EVENTS_STREAM, 50_000),
+            approximate=True,
+        )
     except Exception as exc:
         logger.warning("[EVENTS] Failed to publish %s event: %s", event_type, exc)
 
@@ -529,7 +533,8 @@ async def _write_market_snapshot_and_get_price(
             adv_shares = quote.get("avg_volume_30d", 1_000_000.0)
             adv_usd = adv_shares * last
 
-            await redis.hset(f"market_data:{ticker}", mapping={
+            key = f"market_data:{ticker}"
+            await redis.hset(key, mapping={
                 "last": str(last),
                 "bid": str(quote.get("bid", last * 0.999)),
                 "ask": str(quote.get("ask", last * 1.001)),
@@ -541,6 +546,10 @@ async def _write_market_snapshot_and_get_price(
                 "vix": str(vix),
                 "updated_at": datetime.now(UTC).isoformat(),
             })
+            # Expire after 4 hours — prevents stale tickers accumulating as
+            # the watchlist rotates.  Active tickers are refreshed every cycle
+            # so they never actually expire while in the watchlist.
+            await redis.expire(key, 4 * 3600)
             return float(last)
     except Exception as exc:
         logger.debug("Snapshot failed for %s: %s", ticker, exc)

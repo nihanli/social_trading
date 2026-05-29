@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 WINDOW_KEY = "sentiment:window:{ticker}"
 # Keep up to 24 hours of results even if window is shorter (serves history page)
 MAX_WINDOW_HOURS = 24.0
+# Auto-expire the ZSET key 2 hours after the last write so stale tickers
+# that leave the watchlist don't accumulate in Redis memory indefinitely.
+_WINDOW_KEY_TTL_SEC = int((MAX_WINDOW_HOURS + 2) * 3600)  # 26 hours
 
 
 @dataclass
@@ -102,6 +105,8 @@ class SentimentAggregator:
             # Trim entries older than MAX_WINDOW_HOURS
             cutoff = now - MAX_WINDOW_HOURS * 3600
             pipe.zremrangebyscore(key, 0, cutoff)
+            # Refresh TTL so the key auto-expires if the ticker leaves the watchlist
+            pipe.expire(key, _WINDOW_KEY_TTL_SEC)
             await pipe.execute()
 
     # ── Read ──────────────────────────────────────────────────────────────────

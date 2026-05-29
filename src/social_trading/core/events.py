@@ -87,9 +87,10 @@ class ApprovedSignalEvent(TypedDict):
 # ── Stream name constants ─────────────────────────────────────────────────────
 STREAM_RAW_SOCIAL = "raw_social"
 STREAM_SENTIMENT = "sentiment_signals"
-STREAM_MARKET_DATA = "market_data"
+STREAM_MARKET_DATA = "market_data"       # reserved — not yet published
 STREAM_STRATEGY_SIGNALS = "strategy_signals"
 STREAM_SELECTED_SIGNALS = "selected_signals"
+STREAM_EXEC_EVENTS = "execution:events"  # position open/close lifecycle events
 
 ALL_STREAMS = [
     STREAM_RAW_SOCIAL,
@@ -97,17 +98,23 @@ ALL_STREAMS = [
     STREAM_MARKET_DATA,
     STREAM_STRATEGY_SIGNALS,
     STREAM_SELECTED_SIGNALS,
+    STREAM_EXEC_EVENTS,
 ]
 
 # Maximum entries to retain per stream (approximate trim — Redis `MAXLEN ~`).
 # Sized to cover several hours of consumer lag at peak ingest rates.
-#   raw_social / sentiment_signals: ~35K posts/hr from Bluesky → 250K ≈ 7 hours
-#   strategy_signals: one evaluation/ticker/minute, ~300 tickers → 25K ≈ 1.4 hrs
-#   selected_signals: risk-filtered subset → 10K
+#
+#   raw_social / sentiment_signals : ~35K posts/hr (Bluesky peak) → 250K ≈ 7 hrs
+#   strategy_signals               : 1 eval/ticker/min × 300 tickers → 25K ≈ 1.4 hrs
+#   selected_signals               : risk-filtered subset → 10K
+#   execution:events               : at most 1 event per position open/close;
+#                                    50K covers thousands of round-trip trades
+#   market_data                    : reserved stream, not yet published
 STREAM_MAXLEN: dict[str, int] = {
     STREAM_RAW_SOCIAL:        250_000,
     STREAM_SENTIMENT:         250_000,
     STREAM_MARKET_DATA:        50_000,
     STREAM_STRATEGY_SIGNALS:   25_000,
     STREAM_SELECTED_SIGNALS:   10_000,
+    STREAM_EXEC_EVENTS:        50_000,
 }

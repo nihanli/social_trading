@@ -2,7 +2,7 @@
 
 install:
 	pip install -e ".[dev]"
-	python -m spacy download en_core_web_sm
+	python3 -m spacy download en_core_web_sm
 
 test:
 	pytest tests/unit/ -v
@@ -35,7 +35,7 @@ start:
 	honcho start
 
 migrate:
-	python migrations/migrate.py
+	.venv/bin/python migrations/migrate.py
 
 # Start all app services inside Docker (production / server deployment)
 # For local development, run services directly: see docs/live-run-guide.md

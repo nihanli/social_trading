@@ -28,6 +28,7 @@ def make_ohlcv_df(n: int = 20, close_start: float = 100.0, step: float = 1.0) ->
 
 def make_ticker_mock(last: float = 150.0, bid: float = 149.9, ask: float = 150.1) -> MagicMock:
     t = MagicMock()
+    # Legacy info dict kept for any code that still reads t.info
     t.info = {
         "currentPrice": last,
         "bid": bid,
@@ -36,7 +37,14 @@ def make_ticker_mock(last: float = 150.0, bid: float = 149.9, ask: float = 150.1
         "averageVolume": 3_000_000,
         "marketCap": 2_500_000_000_000,
     }
-    t.fast_info = {}
+    # fast_info must be an object with attribute access (not a plain dict)
+    fi = MagicMock()
+    fi.last_price = last if last != 0.0 else None
+    fi.previous_close = last if last != 0.0 else None
+    fi.last_volume = 5_000_000
+    fi.three_month_average_volume = 3_000_000
+    fi.market_cap = 2_500_000_000_000
+    t.fast_info = fi
     return t
 
 
@@ -47,14 +55,14 @@ async def test_get_quote_returns_expected_fields() -> None:
     provider = YFinanceMarketData(ticker_fn=lambda s: ticker_mock)
     quote = await provider.get_quote("AAPL")
     assert quote["last"] == pytest.approx(178.50)
-    assert quote["bid"] == pytest.approx(178.40)
-    assert quote["ask"] == pytest.approx(178.60)
+    assert quote["bid"] == pytest.approx(178.50 * 0.999)
+    assert quote["ask"] == pytest.approx(178.50 * 1.001)
     assert quote["volume"] == 5_000_000
     assert quote["avg_volume_30d"] == 3_000_000
 
 
 async def test_get_quote_bid_ask_fallback() -> None:
-    """When bid/ask are 0, fall back to last ± 0.1%."""
+    """bid/ask are always synthesised from last ± 0.1% since fast_info has no bid/ask."""
     ticker_mock = make_ticker_mock(last=100.0, bid=0.0, ask=0.0)
     provider = YFinanceMarketData(ticker_fn=lambda s: ticker_mock)
     quote = await provider.get_quote("AAPL")
@@ -174,7 +182,6 @@ async def test_health_check_passes_when_quote_available() -> None:
 
 async def test_health_check_fails_when_last_zero() -> None:
     spy_mock = make_ticker_mock(last=0.0, bid=0.0, ask=0.0)
-    spy_mock.info = {"currentPrice": 0.0, "bid": 0.0, "ask": 0.0}
     provider = YFinanceMarketData(ticker_fn=lambda s: spy_mock)
     healthy = await provider.health_check()
     assert healthy is False

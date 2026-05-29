@@ -82,6 +82,9 @@ class YFinanceMarketData:
         """
         Return latest quote including last price, bid, ask, volume, and ADV.
 
+        Uses fast_info (lightweight) first; falls back to full info dict only
+        for fields not available there (avg_volume_30d, market_cap).
+
         Returns dict with keys:
             last, bid, ask, volume, avg_volume_30d, market_cap
         """
@@ -89,25 +92,33 @@ class YFinanceMarketData:
         t = self._get_ticker(ticker)
 
         def _fetch() -> dict[str, Any]:
-            info = t.info or {}
+            def _f(val: Any, default: float = 0.0) -> float:
+                try:
+                    return float(val) if val is not None else default
+                except (TypeError, ValueError):
+                    return default
 
-            def _info(key: str, default: float = 0.0) -> float:
-                val = info.get(key, default)
-                return float(val) if val is not None else default
+            # fast_info is a lightweight endpoint — avoids the heavy /v10/finance/quoteSummary
+            # call that frequently returns HTTP 400 when called at high frequency.
+            fi = t.fast_info
+            last = _f(getattr(fi, "last_price", None)) or _f(getattr(fi, "previous_close", None))
+            volume = _f(getattr(fi, "last_volume", None))
+            market_cap = _f(getattr(fi, "market_cap", None))
 
-            last = _info("currentPrice") or _info("regularMarketPrice") or _info("previousClose")
-            bid = _info("bid")
-            ask = _info("ask")
-            if bid == 0 and ask == 0:
-                bid = last * 0.999
-                ask = last * 1.001
+            # bid/ask not in fast_info — synthesise from last
+            bid = last * 0.999 if last else 0.0
+            ask = last * 1.001 if last else 0.0
+
+            # three_month_average_volume and market_cap are in fast_info on yfinance ≥ 0.2.x
+            avg_volume_30d = _f(getattr(fi, "three_month_average_volume", None))
+
             return {
                 "last": last,
                 "bid": bid,
                 "ask": ask,
-                "volume": _info("regularMarketVolume"),
-                "avg_volume_30d": _info("averageVolume"),
-                "market_cap": _info("marketCap"),
+                "volume": volume,
+                "avg_volume_30d": avg_volume_30d,
+                "market_cap": market_cap,
             }
 
         return await loop.run_in_executor(None, _fetch)

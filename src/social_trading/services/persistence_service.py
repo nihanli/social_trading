@@ -65,7 +65,9 @@ _EXEC_EVENTS_STREAM = "execution:events"
 _RETAIN_SOCIAL_RAW_HOURS = 48
 _RETAIN_SENTIMENT_SCORES_HOURS = 48
 _RETAIN_SENTIMENT_AGGREGATES_DAYS = 7
-_RETAIN_SIGNALS_HOURS = 24
+_RETAIN_SIGNALS_DAYS = 7          # was 24h — extended for analytics UI
+_RETAIN_ACCOUNT_EQUITY_DAYS = 365  # one year of equity history
+_RETAIN_CONFIG_RUNS_DAYS = 365    # one year of parameter tuning history
 
 # Thread pool for blocking psycopg2 calls
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -306,7 +308,7 @@ def _prune_old_data() -> dict[str, int]:
     statements = [
         (
             "signals",
-            f"DELETE FROM signals WHERE generated_at < NOW() - INTERVAL '{_RETAIN_SIGNALS_HOURS} hours'",
+            f"DELETE FROM signals WHERE generated_at < NOW() - INTERVAL '{_RETAIN_SIGNALS_DAYS} days'",
         ),
         (
             "sentiment_aggregates",
@@ -319,6 +321,14 @@ def _prune_old_data() -> dict[str, int]:
         (
             "social_raw",
             f"DELETE FROM social_raw WHERE ingested_at < NOW() - INTERVAL '{_RETAIN_SOCIAL_RAW_HOURS} hours'",
+        ),
+        (
+            "account_equity",
+            f"DELETE FROM account_equity WHERE timestamp < NOW() - INTERVAL '{_RETAIN_ACCOUNT_EQUITY_DAYS} days'",
+        ),
+        (
+            "config_runs",
+            f"DELETE FROM config_runs WHERE created_at < NOW() - INTERVAL '{_RETAIN_CONFIG_RUNS_DAYS} days'",
         ),
     ]
     try:
