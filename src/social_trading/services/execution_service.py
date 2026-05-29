@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS
+from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
 from social_trading.market_data.composite import FallbackMarketData
@@ -251,6 +252,18 @@ async def run_trade_loop(
                                 logger.debug("On-demand price fetch for %s: %.4f", signal.ticker, last)
                         except Exception as exc:
                             logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
+
+                    # Skip if market is closed — do NOT ack so the signal
+                    # is redelivered when the market opens next session.
+                    if not _NYSE.is_open():
+                        logger.info(
+                            "[EXEC] Market closed — holding %s signal. %s",
+                            signal.ticker, _NYSE.status_str(),
+                        )
+                        # Sleep briefly to avoid a tight spin when the whole
+                        # batch of pending signals is outside market hours.
+                        await asyncio.sleep(5.0)
+                        break  # re-consume on next loop iteration
 
                     result = await engine.submit_signal(
                         signal=signal,
