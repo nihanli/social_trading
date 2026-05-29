@@ -86,6 +86,19 @@ def _stream_dict_to_signal(fields: dict) -> Signal | None:
         return None
 
 
+def _signal_is_stale(signal: Signal, max_age_minutes: int) -> tuple[bool, float]:
+    """
+    Return (is_stale, age_seconds).
+    A signal is stale if it was generated more than max_age_minutes ago.
+    Handles both tz-aware and tz-naive generated_at timestamps.
+    """
+    generated = signal.generated_at
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=UTC)
+    age_sec = (datetime.now(UTC) - generated).total_seconds()
+    return age_sec > max_age_minutes * 60, age_sec
+
+
 def _approved_signal_to_stream_dict(
     signal: Signal,
     quantity: int,
@@ -230,6 +243,23 @@ async def run_risk_service(
                 continue
 
             try:
+                # ── Signal age check ──────────────────────────────────────────
+                # Reject signals that sat in the queue too long — the market
+                # conditions that triggered them may no longer be valid.
+                is_stale, signal_age_sec = _signal_is_stale(
+                    signal, cfg.signal_approval_max_age_min
+                )
+                if is_stale:
+                    logger.info(
+                        "REJECTED (stale) %s: signal age %.0fs > max %ds",
+                        signal.ticker, signal_age_sec,
+                        cfg.signal_approval_max_age_min * 60,
+                    )
+                    rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="stale").inc()
+                    await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
+                    continue
+
                 market = await _get_market_snapshot(redis, signal.ticker)
                 entry_price = market["last"]
 

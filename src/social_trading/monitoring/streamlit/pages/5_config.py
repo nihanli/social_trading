@@ -234,6 +234,11 @@ with col_s1:
         "Reactive price threshold", 0.05, 0.25, float(cfg.reactive_price_threshold), 0.01,
         help="Price move before mention that classifies signal as 'reactive' (penalised).",
     )
+    cfg.signal_approval_max_age_min = st.number_input(
+        "Max signal age at approval (minutes)", 1, 60,
+        int(cfg.signal_approval_max_age_min), 1,
+        help="Signals older than this when they reach the risk service are rejected as stale.",
+    )
 
 with col_s2:
     st.subheader("Factor Weights")

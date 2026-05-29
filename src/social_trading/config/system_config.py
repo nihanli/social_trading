@@ -58,6 +58,7 @@ class SystemConfig:
     reactive_price_threshold: float = 0.10  # >10% pre-spike move = reactive
     convergence_bonus: float = 0.20         # bonus when Twitter + Reddit agree
     signal_age_max_hours: int = 48          # discard signals older than this
+    signal_approval_max_age_min: int = 10   # reject signals older than this many minutes at approval
     signal_decay_lambda: float = 0.10       # hyperbolic decay λ (half-life ~7h)
     signal_poll_interval_sec: int = 60
 
