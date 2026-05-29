@@ -173,6 +173,31 @@ class WatchlistManager:
         raw = await self._redis.smembers(SEED_KEY)
         return sorted(t.decode() if isinstance(t, bytes) else t for t in raw)
 
+    async def clear_non_pinned(self) -> int:
+        """
+        Remove all tickers from the active watchlist except pinned seeds.
+        Also clears the candidate pool so stale candidates don't re-promote.
+        Returns count of tickers removed.
+        """
+        seeds_raw = await self._redis.smembers(SEED_KEY)
+        seeds = {t.decode() if isinstance(t, bytes) else t for t in seeds_raw}
+
+        active_raw = await self._redis.zrange(WATCHLIST_KEY, 0, -1)
+        active = [t.decode() if isinstance(t, bytes) else t for t in active_raw]
+        to_remove = [t for t in active if t not in seeds]
+
+        if to_remove:
+            await self._redis.zrem(WATCHLIST_KEY, *to_remove)
+
+        await self._redis.delete(CANDIDATE_KEY)
+
+        logger.info(
+            "watchlist cleared: removed %d tickers, kept %d pinned seeds, "
+            "candidate pool reset",
+            len(to_remove), len(seeds),
+        )
+        return len(to_remove)
+
     # ── Liquidity gate ────────────────────────────────────────────────────────
 
     async def _passes_liquidity_gate(self, ticker: str) -> bool:

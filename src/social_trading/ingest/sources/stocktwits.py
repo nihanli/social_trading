@@ -111,7 +111,11 @@ class StockTwitsDataSource(BaseDataSource):
                     # Always publish a sample even without spike (feeds NLP baseline)
                     await self._publish_batch(posts[:5])
                     all_posts.extend(posts[:5])
-                await self._watchlist.touch(ticker)
+                # Only refresh last-seen when posts are actually found; touching
+                # on every poll regardless of content would prevent expiry for
+                # tickers with no social activity.
+                if posts:
+                    await self._watchlist.touch(ticker)
                 self._reset_errors()
             except RateLimitError as exc:
                 await self._handle_error(exc)

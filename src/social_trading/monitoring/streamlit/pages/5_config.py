@@ -28,6 +28,8 @@ import streamlit as st
 
 from social_trading.config.system_config import SystemConfig
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
+    clear_watchlist,
+    get_pinned_tickers,
     get_watchlist,
     load_config,
     pin_ticker,
@@ -50,11 +52,36 @@ col_wl, col_seed = st.columns(2)
 with col_wl:
     st.subheader("Active Watchlist")
     watchlist = get_watchlist()
+    pinned = get_pinned_tickers()
+
+    # Pinned tickers float to the top with a "*" label; rest sorted alphabetically
+    pinned_in_list = sorted(t for t in watchlist if t in pinned)
+    unpinned_in_list = sorted(t for t in watchlist if t not in pinned)
+    ordered = [f"{t} *" for t in pinned_in_list] + unpinned_in_list
+
     st.write(f"**{len(watchlist)} tickers currently monitored**")
-    if watchlist:
-        st.dataframe({"Ticker": watchlist}, use_container_width=True, hide_index=True)
+    if ordered:
+        st.caption("\\* = pinned (never auto-expires)")
+        st.dataframe({"Ticker": ordered}, use_container_width=True, hide_index=True)
     else:
         st.info("Watchlist is empty — run seed_watchlist.py or pin tickers below")
+
+    st.markdown("---")
+    st.caption("⚠️ Clear removes all non-pinned tickers and flushes candidates.")
+    if st.button("🗑️ Clear Watchlist", type="secondary"):
+        st.session_state["_confirm_clear_wl"] = True
+
+    if st.session_state.get("_confirm_clear_wl"):
+        st.warning("This will remove all non-pinned tickers. Pinned seeds are kept.")
+        col_yes, col_no = st.columns(2)
+        if col_yes.button("Yes, clear it", type="primary"):
+            removed = clear_watchlist()
+            st.session_state.pop("_confirm_clear_wl", None)
+            st.success(f"Cleared {removed} ticker(s). Pinned seeds retained.")
+            st.rerun()
+        if col_no.button("Cancel"):
+            st.session_state.pop("_confirm_clear_wl", None)
+            st.rerun()
 
 with col_seed:
     st.subheader("Pin / Unpin Tickers")

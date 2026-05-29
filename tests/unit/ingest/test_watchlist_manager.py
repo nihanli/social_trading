@@ -159,3 +159,45 @@ async def test_seed_from_config_pins_all_seeds(wm, redis, cfg):
     for ticker in ["SPY", "QQQ", "AAPL"]:
         assert await redis.sismember(SEED_KEY, ticker)
         assert await redis.zscore(WATCHLIST_KEY, ticker) is not None
+
+
+# ── clear_non_pinned ──────────────────────────────────────────────────────────
+
+async def test_clear_non_pinned_removes_unpinned(wm, redis):
+    """Non-seed tickers are removed; seed tickers are kept."""
+    await redis.zadd(WATCHLIST_KEY, {"NVDA": time.time(), "TSLA": time.time()})
+    await redis.sadd(SEED_KEY, "NVDA")  # NVDA is pinned
+
+    removed = await wm.clear_non_pinned()
+
+    assert removed == 1
+    assert await redis.zscore(WATCHLIST_KEY, "NVDA") is not None
+    assert await redis.zscore(WATCHLIST_KEY, "TSLA") is None
+
+
+async def test_clear_non_pinned_flushes_candidates(wm, redis):
+    """Candidate pool is cleared so stale candidates don't re-promote."""
+    await redis.zadd(CANDIDATE_KEY, {"MSFT": time.time(), "AMD": time.time()})
+    await redis.zadd(WATCHLIST_KEY, {"AMD": time.time()})
+
+    await wm.clear_non_pinned()
+
+    assert await redis.zcard(CANDIDATE_KEY) == 0
+
+
+async def test_clear_non_pinned_empty_watchlist(wm, redis):
+    """Clearing an already-empty watchlist returns 0 without error."""
+    removed = await wm.clear_non_pinned()
+    assert removed == 0
+
+
+async def test_clear_non_pinned_all_pinned(wm, redis):
+    """If every active ticker is pinned, nothing is removed."""
+    await redis.zadd(WATCHLIST_KEY, {"SPY": time.time(), "QQQ": time.time()})
+    await redis.sadd(SEED_KEY, "SPY", "QQQ")
+
+    removed = await wm.clear_non_pinned()
+
+    assert removed == 0
+    assert await redis.zscore(WATCHLIST_KEY, "SPY") is not None
+    assert await redis.zscore(WATCHLIST_KEY, "QQQ") is not None

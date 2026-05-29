@@ -544,22 +544,37 @@ async def _write_market_snapshot_and_get_price(
         if last > 0:
             atr = await market_data.get_atr(ticker)
             realised_vol = await market_data.get_realised_vol(ticker)
-            adv_shares = quote.get("avg_volume_30d", 1_000_000.0)
-            adv_usd = adv_shares * last
 
             key = f"market_data:{ticker}"
-            await redis.hset(key, mapping={
+
+            # Always write price-level fields
+            mapping: dict[str, str] = {
                 "last": str(last),
                 "bid": str(quote.get("bid", last * 0.999)),
                 "ask": str(quote.get("ask", last * 1.001)),
-                "adv_shares": str(adv_shares),
-                "adv_usd": str(adv_usd),
-                "market_cap_usd": str(quote.get("market_cap", 0.0)),
                 "atr_14": str(atr),
                 "realised_vol": str(realised_vol),
                 "vix": str(vix),
                 "updated_at": datetime.now(UTC).isoformat(),
-            })
+            }
+
+            # Only write ADV when the provider returned a real value.
+            # Outside trading hours IB returns NaN→0 and yfinance may return
+            # None→0; writing 0 overwrites the last known good value in Redis
+            # and causes the liquidity gate to reject every signal.
+            adv_shares = quote.get("avg_volume_30d") or 0.0
+            if adv_shares > 0:
+                mapping["adv_shares"] = str(adv_shares)
+                mapping["adv_usd"] = str(adv_shares * last)
+            else:
+                logger.debug("ADV not available for %s — keeping previous Redis value", ticker)
+
+            # Same treatment for market cap (IB always returns 0.0)
+            market_cap = quote.get("market_cap") or 0.0
+            if market_cap > 0:
+                mapping["market_cap_usd"] = str(market_cap)
+
+            await redis.hset(key, mapping=mapping)
             # Expire after 4 hours — prevents stale tickers accumulating as
             # the watchlist rotates.  Active tickers are refreshed every cycle
             # so they never actually expire while in the watchlist.

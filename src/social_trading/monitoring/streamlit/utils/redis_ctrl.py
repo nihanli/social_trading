@@ -170,6 +170,12 @@ def get_watchlist() -> list[str]:
     return sorted(active)
 
 
+def get_pinned_tickers() -> set[str]:
+    """Return the set of trader-pinned seed tickers."""
+    r = _get_redis()
+    return set(r.smembers("watchlist:seed") or [])
+
+
 def pin_ticker(ticker: str) -> None:
     r = _get_redis()
     r.zadd("watchlist:active", {ticker.upper(): time.time()})
@@ -178,6 +184,21 @@ def pin_ticker(ticker: str) -> None:
 def unpin_ticker(ticker: str) -> None:
     r = _get_redis()
     r.zrem("watchlist:active", ticker.upper())
+
+
+def clear_watchlist() -> int:
+    """
+    Remove all non-pinned tickers from the active watchlist and flush candidates.
+    Returns the number of tickers removed.
+    """
+    r = _get_redis()
+    seeds = set(r.smembers("watchlist:seed") or [])
+    active = r.zrange("watchlist:active", 0, -1)
+    to_remove = [t for t in active if t not in seeds]
+    if to_remove:
+        r.zrem("watchlist:active", *to_remove)
+    r.delete("watchlist:candidates")
+    return len(to_remove)
 
 
 def get_recent_signals_from_redis() -> list[dict]:
