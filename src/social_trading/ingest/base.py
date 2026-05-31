@@ -37,6 +37,12 @@ MENTION_HISTORY_LEN = 168   # 7 days × 24 hourly samples
 # Maximum backoff between retries (seconds)
 _MAX_BACKOFF = 300
 
+# Pre-publish dedup: tracks post IDs already written to the raw_social stream.
+# Prevents re-publishing posts that appear in repeated API poll responses
+# (common for Bluesky/StockTwits baseline samples on non-spike cycles).
+_DEDUP_KEY_PREFIX = "ingest:seen:"
+_DEDUP_TTL_SECS = 86_400  # 24 hours — posts older than this can safely re-appear
+
 
 class BaseDataSource(ABC):
     """
@@ -112,24 +118,59 @@ class BaseDataSource(ABC):
 
     # ── Publishing helpers ────────────────────────────────────────────────────
 
-    async def _publish(self, post: SocialPost) -> str:
-        """Publish a normalised SocialPost to the raw_social Redis Stream."""
+    async def _publish(self, post: SocialPost) -> str | None:
+        """
+        Publish a normalised SocialPost to the raw_social Redis Stream.
+
+        Skips (and returns None) if the post has already been published within
+        the last 24 hours — prevents re-publishing the same post across poll
+        cycles when sources return overlapping recent results.
+        """
+        dedup_key = _DEDUP_KEY_PREFIX + post.id
+        is_new = await self._redis.set(dedup_key, "1", nx=True, ex=_DEDUP_TTL_SECS)
+        if not is_new:
+            logger.debug("%s: skipping already-published post %s", self.name, post.id)
+            return None
         payload = _post_to_stream_dict(post)
         maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
         msg_id: bytes = await self._redis.xadd(STREAM_RAW_SOCIAL, payload, maxlen=maxlen, approximate=True)
         return msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
 
     async def _publish_batch(self, posts: list[SocialPost]) -> int:
-        """Publish multiple posts in one pipeline. Returns count published."""
+        """
+        Publish multiple posts in one pipeline. Returns count of new posts published.
+
+        Deduplicates against posts already sent to the stream within the last 24 hours
+        so repeated API poll responses do not flood the stream with duplicate entries.
+        """
         if not posts:
             return 0
-        maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
+
+        # Phase 1: check which post IDs are genuinely new via atomic SET NX
         async with self._redis.pipeline(transaction=False) as pipe:
             for post in posts:
+                pipe.set(_DEDUP_KEY_PREFIX + post.id, "1", nx=True, ex=_DEDUP_TTL_SECS)
+            results = await pipe.execute()
+
+        # SET NX returns True when key was newly created (post not seen before)
+        new_posts = [p for p, r in zip(posts, results) if r]
+        skipped = len(posts) - len(new_posts)
+        if skipped:
+            logger.debug(
+                "%s: dedup filtered %d/%d already-published posts",
+                self.name, skipped, len(posts),
+            )
+        if not new_posts:
+            return 0
+
+        # Phase 2: publish only the new posts
+        maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for post in new_posts:
                 pipe.xadd(STREAM_RAW_SOCIAL, _post_to_stream_dict(post), maxlen=maxlen, approximate=True)
             await pipe.execute()
-        logger.debug("%s published %d posts", self.name, len(posts))
-        return len(posts)
+        logger.debug("%s published %d new posts", self.name, len(new_posts))
+        return len(new_posts)
 
     # ── Error / backoff helpers ───────────────────────────────────────────────
 

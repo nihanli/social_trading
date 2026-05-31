@@ -244,20 +244,28 @@ def get_enrichment_queue_size() -> int:
 def get_phase_pipeline_stats() -> dict:
     """
     Return live two-phase pipeline stats from Redis.
-    Reads the enrichment:requests stream length and the last enrichment:sent keys.
+    Reads the enrichment:requests stream length and the tier-2 configured flag.
     """
+    import json as _json
+
     r = _get_redis()
-    stats: dict = {
-        "enrichment_queue": 0,
-        "tier2_configured": bool(r.get("config:system") and
-                                  __import__("json").loads(r.get("config:system") or "{}").get("x_api_enabled")),
-    }
+    stats: dict = {"enrichment_queue": 0, "tier2_configured": False}
+    try:
+        raw = r.get("config:system")
+        if raw:
+            cfg_data = _json.loads(raw)
+            stats["tier2_configured"] = bool(cfg_data.get("x_api_enabled"))
+    except Exception:
+        pass
     try:
         info = r.xinfo_stream("enrichment:requests")
         stats["enrichment_queue"] = int(info.get("length", 0))
     except Exception:
         pass
     return stats
+
+
+def get_recent_signals_from_redis() -> list[dict]:
     """
     Read recent signals from Redis stream as fallback when PG not available.
     Returns up to 20 most recent entries from strategy_signals stream.

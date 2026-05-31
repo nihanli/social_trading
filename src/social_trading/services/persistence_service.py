@@ -593,6 +593,8 @@ async def run_raw_social_task(bus: TradingEventBus) -> None:
     """Consume raw_social stream and persist to social_raw table."""
     await bus.create_group(STREAM_RAW_SOCIAL, _GROUP)
     total = 0
+    _next_log_at = 0  # log summary every _LOG_INTERVAL new posts
+    _LOG_INTERVAL = 50
     while True:
         messages = await bus.consume(
             STREAM_RAW_SOCIAL, _GROUP, _CONSUMER, count=_BATCH
@@ -605,7 +607,10 @@ async def run_raw_social_task(bus: TradingEventBus) -> None:
         for msg_id, _ in messages:
             await bus.ack(STREAM_RAW_SOCIAL, _GROUP, msg_id)
         if n:
-            logger.info("social_raw: persisted %d posts (total=%d)", n, total)
+            logger.debug("social_raw: batch persisted %d new posts", n)
+            if total >= _next_log_at:
+                logger.info("social_raw: persisted %d posts cumulative", total)
+                _next_log_at = total + _LOG_INTERVAL
 
 
 async def run_sentiment_task(bus: TradingEventBus) -> None:
