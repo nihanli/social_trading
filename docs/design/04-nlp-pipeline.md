@@ -18,7 +18,20 @@ Raw Post Text
 [6] Time-Bucket Aggregation (15-minute windows)
     ↓
 Ticker-level Sentiment Signal
+    ↓
+[7] Signal Service — Two-Phase Evaluation (§5a)
+      Phase 1: free sources → signal_phase1_threshold
+        └─ Tier-2 enrichment requested (if X/Twitter API enabled)
+      Phase 2: +Tier-2 data → signal_phase2_threshold → fire signal
 ```
+
+**Tier-2 enrichment flow:**  When a ticker's aggregated sentiment (from free sources)
+passes the Phase 1 quality threshold, the signal service publishes a request to
+`enrichment:requests`.  The ingest service consumes this stream, calls the X/Twitter
+API for that specific ticker, and publishes any returned posts back through the normal
+`raw_social → NLP → sentiment_signals → aggregator` pipeline.  On the next signal
+evaluation cycle, the aggregator window for that ticker now includes Twitter data, so
+Phase 2 evaluation fires.
 
 ### 4b. Recommended Models
 

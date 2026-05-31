@@ -204,11 +204,11 @@ def _write_signals(rows: list[dict]) -> int:
                             INSERT INTO signals
                                 (timestamp, ticker, strategy, direction,
                                  confidence, sentiment_score, mention_zscore,
-                                 quality_score, generated_at)
+                                 quality_score, signal_phase, generated_at)
                             VALUES (%(ts)s, %(ticker)s, %(strategy)s,
                                     %(direction)s, %(confidence)s,
                                     %(sentiment_score)s, %(mention_zscore)s,
-                                    %(quality_score)s, %(ts)s)
+                                    %(quality_score)s, %(signal_phase)s, %(ts)s)
                             """,
                             {
                                 "ts": r.get("generated_at") or datetime.now(UTC).isoformat(),
@@ -219,6 +219,7 @@ def _write_signals(rows: list[dict]) -> int:
                                 "sentiment_score": _float(r.get("sentiment_score", 0)),
                                 "mention_zscore": _float(r.get("volume_z_score", 0)),
                                 "quality_score": _float(r.get("quality_score", 0)),
+                                "signal_phase": r.get("signal_phase") or None,
                             },
                         )
                         inserted += cur.rowcount

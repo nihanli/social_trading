@@ -24,6 +24,7 @@ class SystemConfig:
 
     # ── Watchlist & Discovery ─────────────────────────────────────────────────
     watchlist_stale_hours: int = 48          # remove ticker silent for N hours
+    watchlist_max_size: int = 50             # max active tickers (seeds are exempt)
     watchlist_promote_interval: int = 600   # seconds between liquidity checks
     counts_poll_interval_sec: int = 300     # X Counts polling cadence (legacy; X disabled by default)
     stocktwits_poll_interval_sec: int = 300
@@ -52,7 +53,6 @@ class SystemConfig:
     watchlist_max_spread_pct: float = 0.01
 
     # ── Signal Generation ─────────────────────────────────────────────────────
-    signal_quality_threshold: float = 0.50  # min quality to fire a signal0  # minimum score to fire a signal
     sentiment_strength_min: float = 0.30    # |sentiment| must exceed this
     price_momentum_min_pct: float = 0.02    # min price move for momentum factor
     reactive_price_threshold: float = 0.10  # >10% pre-spike move = reactive
@@ -61,6 +61,16 @@ class SystemConfig:
     signal_approval_max_age_min: int = 10   # reject signals older than this many minutes at approval
     signal_decay_lambda: float = 0.10       # hyperbolic decay λ (half-life ~7h)
     signal_poll_interval_sec: int = 60
+
+    # ── Two-Phase Signal Pipeline ─────────────────────────────────────────────
+    # Phase 1: evaluated using only free/Tier-1 sources (lower threshold).
+    #          Tickers passing Phase 1 trigger Tier-2 enrichment calls.
+    # Phase 2: re-evaluated with all sources (higher threshold).
+    #          Only Phase-2 signals are forwarded to execution.
+    signal_phase1_threshold: float = 0.40       # coarse filter — free sources only
+    signal_phase2_threshold: float = 0.65       # fine filter — all sources required
+    phase2_max_tickers_per_cycle: int = 10      # cost cap: max Tier-2 calls per cycle
+    phase2_skip_open_positions: bool = True     # skip enrichment if position already open
 
     # Signal quality factor weights — must sum to 1.0
     w_volume: float = 0.30

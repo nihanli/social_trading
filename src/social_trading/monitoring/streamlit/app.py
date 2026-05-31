@@ -31,6 +31,7 @@ from social_trading.monitoring.streamlit.utils.db import query, localize_datetim
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
+    get_phase_pipeline_stats,
     get_system_state,
     halt_new_trades,
     resume_trading,
@@ -125,13 +126,15 @@ daily_pnl_df = query("""
 """)
 open_pos_df = query("SELECT COUNT(*) AS cnt FROM positions")
 signals_today_df = query("""
-    SELECT COUNT(*) FILTER (WHERE executed) AS executed,
-           COUNT(*) AS total
+    SELECT COUNT(*) FILTER (WHERE executed)               AS executed,
+           COUNT(*)                                       AS total,
+           COUNT(*) FILTER (WHERE signal_phase = 'phase1') AS phase1,
+           COUNT(*) FILTER (WHERE signal_phase = 'phase2') AS phase2
     FROM signals
     WHERE generated_at::date = CURRENT_DATE
 """)
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric(
     "Portfolio Equity",
     f"${equity_df.iloc[0, 0]:,.0f}" if not equity_df.empty else f"${state['net_liquidation']:,.0f}",
@@ -146,11 +149,20 @@ col4.metric(
     f"{100 * daily_pnl_df.iloc[0]['wins'] / max(daily_pnl_df.iloc[0]['total'], 1):.0f}%"
     if not daily_pnl_df.empty and daily_pnl_df.iloc[0]["total"] > 0 else "—",
 )
-col5.metric(
-    "Signals Executed",
-    f"{signals_today_df.iloc[0]['executed']}/{signals_today_df.iloc[0]['total']}"
-    if not signals_today_df.empty else "—",
-)
+if not signals_today_df.empty:
+    _s = signals_today_df.iloc[0]
+    col5.metric(
+        "Signals Today",
+        f"{int(_s['total'])}  (P1:{int(_s['phase1'] or 0)} P2:{int(_s['phase2'] or 0)})",
+        help="Total signals today — breakdown by phase in parentheses",
+    )
+    col6.metric(
+        "Signals Executed",
+        f"{int(_s['executed'])}/{int(_s['total'])}",
+    )
+else:
+    col5.metric("Signals Today", "—")
+    col6.metric("Signals Executed", "—")
 
 # ═══════════════════════════════════════
 # EQUITY CURVE
@@ -210,9 +222,10 @@ with col_right:
     st.subheader("Recent Signals")
     signals = query("""
         SELECT ticker, direction,
-               ROUND(confidence::numeric, 2)      AS quality,
-               ROUND(sentiment_score::numeric, 2) AS sentiment,
-               ROUND(mention_zscore::numeric, 1)  AS vol_z,
+               COALESCE(signal_phase, 'legacy')    AS phase,
+               ROUND(confidence::numeric, 2)        AS quality,
+               ROUND(sentiment_score::numeric, 2)   AS sentiment,
+               ROUND(mention_zscore::numeric, 1)    AS vol_z,
                approved, executed,
                TO_CHAR(generated_at, 'HH24:MI:SS') AS time
         FROM signals
@@ -223,6 +236,12 @@ with col_right:
         st.dataframe(signals, use_container_width=True, hide_index=True)
     else:
         st.info("No signals recorded yet")
+
+    # Live enrichment queue indicator
+    pipeline = get_phase_pipeline_stats()
+    eq = pipeline.get("enrichment_queue", 0)
+    if eq > 0:
+        st.caption(f"⏳ {eq} ticker(s) queued for Tier-2 enrichment (Phase 1 → Phase 2)")
 
 # ═══════════════════════════════════════
 # SENTIMENT HEATMAP

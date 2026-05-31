@@ -227,7 +227,37 @@ def clear_watchlist() -> int:
     return len(to_remove)
 
 
-def get_recent_signals_from_redis() -> list[dict]:
+def get_enrichment_queue_size() -> int:
+    """
+    Return the number of Phase-1 tickers currently queued for Tier-2 enrichment.
+    This is the pending-enrichment backlog — tickers that passed Phase 1 but
+    haven't yet been re-evaluated with Tier-2 data.
+    """
+    r = _get_redis()
+    try:
+        info = r.xinfo_stream("enrichment:requests")
+        return int(info.get("length", 0))
+    except Exception:
+        return 0
+
+
+def get_phase_pipeline_stats() -> dict:
+    """
+    Return live two-phase pipeline stats from Redis.
+    Reads the enrichment:requests stream length and the last enrichment:sent keys.
+    """
+    r = _get_redis()
+    stats: dict = {
+        "enrichment_queue": 0,
+        "tier2_configured": bool(r.get("config:system") and
+                                  __import__("json").loads(r.get("config:system") or "{}").get("x_api_enabled")),
+    }
+    try:
+        info = r.xinfo_stream("enrichment:requests")
+        stats["enrichment_queue"] = int(info.get("length", 0))
+    except Exception:
+        pass
+    return stats
     """
     Read recent signals from Redis stream as fallback when PG not available.
     Returns up to 20 most recent entries from strategy_signals stream.

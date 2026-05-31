@@ -47,6 +47,12 @@ class BaseDataSource(ABC):
 
     The base handles publishing to Redis and exponential backoff so each
     concrete source can focus only on its API integration.
+
+    Source tiers control cost management in the two-phase signal pipeline:
+        Tier 1 — free/low-cost sources polled on every cycle for all tickers.
+                 (Bluesky, StockTwits, Reddit, yfinance screener, …)
+        Tier 2 — metered/paid sources only called for Phase-1 candidates.
+                 (Twitter/X API)
     """
 
     def __init__(self, redis: aioredis.Redis, cfg: SystemConfig) -> None:
@@ -61,6 +67,16 @@ class BaseDataSource(ABC):
     def name(self) -> str:
         """Unique source identifier e.g. "twitter", "reddit", "stocktwits"."""
         ...
+
+    @property
+    def tier(self) -> int:
+        """
+        Cost tier for two-phase signal filtering.
+        1 = free / always-on (default).
+        2 = metered / paid — only called for Phase-1 signal candidates.
+        Override in paid sources.
+        """
+        return 1
 
     @property
     def is_streaming(self) -> bool:

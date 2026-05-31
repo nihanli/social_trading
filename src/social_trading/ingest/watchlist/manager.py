@@ -7,6 +7,13 @@ Design (see docs/design/03-data-sources.md §3a):
   - Active watchlist: Redis ZSET `watchlist:active` (score = last_seen epoch)
   - Seeds: Redis SET `watchlist:seed` — trader-pinned, never expire
   - Candidates: Redis ZSET `watchlist:candidates` — awaiting liquidity check
+  - Source tracking: Redis SET `watchlist:ticker_sources:{ticker}` — which
+    discovery sources have mentioned each ticker (used for eviction scoring)
+
+When the watchlist is at capacity, a smart eviction algorithm makes room for
+new tickers: non-pinned tickers are scored as
+    eviction_score = last_seen_epoch + (MULTI_SOURCE_BONUS if ≥2 sources else 0)
+The ticker with the lowest eviction score (stalest, fewest sources) is removed.
 
 The manager is async throughout so it can be called from asyncio service loops.
 yfinance calls (I/O bound) are run in a thread executor to avoid blocking.
@@ -27,6 +34,15 @@ logger = logging.getLogger(__name__)
 WATCHLIST_KEY = "watchlist:active"      # ZSET  score = last_seen epoch
 CANDIDATE_KEY = "watchlist:candidates"  # ZSET  score = first_seen epoch
 SEED_KEY = "watchlist:seed"             # SET   permanent trader pins
+TICKER_SOURCES_PREFIX = "watchlist:ticker_sources:"  # SET  per-ticker source names
+
+# Tickers mentioned by ≥2 sources receive an extra 6-hour recency credit in
+# the eviction scoring, making them harder to evict than single-source tickers.
+MULTI_SOURCE_BONUS_SECS: int = 6 * 3600
+
+
+def _decode(v: bytes | str) -> str:
+    return v.decode() if isinstance(v, bytes) else v
 
 
 class WatchlistManager:
@@ -47,11 +63,17 @@ class WatchlistManager:
     async def propose(self, ticker: str, source: str) -> None:
         """
         Add a ticker to the candidate pool from a discovery source.
-        If it's already active, just refresh the last-seen timestamp.
+        Records which source mentioned the ticker (used for eviction scoring).
+        If the ticker is already active, just refreshes the last-seen timestamp.
         """
         ticker = ticker.upper().strip()
         if not ticker or len(ticker) > 6:
             return
+
+        # Track mentioning source — this drives the multi-source eviction bonus.
+        src_key = TICKER_SOURCES_PREFIX + ticker
+        await self._redis.sadd(src_key, source)
+        await self._redis.expire(src_key, int(self._cfg.watchlist_stale_hours * 3600))
 
         already_active = await self._redis.zscore(WATCHLIST_KEY, ticker) is not None
         if already_active:
@@ -68,6 +90,10 @@ class WatchlistManager:
     async def promote_candidates(self) -> int:
         """
         Check all candidates against the liquidity gate and promote passing ones.
+        When the watchlist is at capacity, the weakest non-pinned ticker is
+        evicted to make room (favouring new multi-source tickers over stale
+        single-source ones).  Seeds always promote regardless of capacity.
+
         Run periodically (every cfg.watchlist_promote_interval seconds).
         Reloads config first so UI changes to thresholds take effect.
 
@@ -79,15 +105,29 @@ class WatchlistManager:
         candidates_raw = await self._redis.zrange(CANDIDATE_KEY, 0, -1)
         seeds_raw = await self._redis.smembers(SEED_KEY)
 
-        candidates = [t.decode() if isinstance(t, bytes) else t for t in candidates_raw]
-        seeds = [t.decode() if isinstance(t, bytes) else t for t in seeds_raw]
+        candidates = [_decode(t) for t in candidates_raw]
+        seeds = {_decode(t) for t in seeds_raw}
 
         promoted = 0
-        for ticker in set(candidates + seeds):
-            # Check if already active (seeds might already be there)
+        for ticker in set(candidates) | seeds:
+            # Already active — just clean up candidate pool entry if present
             if await self._redis.zscore(WATCHLIST_KEY, ticker) is not None:
                 await self._redis.zrem(CANDIDATE_KEY, ticker)
                 continue
+
+            # Seeds always get in regardless of capacity (they never expire)
+            if ticker not in seeds:
+                current_size = await self._redis.zcard(WATCHLIST_KEY)
+                if current_size >= self._cfg.watchlist_max_size:
+                    evicted = await self._evict_weakest()
+                    if not evicted:
+                        # All active slots are pinned seeds — cannot evict
+                        logger.debug(
+                            "watchlist full (%d/%d), all slots pinned — cannot admit %s",
+                            current_size, self._cfg.watchlist_max_size, ticker,
+                        )
+                        # Leave candidate in queue; retry next cycle
+                        continue
 
             if await self._passes_liquidity_gate(ticker):
                 await self._redis.zadd(WATCHLIST_KEY, {ticker: time.time()})
@@ -111,8 +151,8 @@ class WatchlistManager:
         active_raw = await self._redis.zrange(WATCHLIST_KEY, 0, -1)
         seeds_raw = await self._redis.smembers(SEED_KEY)
 
-        active = {t.decode() if isinstance(t, bytes) else t for t in active_raw}
-        seeds = {t.decode() if isinstance(t, bytes) else t for t in seeds_raw}
+        active = {_decode(t) for t in active_raw}
+        seeds = {_decode(t) for t in seeds_raw}
         return sorted(active | seeds)
 
     async def touch(self, ticker: str) -> None:
@@ -123,18 +163,21 @@ class WatchlistManager:
         """
         Remove tickers not seen for cfg.watchlist_stale_hours.
         Seed tickers are never removed (trader wants them always active).
+        Also cleans up the source-tracking SET for each expired ticker.
         Returns count of tickers expired.
         """
         cutoff = time.time() - self._cfg.watchlist_stale_hours * 3600
         seeds_raw = await self._redis.smembers(SEED_KEY)
-        seeds = {t.decode() if isinstance(t, bytes) else t for t in seeds_raw}
+        seeds = {_decode(t) for t in seeds_raw}
 
         stale_raw = await self._redis.zrangebyscore(WATCHLIST_KEY, 0, cutoff)
-        stale = [t.decode() if isinstance(t, bytes) else t for t in stale_raw]
+        stale = [_decode(t) for t in stale_raw]
         to_remove = [t for t in stale if t not in seeds]
 
         if to_remove:
             await self._redis.zrem(WATCHLIST_KEY, *to_remove)
+            for t in to_remove:
+                await self._redis.delete(TICKER_SOURCES_PREFIX + t)
             logger.info("watchlist expired: %s", to_remove)
 
         return len(to_remove)
@@ -142,6 +185,10 @@ class WatchlistManager:
     async def size(self) -> int:
         """Return count of active watchlist tickers."""
         return await self._redis.zcard(WATCHLIST_KEY)
+
+    async def source_count(self, ticker: str) -> int:
+        """Return how many distinct sources have mentioned this ticker."""
+        return await self._redis.scard(TICKER_SOURCES_PREFIX + ticker.upper())
 
     # ── Trader controls ───────────────────────────────────────────────────────
 
@@ -171,23 +218,26 @@ class WatchlistManager:
     async def get_seeds(self) -> list[str]:
         """Return all trader-pinned seed tickers."""
         raw = await self._redis.smembers(SEED_KEY)
-        return sorted(t.decode() if isinstance(t, bytes) else t for t in raw)
+        return sorted(_decode(t) for t in raw)
 
     async def clear_non_pinned(self) -> int:
         """
         Remove all tickers from the active watchlist except pinned seeds.
-        Also clears the candidate pool so stale candidates don't re-promote.
+        Also clears the candidate pool so stale candidates don't re-promote,
+        and removes source-tracking data for removed tickers.
         Returns count of tickers removed.
         """
         seeds_raw = await self._redis.smembers(SEED_KEY)
-        seeds = {t.decode() if isinstance(t, bytes) else t for t in seeds_raw}
+        seeds = {_decode(t) for t in seeds_raw}
 
         active_raw = await self._redis.zrange(WATCHLIST_KEY, 0, -1)
-        active = [t.decode() if isinstance(t, bytes) else t for t in active_raw]
+        active = [_decode(t) for t in active_raw]
         to_remove = [t for t in active if t not in seeds]
 
         if to_remove:
             await self._redis.zrem(WATCHLIST_KEY, *to_remove)
+            for t in to_remove:
+                await self._redis.delete(TICKER_SOURCES_PREFIX + t)
 
         await self._redis.delete(CANDIDATE_KEY)
 
@@ -197,6 +247,54 @@ class WatchlistManager:
             len(to_remove), len(seeds),
         )
         return len(to_remove)
+
+    # ── Eviction ──────────────────────────────────────────────────────────────
+
+    async def _evict_weakest(self) -> bool:
+        """
+        Remove the non-pinned ticker with the lowest eviction score to free a slot.
+
+        Eviction score (higher = keep):
+            score = last_seen_epoch + (MULTI_SOURCE_BONUS_SECS if ≥2 sources else 0)
+
+        A ticker mentioned by multiple sources gets a 6-hour recency credit,
+        making it harder to evict than a similarly-aged single-source ticker.
+
+        Returns True if a ticker was evicted, False if all active slots are pinned.
+        """
+        seeds_raw = await self._redis.smembers(SEED_KEY)
+        seeds = {_decode(t) for t in seeds_raw}
+
+        # ZRANGE with WITHSCORES returns [(member, score), ...]
+        entries = await self._redis.zrange(WATCHLIST_KEY, 0, -1, withscores=True)
+        non_seed_entries = [
+            (_decode(t), score) for t, score in entries if _decode(t) not in seeds
+        ]
+
+        if not non_seed_entries:
+            return False  # all active tickers are pinned — cannot evict
+
+        worst_ticker: str | None = None
+        worst_score: float = float("inf")
+
+        for ticker, last_seen in non_seed_entries:
+            src_count = await self._redis.scard(TICKER_SOURCES_PREFIX + ticker)
+            bonus = MULTI_SOURCE_BONUS_SECS if src_count >= 2 else 0
+            composite = last_seen + bonus
+            if composite < worst_score:
+                worst_score = composite
+                worst_ticker = ticker
+
+        if worst_ticker:
+            await self._redis.zrem(WATCHLIST_KEY, worst_ticker)
+            await self._redis.delete(TICKER_SOURCES_PREFIX + worst_ticker)
+            logger.info(
+                "watchlist evicted %s (eviction_score=%.0f) to make room for new ticker",
+                worst_ticker, worst_score,
+            )
+            return True
+
+        return False  # pragma: no cover
 
     # ── Liquidity gate ────────────────────────────────────────────────────────
 

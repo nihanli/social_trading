@@ -68,6 +68,14 @@ class DataSourceRegistry:
         """Return only sources where is_streaming=False."""
         return [s for s in self._sources.values() if not s.is_streaming]
 
+    def tier1_sources(self) -> list[DataSource]:
+        """Return Tier-1 (free/always-on) polling sources."""
+        return [s for s in self._sources.values() if getattr(s, "tier", 1) == 1]
+
+    def tier2_sources(self) -> list[DataSource]:
+        """Return Tier-2 (metered/paid) sources used only for Phase-2 enrichment."""
+        return [s for s in self._sources.values() if getattr(s, "tier", 1) == 2]
+
     @property
     def names(self) -> list[str]:
         """Names of all registered sources."""

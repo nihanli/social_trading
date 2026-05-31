@@ -13,7 +13,9 @@ Quality score formula (design §5b):
   service) do not permanently lower the score ceiling.
 
 Signal fires when:
-  quality >= cfg.signal_quality_threshold
+  quality >= quality_threshold   (passed directly to evaluate(); set by signal
+                                  service from cfg.signal_phase1_threshold or
+                                  cfg.signal_phase2_threshold depending on phase)
   AND |mean_score| >= cfg.sentiment_strength_min
   AND price direction aligns (if market data available)
 
@@ -50,6 +52,7 @@ class SignalGenerator:
         self,
         stats: SentimentStats,
         cfg: SystemConfig,
+        quality_threshold: float,
         volume_zscore: float = 0.0,
         price_momentum: float = 0.0,
         is_reactive: bool = False,
@@ -58,13 +61,17 @@ class SignalGenerator:
         Evaluate a SentimentStats snapshot and produce a Signal or None.
 
         Args:
-            stats:          Aggregated sentiment from SentimentAggregator.
-            cfg:            Current SystemConfig (thresholds, weights).
-            volume_zscore:  Mention volume Z-score vs 7-day baseline.
-            price_momentum: Recent price change (fraction, e.g. 0.02 = +2%).
-                            0.0 = no price data available (treated as neutral).
-            is_reactive:    True if the price moved significantly BEFORE the
-                            mention spike — suggests noise, not signal.
+            stats:             Aggregated sentiment from SentimentAggregator.
+            cfg:               Current SystemConfig (weights, sentiment threshold).
+            quality_threshold: Minimum quality score to fire a signal.  Caller
+                               sets this from cfg.signal_phase1_threshold (Phase 1,
+                               free sources only) or cfg.signal_phase2_threshold
+                               (Phase 2, all sources present).
+            volume_zscore:     Mention volume Z-score vs 7-day baseline.
+            price_momentum:    Recent price change (fraction, e.g. 0.02 = +2%).
+                               0.0 = no price data available (treated as neutral).
+            is_reactive:       True if the price moved significantly BEFORE the
+                               mention spike — suggests noise, not signal.
 
         Returns:
             Signal if quality threshold met, else None.
@@ -116,10 +123,10 @@ class SignalGenerator:
 
         logger.debug(
             "%s quality=%.3f (v=%.2f s=%.2f p=%.2f m=%.2f c=%.2f) threshold=%.2f",
-            stats.ticker, quality, v, s, p, m, c, cfg.signal_quality_threshold,
+            stats.ticker, quality, v, s, p, m, c, quality_threshold,
         )
 
-        if quality < cfg.signal_quality_threshold:
+        if quality < quality_threshold:
             return None
 
         # ── 4. Build Signal ───────────────────────────────────────────────────

@@ -10,9 +10,16 @@ Two concurrent asyncio tasks:
   evaluate_task: Every cfg.signal_poll_interval_sec (default 60s):
                    - Reload config
                    - Get active watchlist
-                   - For each ticker: compute stats + volume Z-score
-                   - Call SignalGenerator.evaluate()
-                   - Publish Signal → strategy_signals stream
+                   - Phase 1: evaluate with Tier-1 (free) stats against
+                              signal_phase1_threshold; publish enrichment
+                              requests for qualifying tickers.
+                   - Phase 2: for tickers that already have Tier-2 data in
+                              the aggregator window, re-evaluate against
+                              signal_phase2_threshold; publish to
+                              strategy_signals stream.
+                   - Tickers with no Tier-2 data evaluated against Phase 1 threshold;
+                     when cfg.x_api_enabled is False, Phase 1 signals fire directly
+                     to strategy_signals (no paid sources means Phase 1 IS the final signal).
 
 Design reference: docs/design/05-signal-generation.md §5a
 
@@ -26,12 +33,18 @@ import logging
 import os
 import signal as os_signal
 import sys
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_SENTIMENT, STREAM_STRATEGY_SIGNALS, STREAM_MAXLEN
+from social_trading.core.events import (
+    STREAM_ENRICHMENT_REQUESTS,
+    STREAM_MAXLEN,
+    STREAM_SENTIMENT,
+    STREAM_STRATEGY_SIGNALS,
+)
 from social_trading.core.models import SentimentResult, Signal
 from social_trading.ingest.watchlist.manager import WatchlistManager
 from social_trading.monitoring.metrics import (
@@ -56,6 +69,14 @@ logger = logging.getLogger(__name__)
 _GROUP = "signal"
 _CONSUMER = "signal-0"
 _INGEST_BATCH = 32
+
+# Canonical set of Tier-2 source names (paid APIs).  Kept in sync with the
+# `tier` property overrides in each DataSource implementation.
+_TIER2_SOURCE_NAMES: frozenset[str] = frozenset({"twitter"})
+
+# Redis key template for deduplicating enrichment requests within a cycle.
+# TTL = signal_poll_interval_sec so at most one request is sent per cycle.
+_ENRICHMENT_SENT_KEY = "enrichment:sent:{ticker}"
 
 
 # ── Deserialisation ───────────────────────────────────────────────────────────
@@ -94,7 +115,52 @@ def _signal_to_stream_dict(sig: Signal) -> dict[str, str]:
         "convergence": str(sig.convergence),
         "source_post_count": str(sig.source_post_count),
         "generated_at": sig.generated_at.isoformat(),
+        "signal_phase": sig.signal_phase or "",
     }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _stats_has_tier2_data(sources: set[str] | frozenset[str]) -> bool:
+    """Return True if the sentiment stats window includes any Tier-2 source."""
+    return bool(sources & _TIER2_SOURCE_NAMES)
+
+
+async def _is_open_position(redis: aioredis.Redis, ticker: str) -> bool:
+    """Check whether there is an open position for *ticker* in Redis."""
+    return bool(await redis.hexists("positions:live", ticker))
+
+
+async def _request_enrichment(
+    redis: aioredis.Redis,
+    ticker: str,
+    phase1_score: float,
+    poll_interval_sec: int,
+) -> None:
+    """
+    Publish an enrichment request for *ticker* to the enrichment:requests stream.
+
+    Deduplication: a key with TTL = poll_interval_sec ensures at most one
+    request is published per signal evaluation cycle.
+    """
+    dedup_key = _ENRICHMENT_SENT_KEY.format(ticker=ticker)
+    already_sent = await redis.set(dedup_key, "1", ex=poll_interval_sec, nx=True)
+    if not already_sent:
+        logger.debug("enrichment already requested this cycle for %s", ticker)
+        return
+
+    event = {
+        "ticker": ticker,
+        "phase1_score": str(phase1_score),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await redis.xadd(
+        STREAM_ENRICHMENT_REQUESTS,
+        event,
+        maxlen=STREAM_MAXLEN.get(STREAM_ENRICHMENT_REQUESTS),
+        approximate=True,
+    )
+    logger.info("PHASE1 CANDIDATE %s score=%.3f → enrichment requested", ticker, phase1_score)
 
 
 # ── Service tasks ─────────────────────────────────────────────────────────────
@@ -128,15 +194,38 @@ async def run_evaluate_task(
     redis: aioredis.Redis,
 ) -> None:
     """
-    Periodically iterate active watchlist, compute stats, generate signals.
-    Runs until cancelled.
+    Periodically iterate active watchlist, compute stats, run two-phase
+    signal evaluation, publish signals and enrichment requests.
+
+    Two-phase logic:
+      • Phase 1  — free/Tier-1 sources only (no Tier-2 data in window yet).
+                   Threshold: cfg.signal_phase1_threshold.
+                   score >= phase1_threshold → Phase-1 signal.
+                   - If tier2_configured (x_api_enabled=True AND X_BEARER_TOKEN set):
+                     request Tier-2 enrichment (signal fires after Phase 2).
+                   - Otherwise: fire signal directly to strategy_signals
+                     (Phase 1 IS the final signal when no paid sources active).
+      • Phase 2  — Tier-2 data is present in the aggregator window (enrichment fulfilled).
+                   Threshold: cfg.signal_phase2_threshold.
+                   score >= phase2_threshold → fire signal to strategy_signals.
+                   score < phase2_threshold → suppressed (enrichment confirmed weak signal).
     """
-    logger.info("Signal evaluate task started")
+    logger.info("Signal evaluate task started (two-phase pipeline)")
     signals_generated = 0
+    _tier2_warn_logged = False  # warn once if x_api_enabled but token missing
 
     while True:
         cfg = await SystemConfig.load(redis)
         aggregator.update_cfg(cfg)
+
+        # Warn once if config says Tier-2 is enabled but the token is absent.
+        if cfg.x_api_enabled and not os.getenv("X_BEARER_TOKEN") and not _tier2_warn_logged:
+            logger.warning(
+                "x_api_enabled=True but X_BEARER_TOKEN is not set — "
+                "Tier-2 enrichment will NOT run; Phase 1 signals fire directly. "
+                "Set X_BEARER_TOKEN in .env to enable paid X/Twitter enrichment."
+            )
+            _tier2_warn_logged = True
 
         tickers = await watchlist.get_active()
         if not tickers:
@@ -144,6 +233,18 @@ async def run_evaluate_task(
             continue
 
         batch_signals: list[Signal] = []
+        phase1_direct = 0      # Phase-1 signals fired directly (no tier-2 configured)
+        phase1_enrichment = 0  # Phase-1 candidates that requested enrichment
+        phase2_evaluated = 0
+
+        # Whether paid Tier-2 API (X/Twitter) is active this cycle.
+        # Mirrors the exact condition in ingest_service.py — BOTH the config flag
+        # AND the env var must be set, otherwise no TwitterDataSource was registered
+        # and enrichment requests would sit in the queue forever.
+        tier2_configured = cfg.x_api_enabled and bool(os.getenv("X_BEARER_TOKEN"))
+
+        # Apply phase2_max_tickers_per_cycle cap across the whole batch.
+        enrichment_budget = cfg.phase2_max_tickers_per_cycle
 
         for ticker in tickers:
             try:
@@ -152,33 +253,93 @@ async def run_evaluate_task(
                     continue
 
                 volume_zscore = await aggregator.get_volume_zscore(ticker)
-                sig = generator.evaluate(
-                    stats,
-                    cfg=cfg,
-                    volume_zscore=volume_zscore,
-                    # price_momentum: 0.0 until market_data service is available (Phase 5)
-                )
-                if sig is not None:
-                    batch_signals.append(sig)
-                    SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
-                    SIGNAL_QUALITY.observe(sig.quality_score)
-                    SENTIMENT_SCORE.labels(ticker=ticker).set(sig.sentiment_score)
-                    VOLUME_ZSCORE.labels(ticker=ticker).set(sig.volume_z_score)
+                has_tier2 = _stats_has_tier2_data(stats.sources)
+
+                if has_tier2:
+                    # ── Phase 2 ─────────────────────────────────────────────
+                    phase2_evaluated += 1
+                    sig = generator.evaluate(
+                        stats, cfg=cfg,
+                        quality_threshold=cfg.signal_phase2_threshold,
+                        volume_zscore=volume_zscore,
+                    )
+                    if sig is not None:
+                        sig = sig.model_copy(update={"signal_phase": "phase2"})
+                        batch_signals.append(sig)
+                        SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
+                        SIGNAL_QUALITY.observe(sig.quality_score)
+                        SENTIMENT_SCORE.labels(ticker=ticker).set(sig.sentiment_score)
+                        VOLUME_ZSCORE.labels(ticker=ticker).set(sig.volume_z_score)
+                        logger.info(
+                            "PHASE2 SIGNAL %s dir=%s score=%.3f",
+                            ticker, sig.direction, sig.quality_score,
+                        )
+                    else:
+                        logger.debug(
+                            "PHASE2 BELOW_THRESHOLD %s (need ≥%.2f)",
+                            ticker, cfg.signal_phase2_threshold,
+                        )
+
+                else:
+                    # ── Phase 1 (free sources only) ─────────────────────────
+                    sig = generator.evaluate(
+                        stats, cfg=cfg,
+                        quality_threshold=cfg.signal_phase1_threshold,
+                        volume_zscore=volume_zscore,
+                    )
+                    if sig is not None:
+                        SENTIMENT_SCORE.labels(ticker=ticker).set(sig.sentiment_score)
+                        VOLUME_ZSCORE.labels(ticker=ticker).set(sig.volume_z_score)
+
+                        if not tier2_configured:
+                            # No paid sources — Phase 1 IS the final signal.
+                            sig = sig.model_copy(update={"signal_phase": "phase1"})
+                            batch_signals.append(sig)
+                            phase1_direct += 1
+                            SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
+                            SIGNAL_QUALITY.observe(sig.quality_score)
+                            logger.info(
+                                "PHASE1 SIGNAL (direct) %s dir=%s score=%.3f",
+                                ticker, sig.direction, sig.quality_score,
+                            )
+                        else:
+                            # Tier-2 configured — request enrichment; signal fires after Phase 2.
+                            phase1_enrichment += 1
+                            if enrichment_budget > 0:
+                                skip = (
+                                    cfg.phase2_skip_open_positions
+                                    and await _is_open_position(redis, ticker)
+                                )
+                                if skip:
+                                    logger.debug(
+                                        "PHASE1 SKIP_ENRICHMENT %s (open position)", ticker
+                                    )
+                                else:
+                                    await _request_enrichment(
+                                        redis, ticker, sig.quality_score,
+                                        cfg.signal_poll_interval_sec,
+                                    )
+                                    enrichment_budget -= 1
 
             except Exception as exc:
                 logger.warning("Error evaluating %s: %s", ticker, exc)
 
         if batch_signals:
             for sig in batch_signals:
-                await redis.xadd(STREAM_STRATEGY_SIGNALS, _signal_to_stream_dict(sig),
-                                 maxlen=STREAM_MAXLEN.get(STREAM_STRATEGY_SIGNALS), approximate=True)
+                await redis.xadd(
+                    STREAM_STRATEGY_SIGNALS,
+                    _signal_to_stream_dict(sig),
+                    maxlen=STREAM_MAXLEN.get(STREAM_STRATEGY_SIGNALS),
+                    approximate=True,
+                )
             signals_generated += len(batch_signals)
-            logger.info(
-                "signals: generated=%d this_cycle=%d tickers_scanned=%d",
-                signals_generated, len(batch_signals), len(tickers),
-            )
-        else:
-            logger.debug("evaluate cycle: no signals (tickers=%d)", len(tickers))
+
+        logger.info(
+            "evaluate cycle: signals=%d phase1_direct=%d phase1_enrichment=%d "
+            "phase2_evaluated=%d tickers_scanned=%d tier2=%s",
+            len(batch_signals), phase1_direct, phase1_enrichment,
+            phase2_evaluated, len(tickers), tier2_configured,
+        )
 
         await asyncio.sleep(cfg.signal_poll_interval_sec)
 

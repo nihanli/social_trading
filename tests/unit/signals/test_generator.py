@@ -25,7 +25,6 @@ def gen() -> SignalGenerator:
 @pytest.fixture
 def cfg() -> SystemConfig:
     return SystemConfig(
-        signal_quality_threshold=0.60,
         sentiment_strength_min=0.30,
         w_volume=0.30,
         w_sentiment=0.25,
@@ -34,6 +33,10 @@ def cfg() -> SystemConfig:
         w_convergence=0.10,
         convergence_bonus=0.20,
     )
+
+
+# Default quality threshold used across evaluate() test calls.
+_THRESHOLD = 0.60
 
 
 def make_stats(
@@ -70,7 +73,7 @@ def make_stats(
 
 def test_generates_long_signal(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.7)
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=0.03)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=0.03)
     assert sig is not None
     assert isinstance(sig, Signal)
     assert sig.direction == "LONG"
@@ -82,14 +85,14 @@ def test_generates_short_signal(gen: SignalGenerator, cfg: SystemConfig) -> None
         mean_score=-0.7,
         source_scores={"twitter": -0.7, "reddit": -0.6},
     )
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=-0.03)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=-0.03)
     assert sig is not None
     assert sig.direction == "SHORT"
 
 
 def test_signal_quality_within_bounds(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.8)
-    sig = gen.evaluate(stats, cfg, volume_zscore=4.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=4.0)
     assert sig is not None
     assert 0.0 <= sig.quality_score <= 1.0
 
@@ -99,26 +102,26 @@ def test_signal_quality_within_bounds(gen: SignalGenerator, cfg: SystemConfig) -
 def test_below_quality_threshold_returns_none(gen: SignalGenerator, cfg: SystemConfig) -> None:
     # Low volume_zscore + barely above sentiment min → low quality
     stats = make_stats(mean_score=0.31, source_scores={"twitter": 0.31})
-    sig = gen.evaluate(stats, cfg, volume_zscore=0.1, price_momentum=0.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=0.1, price_momentum=0.0)
     assert sig is None
 
 
 def test_below_sentiment_threshold_returns_none(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.15)  # below 0.30 min
-    sig = gen.evaluate(stats, cfg, volume_zscore=5.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=5.0)
     assert sig is None
 
 
 def test_insufficient_posts_returns_none(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(post_count=1)  # < 2 required
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0)
     assert sig is None
 
 
 def test_price_misaligned_long_returns_none(gen: SignalGenerator, cfg: SystemConfig) -> None:
     """Strongly negative price momentum contradicts LONG direction."""
     stats = make_stats(mean_score=0.7)
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=-0.10)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=-0.10)
     assert sig is None
 
 
@@ -127,14 +130,14 @@ def test_price_misaligned_short_returns_none(gen: SignalGenerator, cfg: SystemCo
         mean_score=-0.7,
         source_scores={"twitter": -0.7},
     )
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=0.10)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=0.10)
     assert sig is None
 
 
 def test_slight_price_dip_does_not_block_long(gen: SignalGenerator, cfg: SystemConfig) -> None:
     """Small dip (−1%) is allowed for LONG — buying the dip."""
     stats = make_stats(mean_score=0.7)
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=-0.01)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=-0.01)
     assert sig is not None
     assert sig.direction == "LONG"
 
@@ -142,7 +145,7 @@ def test_slight_price_dip_does_not_block_long(gen: SignalGenerator, cfg: SystemC
 def test_no_price_data_does_not_block_signal(gen: SignalGenerator, cfg: SystemConfig) -> None:
     """price_momentum=0.0 means 'not available' — should not filter."""
     stats = make_stats(mean_score=0.7)
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0, price_momentum=0.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0, price_momentum=0.0)
     assert sig is not None
 
 
@@ -150,21 +153,21 @@ def test_no_price_data_does_not_block_signal(gen: SignalGenerator, cfg: SystemCo
 
 def test_signal_carries_volume_zscore(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.7)
-    sig = gen.evaluate(stats, cfg, volume_zscore=2.5)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=2.5)
     assert sig is not None
     assert sig.volume_z_score == pytest.approx(2.5)
 
 
 def test_signal_carries_source_count(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.7, post_count=15)
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0)
     assert sig is not None
     assert sig.source_post_count == 15
 
 
 def test_signal_metadata_has_sources(gen: SignalGenerator, cfg: SystemConfig) -> None:
     stats = make_stats(mean_score=0.7, sources={"twitter", "reddit"})
-    sig = gen.evaluate(stats, cfg, volume_zscore=3.0)
+    sig = gen.evaluate(stats, cfg, quality_threshold=_THRESHOLD, volume_zscore=3.0)
     assert sig is not None
     assert "sources" in sig.metadata
     assert set(sig.metadata["sources"]) == {"twitter", "reddit"}

@@ -81,6 +81,7 @@ class Signal(BaseModel):
     source_post_count: int
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    signal_phase: str | None = None  # "phase1" (free sources) or "phase2" (all sources)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

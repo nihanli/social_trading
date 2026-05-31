@@ -84,6 +84,13 @@ class ApprovedSignalEvent(TypedDict):
     take_profit: str
 
 
+# enrichment:requests  ────────────────────────────────────────────────────────
+class EnrichmentRequestEvent(TypedDict):
+    ticker: str
+    phase1_score: str      # float as str — quality score that passed Phase 1
+    requested_at: str      # ISO-8601
+
+
 # ── Stream name constants ─────────────────────────────────────────────────────
 STREAM_RAW_SOCIAL = "raw_social"
 STREAM_SENTIMENT = "sentiment_signals"
@@ -91,6 +98,7 @@ STREAM_MARKET_DATA = "market_data"       # reserved — not yet published
 STREAM_STRATEGY_SIGNALS = "strategy_signals"
 STREAM_SELECTED_SIGNALS = "selected_signals"
 STREAM_EXEC_EVENTS = "execution:events"  # position open/close lifecycle events
+STREAM_ENRICHMENT_REQUESTS = "enrichment:requests"  # Phase-1 → Tier-2 enrichment triggers
 
 ALL_STREAMS = [
     STREAM_RAW_SOCIAL,
@@ -99,6 +107,7 @@ ALL_STREAMS = [
     STREAM_STRATEGY_SIGNALS,
     STREAM_SELECTED_SIGNALS,
     STREAM_EXEC_EVENTS,
+    STREAM_ENRICHMENT_REQUESTS,
 ]
 
 # Maximum entries to retain per stream (approximate trim — Redis `MAXLEN ~`).
@@ -111,10 +120,11 @@ ALL_STREAMS = [
 #                                    50K covers thousands of round-trip trades
 #   market_data                    : reserved stream, not yet published
 STREAM_MAXLEN: dict[str, int] = {
-    STREAM_RAW_SOCIAL:        250_000,
-    STREAM_SENTIMENT:         250_000,
-    STREAM_MARKET_DATA:        50_000,
-    STREAM_STRATEGY_SIGNALS:   25_000,
-    STREAM_SELECTED_SIGNALS:   10_000,
-    STREAM_EXEC_EVENTS:        50_000,
+    STREAM_RAW_SOCIAL:             250_000,
+    STREAM_SENTIMENT:              250_000,
+    STREAM_MARKET_DATA:             50_000,
+    STREAM_STRATEGY_SIGNALS:        25_000,
+    STREAM_SELECTED_SIGNALS:        10_000,
+    STREAM_EXEC_EVENTS:             50_000,
+    STREAM_ENRICHMENT_REQUESTS:      5_000,
 }

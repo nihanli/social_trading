@@ -129,6 +129,15 @@ with col3:
     cfg.watchlist_stale_hours = st.number_input(
         "Watchlist stale expiry (hours)", 6, 168, int(cfg.watchlist_stale_hours), 6,
     )
+    cfg.watchlist_max_size = st.number_input(
+        "Max watchlist size",
+        min_value=10, max_value=500,
+        value=int(cfg.watchlist_max_size), step=10,
+        help=(
+            "Maximum number of tickers in the active watchlist. "
+            "Pinned seeds are always included and do not count toward this cap."
+        ),
+    )
     cfg.watchlist_min_adv_usd = st.number_input(
         "Min ADV for watchlist ($)", 100_000, 5_000_000,
         int(cfg.watchlist_min_adv_usd), 100_000, format="%d",
@@ -223,10 +232,35 @@ st.header("3. Signal Quality")
 col_s1, col_s2 = st.columns(2)
 
 with col_s1:
-    cfg.signal_quality_threshold = st.slider(
-        "Minimum signal quality score", 0.3, 0.95, float(cfg.signal_quality_threshold), 0.05,
-        help="Signals below this score are discarded.",
+    st.subheader("Two-Phase Thresholds")
+    st.caption(
+        "Phase 1 uses free/Tier-1 sources (always on). "
+        "When X/Twitter API is enabled, tickers passing Phase 1 trigger paid enrichment "
+        "and are re-evaluated against the higher Phase 2 threshold before a signal fires. "
+        "When no paid sources are configured, Phase 1 signals fire directly."
     )
+    cfg.signal_phase1_threshold = st.slider(
+        "Phase 1 threshold (free sources)", 0.2, 0.95,
+        float(cfg.signal_phase1_threshold), 0.05,
+        help="Signals with score ≥ this value fire directly (no paid API) or trigger Tier-2 enrichment.",
+    )
+    cfg.signal_phase2_threshold = st.slider(
+        "Phase 2 threshold (all sources)", 0.2, 0.95,
+        float(cfg.signal_phase2_threshold), 0.05,
+        help="After Tier-2 enrichment, only signals with score ≥ this value fire to execution.",
+    )
+    cfg.phase2_max_tickers_per_cycle = st.number_input(
+        "Max Tier-2 enrichment calls per cycle", 1, 50,
+        int(cfg.phase2_max_tickers_per_cycle), 1,
+        help="Cost cap: limits Tier-2 API calls per signal evaluation cycle.",
+    )
+    cfg.phase2_skip_open_positions = st.checkbox(
+        "Skip enrichment for tickers with open positions",
+        value=bool(cfg.phase2_skip_open_positions),
+        help="Avoids paying for Tier-2 data when a position is already open.",
+    )
+
+    st.subheader("Other Quality Settings")
     cfg.sentiment_strength_min = st.slider(
         "Min |sentiment| to fire", 0.1, 0.8, float(cfg.sentiment_strength_min), 0.05,
     )

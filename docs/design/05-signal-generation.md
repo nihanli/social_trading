@@ -1,6 +1,39 @@
 ## 5. Signal Generation Logic
 
-### 5a. Main Signal Loop
+### 5a. Two-Phase Signal Pipeline
+
+The signal engine implements a **two-phase quality gate** to balance signal coverage
+(using always-free data) with signal precision (confirmed by metered paid data):
+
+```
+Phase 1 — Free/Tier-1 sources only (Bluesky, Reddit, StockTwits, YFinance)
+    ↓
+  quality ≥ signal_phase1_threshold (default 0.40)?
+    │
+    ├─ YES + no Tier-2 API configured ──► fire signal directly → strategy_signals
+    │
+    └─ YES + Tier-2 (X/Twitter) enabled ──► publish to enrichment:requests
+                                                    ↓
+                                         Enrichment Loop calls Twitter for this ticker
+                                                    ↓
+                                         Phase 2 — all sources in aggregator window
+                                                    ↓
+                                          quality ≥ signal_phase2_threshold (default 0.65)?
+                                            ├─ YES ──► fire signal → strategy_signals
+                                            └─ NO  ──► suppress (Tier-2 confirmed weak)
+```
+
+**Key properties:**
+- Phase 1 and Phase 2 thresholds are fully independent — no ordering constraint.
+- A ticker that scores ≥ phase1_threshold fires directly when no paid API is configured,
+  so the system always produces signals even without an X/Twitter subscription.
+- Enrichment is deduplicated per cycle via `enrichment:sent:{ticker}` (TTL = poll interval).
+- Open positions can be skipped from enrichment to avoid paying for redundant data
+  (`phase2_skip_open_positions`, default True).
+- At most `phase2_max_tickers_per_cycle` (default 10) Tier-2 calls per signal cycle
+  to cap API costs.
+
+### 5b. Main Signal Loop
 
 The signal engine reads the active watchlist from Redis (populated by the discovery layer
 in §3a) and evaluates each ticker every cycle. No ticker list is hardcoded.
@@ -16,26 +49,39 @@ def signal_engine_loop():
     from config.system_config import SystemConfig
     while True:
         cfg = SystemConfig.load(rc)          # reload each cycle — picks up UI changes
+        tier2_active = cfg.x_api_enabled
+
         for ticker in wm.get_active():
-            result = compute_trading_signal(ticker, cfg=cfg)
-            if result["signal"] != "FLAT":
-                rc.xadd("strategy_signals", {
-                    "ticker":  ticker,
-                    "signal":  result["signal"],
-                    "score":   result["score"],
-                    "ts":      str(time.time()),
-                })
+            stats = aggregator.get_stats(ticker)
+            has_tier2_data = bool(stats.sources & {"twitter"})
+
+            if has_tier2_data:
+                # Phase 2: Tier-2 data present — apply higher threshold
+                sig = generator.evaluate(stats, cfg,
+                                         quality_threshold=cfg.signal_phase2_threshold)
+                if sig:
+                    rc.xadd("strategy_signals", serialise(sig))
+            else:
+                # Phase 1: free sources only
+                sig = generator.evaluate(stats, cfg,
+                                         quality_threshold=cfg.signal_phase1_threshold)
+                if sig:
+                    if not tier2_active:
+                        rc.xadd("strategy_signals", serialise(sig))   # direct fire
+                    else:
+                        rc.xadd("enrichment:requests", {"ticker": ticker, ...})  # request enrichment
+
         time.sleep(cfg.signal_poll_interval_sec)
 ```
 
-### 5b. Signal Construction Pipeline
+### 5c. Signal Construction Pipeline
 
 ```python
 import pandas as pd
 import numpy as np
 
 def compute_trading_signal(ticker: str, window_hours: int = 24,
-                            cfg=None) -> dict:
+                            cfg=None, quality_threshold: float = 0.40) -> dict:
     """Single-ticker multi-factor signal. All thresholds from SystemConfig."""
     import redis
     from config.system_config import SystemConfig
@@ -70,10 +116,10 @@ def compute_trading_signal(ticker: str, window_hours: int = 24,
         cfg.w_convergence * convergence_bonus
     )
 
-    # 7. Signal decision — threshold from SystemConfig
-    if quality_score >= cfg.signal_quality_threshold and sentiment_score > cfg.sentiment_strength_min and price_momentum >= 0:
+    # 7. Signal decision — threshold passed in (phase1 or phase2 depending on caller)
+    if quality_score >= quality_threshold and sentiment_score > cfg.sentiment_strength_min and price_momentum >= 0:
         signal = "LONG"
-    elif quality_score >= cfg.signal_quality_threshold and sentiment_score < -cfg.sentiment_strength_min and price_momentum <= 0:
+    elif quality_score >= quality_threshold and sentiment_score < -cfg.sentiment_strength_min and price_momentum <= 0:
         signal = "SHORT"
     else:
         signal = "FLAT"
@@ -84,7 +130,7 @@ def compute_trading_signal(ticker: str, window_hours: int = 24,
 
 [^13]: Synthesis of SpotDylan/SocialMediaTradeBotV1, galafis/rust-sentiment-analysis-trading, and Buz & de Melo (2021) signal quality framework
 
-### 5c. Signal Decay — Time-Limit Enforcement
+### 5d. Signal Decay — Time-Limit Enforcement
 
 ```python
 import math
@@ -104,10 +150,10 @@ def is_signal_expired(hours_since_detection: float, cfg: SystemConfig = None) ->
 
 ---
 
-### 5d. Quality Score — Implementation Reference
+### 5e. Quality Score — Implementation Reference
 
 The `SignalGenerator` class (`src/social_trading/signals/generator.py`) implements the
-quality formula from §5b with the following exact computation and default weights.
+quality formula from §5c with the following exact computation and default weights.
 
 #### Formula
 
@@ -121,7 +167,8 @@ The raw weighted sum is **normalised by the sum of active weights** so that fact
 are unavailable (e.g. `price_momentum = 0.0` before the market-data service is live) do
 not permanently lower the score ceiling.  A signal fires when:
 
-- `quality ≥ signal_quality_threshold` (default **0.50**)
+- `quality ≥ quality_threshold` (Phase 1: `signal_phase1_threshold` default **0.40**;
+   Phase 2: `signal_phase2_threshold` default **0.65**)
 - `|mean_sentiment| ≥ sentiment_strength_min` (default **0.30**)
 - If market data is available: price direction must not strongly contradict sentiment
 
@@ -188,14 +235,18 @@ max_quality = (0.30×1.0 + 0.25×1.0 + 0.20×1.0 + 0.10×0.20) / 0.85 ≈ 0.906
 ```
 
 With multiple active platforms adding convergence and a volume spike, typical signals
-score in the **0.50–0.65** range.  Enabling Phase 5 market data raises the ceiling
-toward `1.0` by contributing the `w_momentum = 0.15` term.
+score in the **0.45–0.65** range.  Phase 1 signals (free sources only) typically land
+between 0.40 and 0.60; Tier-2 enrichment from X/Twitter can push scores above the 0.65
+Phase 2 threshold when cross-platform convergence confirms the move.
 
 #### Configuration (all tunable via UI → Config page)
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `signal_quality_threshold` | 0.50 | Minimum quality to fire a signal |
+| `signal_phase1_threshold` | 0.40 | Phase 1 gate — free sources only; passing tickers request Tier-2 enrichment (or fire directly if no Tier-2 configured) |
+| `signal_phase2_threshold` | 0.65 | Phase 2 gate — all sources required; passing tickers fire to execution |
+| `phase2_max_tickers_per_cycle` | 10 | Max Tier-2 API calls per signal evaluation cycle (cost cap) |
+| `phase2_skip_open_positions` | True | Skip enrichment when position already open for ticker |
 | `sentiment_strength_min` | 0.30 | Minimum \|mean_score\| for LONG/SHORT direction |
 | `convergence_bonus` | 0.20 | Cap on the convergence factor `c` |
 | `w_volume` | 0.30 | Weight for mention volume Z-score |

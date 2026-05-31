@@ -66,6 +66,11 @@ class TwitterDataSource(BaseDataSource):
         return "twitter"
 
     @property
+    def tier(self) -> int:
+        """Tier 2 — metered X API; only called for Phase-2 enrichment candidates."""
+        return 2
+
+    @property
     def is_streaming(self) -> bool:
         return False
 

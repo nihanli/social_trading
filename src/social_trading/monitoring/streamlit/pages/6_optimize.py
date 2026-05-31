@@ -136,8 +136,8 @@ with tab_sensitivity:
 
         col1, col2 = st.columns(2)
         param_col = col1.selectbox("Config parameter (X axis)", numeric_cfg_cols,
-                                   index=numeric_cfg_cols.index("signal_quality_threshold")
-                                   if "signal_quality_threshold" in numeric_cfg_cols else 0)
+                                   index=numeric_cfg_cols.index("signal_phase1_threshold")
+                                   if "signal_phase1_threshold" in numeric_cfg_cols else 0)
         metric_col = col2.selectbox("Performance metric (Y axis)", perf_metrics)
 
         scatter_df = analysis_df[[param_col, metric_col, "mode", "run_date"]].dropna()
@@ -192,10 +192,10 @@ with tab_suggest:
         if pd.notna(avg_wr) and avg_wr < 0.45:
             suggestions.append({
                 "symptom": f"Low win rate ({avg_wr:.1%})",
-                "suggestion": "Raise signal quality threshold",
-                "parameter": "signal_quality_threshold",
-                "current": cfg_now.signal_quality_threshold,
-                "recommended": round(min(cfg_now.signal_quality_threshold + 0.05, 0.90), 2),
+                "suggestion": "Raise Phase 1 signal quality threshold",
+                "parameter": "signal_phase1_threshold",
+                "current": cfg_now.signal_phase1_threshold,
+                "recommended": round(min(cfg_now.signal_phase1_threshold + 0.05, 0.90), 2),
                 "severity": "warning",
             })
 
@@ -229,10 +229,10 @@ with tab_suggest:
         if pd.notna(avg_total) and avg_total > 0 and pd.notna(avg_sr) and avg_sr / avg_total > 0.25:
             suggestions.append({
                 "symptom": f"Sentiment reversals common ({avg_sr / avg_total:.0%})",
-                "suggestion": "Tighten entry bar — raise signal_quality_threshold",
-                "parameter": "signal_quality_threshold",
-                "current": cfg_now.signal_quality_threshold,
-                "recommended": round(min(cfg_now.signal_quality_threshold + 0.05, 0.90), 2),
+                "suggestion": "Tighten entry bar — raise Phase 1 signal quality threshold",
+                "parameter": "signal_phase1_threshold",
+                "current": cfg_now.signal_phase1_threshold,
+                "recommended": round(min(cfg_now.signal_phase1_threshold + 0.05, 0.90), 2),
                 "severity": "warning",
             })
 

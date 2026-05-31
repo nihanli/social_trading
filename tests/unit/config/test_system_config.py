@@ -49,26 +49,26 @@ async def test_vix_crisis_must_exceed_high_fear(cfg: SystemConfig) -> None:
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 async def test_save_and_reload_round_trips(redis) -> None:
-    cfg = SystemConfig(signal_quality_threshold=0.85, max_hold_hours=24)
+    cfg = SystemConfig(signal_phase1_threshold=0.45, max_hold_hours=24)
     await cfg.save(redis)
 
     loaded = await SystemConfig.load(redis)
-    assert loaded.signal_quality_threshold == 0.85
+    assert loaded.signal_phase1_threshold == 0.45
     assert loaded.max_hold_hours == 24
 
 
 async def test_load_returns_defaults_when_nothing_saved(redis) -> None:
     cfg = await SystemConfig.load(redis)
     default = SystemConfig()
-    assert cfg.signal_quality_threshold == default.signal_quality_threshold
+    assert cfg.signal_phase1_threshold == default.signal_phase1_threshold
 
 
 async def test_unknown_keys_in_redis_are_ignored(redis) -> None:
     """Forward-compatibility: new keys stored by future version don't crash load."""
-    data = {"signal_quality_threshold": "0.77", "future_param_xyz": "42"}
+    data = {"signal_phase1_threshold": "0.35", "future_param_xyz": "42"}
     await redis.set("config:system", json.dumps(data))
     cfg = await SystemConfig.load(redis)
-    assert cfg.signal_quality_threshold == 0.77
+    assert cfg.signal_phase1_threshold == 0.35
 
 
 # ── Config Hash ────────────────────────────────────────────────────────────────
@@ -83,6 +83,6 @@ async def test_same_config_same_hash(cfg: SystemConfig) -> None:
 
 
 def test_different_configs_different_hashes() -> None:
-    c1 = SystemConfig(signal_quality_threshold=0.60)
-    c2 = SystemConfig(signal_quality_threshold=0.75)
+    c1 = SystemConfig(signal_phase1_threshold=0.35)
+    c2 = SystemConfig(signal_phase1_threshold=0.55)
     assert c1.config_hash() != c2.config_hash()

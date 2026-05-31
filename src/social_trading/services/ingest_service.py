@@ -49,6 +49,7 @@ from social_trading.ingest.sources.stocktwits import StockTwitsDataSource
 from social_trading.ingest.sources.twitter import TwitterDataSource
 from social_trading.ingest.sources.yfinance_screener import YFinanceScreenerDataSource
 from social_trading.ingest.watchlist.manager import WatchlistManager
+from social_trading.core.events import STREAM_ENRICHMENT_REQUESTS
 from social_trading.monitoring.metrics import (
     ACTIVE_TICKERS,
     start_metrics_server,
@@ -140,6 +141,111 @@ async def run_watchlist_maintenance(
         await asyncio.sleep(cfg.watchlist_promote_interval)
 
 
+async def run_enrichment_loop(
+    registry: DataSourceRegistry,
+    redis: aioredis.Redis,
+) -> None:
+    """
+    Consume enrichment:requests stream and call Tier-2 sources for each ticker.
+
+    Published by signal_service when a ticker passes Phase-1 evaluation.
+    Deduplication at the publisher side (enrichment:sent:{ticker} TTL key)
+    ensures at most one request per signal cycle per ticker.
+
+    Runs until cancelled; silently skips when no Tier-2 sources are registered.
+    """
+    _group = "ingest"
+    _consumer = "ingest-enrichment-0"
+
+    try:
+        await redis.xgroup_create(STREAM_ENRICHMENT_REQUESTS, _group, id="$", mkstream=True)
+    except Exception:
+        pass  # group already exists
+
+    logger.info("Enrichment loop started (tier-2 sources: %s)",
+                [s.name for s in registry.tier2_sources()])
+
+    while True:
+        tier2_sources = registry.tier2_sources()
+        if not tier2_sources:
+            # No tier-2 sources registered; drain silently and sleep.
+            await asyncio.sleep(30)
+            continue
+
+        try:
+            messages = await redis.xreadgroup(
+                _group, _consumer,
+                {STREAM_ENRICHMENT_REQUESTS: ">"},
+                count=10,
+                block=5000,
+            )
+        except Exception as exc:
+            logger.warning("enrichment loop xreadgroup error: %s", exc)
+            await asyncio.sleep(5)
+            continue
+
+        if not messages:
+            continue
+
+        for _stream, entries in messages:
+            for msg_id, fields in entries:
+                try:
+                    # Fields are bytes when decode_responses=False.
+                    ticker = (
+                        fields[b"ticker"].decode() if isinstance(fields.get(b"ticker"), bytes)
+                        else fields.get("ticker", "")
+                    )
+                    if not ticker:
+                        continue
+
+                    phase1_score = float(
+                        (fields.get(b"phase1_score") or fields.get("phase1_score", b"0")).decode()
+                        if isinstance(fields.get(b"phase1_score") or fields.get("phase1_score"), bytes)
+                        else fields.get("phase1_score", 0)
+                    )
+
+                    logger.info(
+                        "ENRICHMENT ticker=%s phase1_score=%.3f (calling %d tier-2 source(s))",
+                        ticker, phase1_score, len(tier2_sources),
+                    )
+
+                    for source in tier2_sources:
+                        try:
+                            posts = await source.poll([ticker])
+                            if posts:
+                                logger.info(
+                                    "ENRICHMENT OK source=%s ticker=%s posts=%d "
+                                    "phase1_score=%.3f — Phase-2 data now available",
+                                    source.name, ticker, len(posts), phase1_score,
+                                )
+                                await redis.set("sentiment:last_poll_ts", str(time.time()))
+                            else:
+                                logger.info(
+                                    "ENRICHMENT EMPTY source=%s ticker=%s — "
+                                    "no new posts found (Phase-2 may still suppress)",
+                                    source.name, ticker,
+                                )
+                        except Exception as src_exc:
+                            from social_trading.core.exceptions import RateLimitError
+                            if isinstance(src_exc, RateLimitError):
+                                logger.warning(
+                                    "ENRICHMENT RATE_LIMITED source=%s ticker=%s — "
+                                    "backing off: %s",
+                                    source.name, ticker, src_exc,
+                                )
+                            else:
+                                logger.error(
+                                    "ENRICHMENT FAILED source=%s ticker=%s — "
+                                    "unexpected error: %s",
+                                    source.name, ticker, src_exc, exc_info=True,
+                                )
+
+                except Exception as exc:
+                    logger.warning("enrichment loop processing error: %s", exc)
+                finally:
+                    await redis.xack(STREAM_ENRICHMENT_REQUESTS, _group, msg_id)
+
+
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
@@ -229,6 +335,12 @@ async def main() -> None:
     tasks.append(asyncio.create_task(
         run_watchlist_maintenance(watchlist, cfg, redis),
         name="watchlist:maintenance",
+    ))
+
+    # ── Enrichment loop (Phase 2 Tier-2 calls) ────────────────────────────────
+    tasks.append(asyncio.create_task(
+        run_enrichment_loop(registry, redis),
+        name="enrichment:loop",
     ))
 
     logger.info("Ingest service started with %d tasks", len(tasks))
