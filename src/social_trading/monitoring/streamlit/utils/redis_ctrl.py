@@ -244,17 +244,27 @@ def get_enrichment_queue_size() -> int:
 def get_phase_pipeline_stats() -> dict:
     """
     Return live two-phase pipeline stats from Redis.
-    Reads the enrichment:requests stream length and the tier-2 configured flag.
-    """
-    import json as _json
+    Reads the enrichment:requests stream length and the tier-2 active flag.
 
+    ``ingest:tier2_active`` is stamped by the enrichment loop each cycle after
+    dynamically registering/deregistering Twitter — it reflects actual ingest
+    capability, not just what the config flags say.
+    """
     r = _get_redis()
     stats: dict = {"enrichment_queue": 0, "tier2_configured": False}
     try:
-        raw = r.get("config:system")
-        if raw:
-            cfg_data = _json.loads(raw)
-            stats["tier2_configured"] = bool(cfg_data.get("x_api_enabled"))
+        # Prefer the live ingest-service flag over raw config to avoid the
+        # race where x_api_enabled=True but Twitter isn't yet registered.
+        raw = r.get("ingest:tier2_active")
+        if raw is not None:
+            stats["tier2_configured"] = raw in ("1", b"1")
+        else:
+            # Fall back to config if ingest_service hasn't written the key yet.
+            import json as _json
+            cfg_raw = r.get("config:system")
+            if cfg_raw:
+                cfg_data = _json.loads(cfg_raw)
+                stats["tier2_configured"] = bool(cfg_data.get("x_api_enabled"))
     except Exception:
         pass
     try:

@@ -237,11 +237,15 @@ async def run_evaluate_task(
         phase1_enrichment = 0  # Phase-1 candidates that requested enrichment
         phase2_evaluated = 0
 
-        # Whether paid Tier-2 API (X/Twitter) is active this cycle.
-        # Mirrors the exact condition in ingest_service.py — BOTH the config flag
-        # AND the env var must be set, otherwise no TwitterDataSource was registered
-        # and enrichment requests would sit in the queue forever.
-        tier2_configured = cfg.x_api_enabled and bool(os.getenv("X_BEARER_TOKEN"))
+        # Whether paid Tier-2 API (X/Twitter) is *actually* active in the ingest
+        # service.  The enrichment loop stamps ingest:tier2_active ("1"/"0") each
+        # cycle after dynamically registering/unregistering Twitter based on the
+        # current config.  Reading this key avoids the race where the config UI
+        # enables x_api_enabled but the ingest service hasn't registered Twitter yet
+        # (or was started before the token was configured), which would cause
+        # enrichment requests to accumulate in the stream without ever being processed.
+        tier2_active_raw = await redis.get("ingest:tier2_active")
+        tier2_configured = (tier2_active_raw == "1" or tier2_active_raw == b"1")
 
         # Apply phase2_max_tickers_per_cycle cap across the whole batch.
         enrichment_budget = cfg.phase2_max_tickers_per_cycle
@@ -303,23 +307,42 @@ async def run_evaluate_task(
                                 ticker, sig.direction, sig.quality_score,
                             )
                         else:
-                            # Tier-2 configured — request enrichment; signal fires after Phase 2.
-                            phase1_enrichment += 1
-                            if enrichment_budget > 0:
-                                skip = (
-                                    cfg.phase2_skip_open_positions
-                                    and await _is_open_position(redis, ticker)
+                            # Tier-2 configured.  Check if the last enrichment attempt
+                            # failed — if so, fire Phase-1 directly rather than letting
+                            # the ticker stall indefinitely waiting for enrichment that
+                            # keeps erroring.
+                            fallback_key = f"enrichment:fallback:{ticker}"
+                            enrichment_failed = await redis.exists(fallback_key)
+                            if enrichment_failed:
+                                await redis.delete(fallback_key)
+                                sig = sig.model_copy(update={"signal_phase": "phase1"})
+                                batch_signals.append(sig)
+                                phase1_direct += 1
+                                SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
+                                SIGNAL_QUALITY.observe(sig.quality_score)
+                                logger.warning(
+                                    "PHASE1 SIGNAL (enrichment fallback) %s dir=%s score=%.3f "
+                                    "— Tier-2 source error; firing Phase-1 directly",
+                                    ticker, sig.direction, sig.quality_score,
                                 )
-                                if skip:
-                                    logger.debug(
-                                        "PHASE1 SKIP_ENRICHMENT %s (open position)", ticker
+                            else:
+                                # Request enrichment; signal fires after Phase 2.
+                                phase1_enrichment += 1
+                                if enrichment_budget > 0:
+                                    skip = (
+                                        cfg.phase2_skip_open_positions
+                                        and await _is_open_position(redis, ticker)
                                     )
-                                else:
-                                    await _request_enrichment(
-                                        redis, ticker, sig.quality_score,
-                                        cfg.signal_poll_interval_sec,
-                                    )
-                                    enrichment_budget -= 1
+                                    if skip:
+                                        logger.debug(
+                                            "PHASE1 SKIP_ENRICHMENT %s (open position)", ticker
+                                        )
+                                    else:
+                                        await _request_enrichment(
+                                            redis, ticker, sig.quality_score,
+                                            cfg.signal_poll_interval_sec,
+                                        )
+                                        enrichment_budget -= 1
 
             except Exception as exc:
                 logger.warning("Error evaluating %s: %s", ticker, exc)

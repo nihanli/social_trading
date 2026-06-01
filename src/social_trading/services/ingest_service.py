@@ -96,23 +96,30 @@ async def run_poll_loop(
     while True:
         cfg = await SystemConfig.load(redis)
 
+        # Resolve interval type early so timestamp gates below know which
+        # category this source belongs to (discovery vs. sentiment/social).
+        interval_attr = _POLL_INTERVAL_ATTR.get(source.name, "discovery_poll_interval_sec")
+        interval = getattr(cfg, interval_attr)
+
         # Discover trending tickers on this source
         await source.get_trending()
 
-        # Stamp the last discovery poll time so the UI countdown can show
-        # "next discovery in X seconds" relative to the real last run.
-        await redis.set("discovery:last_poll_ts", str(time.time()))
+        # Stamp the appropriate "last poll" key so the UI countdown reflects
+        # the *actual* cadence of the source that owns each category:
+        #   discovery_poll_interval_sec sources → discovery:last_poll_ts
+        #   stocktwits_poll_interval_sec sources → sentiment:last_poll_ts
+        # Keeping the keys separate prevents social-poll loops from resetting
+        # the discovery countdown and vice versa.
+        if interval_attr == "discovery_poll_interval_sec":
+            await redis.set("discovery:last_poll_ts", str(time.time()))
+        elif interval_attr == "stocktwits_poll_interval_sec":
+            await redis.set("sentiment:last_poll_ts", str(time.time()))
 
         # Poll active watchlist for social posts (no-op for discovery-only sources)
         tickers = await watchlist.get_active()
         if tickers:
             await source.poll(tickers)
-            # Stamp sentiment poll time for social sources so the UI countdown works.
-            if source.name in ("stocktwits", "bluesky", "twitter"):
-                await redis.set("sentiment:last_poll_ts", str(time.time()))
 
-        interval_attr = _POLL_INTERVAL_ATTR.get(source.name, "discovery_poll_interval_sec")
-        interval = getattr(cfg, interval_attr)
         await asyncio.sleep(interval)
 
 
@@ -152,8 +159,15 @@ async def run_enrichment_loop(
     Deduplication at the publisher side (enrichment:sent:{ticker} TTL key)
     ensures at most one request per signal cycle per ticker.
 
-    Runs until cancelled; silently skips when no Tier-2 sources are registered.
+    Dynamically registers/deregisters TwitterDataSource when x_api_enabled
+    is toggled via the Config UI — no service restart required.
+
+    Stamps ``ingest:tier2_active`` ("1"/"0") in Redis each cycle so that
+    signal_service and the UI use consistent tier-2 availability information
+    rather than each computing it independently from config + env vars.
     """
+    from social_trading.config.system_config import SystemConfig as _SC
+
     _group = "ingest"
     _consumer = "ingest-enrichment-0"
 
@@ -166,9 +180,55 @@ async def run_enrichment_loop(
                 [s.name for s in registry.tier2_sources()])
 
     while True:
+        # ── Dynamic Twitter registration ─────────────────────────────────────
+        # Re-read config each iteration so enabling/disabling X API via the UI
+        # takes effect without restarting the ingest service.
+        try:
+            cfg = await _SC.load(redis)
+            should_have_twitter = cfg.x_api_enabled and bool(os.getenv("X_BEARER_TOKEN"))
+        except Exception:
+            should_have_twitter = False
+
+        has_twitter = registry.get("twitter") is not None
+        if should_have_twitter and not has_twitter:
+            registry.register(TwitterDataSource(redis=redis, cfg=cfg))
+            logger.info(
+                "ENRICHMENT Twitter source registered (x_api_enabled=True + X_BEARER_TOKEN set)"
+            )
+        elif not should_have_twitter and has_twitter:
+            registry.unregister("twitter")
+            logger.info(
+                "ENRICHMENT Twitter source deregistered (x_api_enabled=False or token absent)"
+            )
+
         tier2_sources = registry.tier2_sources()
+
+        # Stamp tier2_active so signal_service and UI reflect the same truth.
+        await redis.set("ingest:tier2_active", "1" if tier2_sources else "0")
+
         if not tier2_sources:
-            # No tier-2 sources registered; drain silently and sleep.
+            # Drain any pending enrichment requests so the queue doesn't grow
+            # unboundedly when Twitter is disabled after having been active.
+            try:
+                stale = await redis.xreadgroup(
+                    _group, _consumer,
+                    {STREAM_ENRICHMENT_REQUESTS: ">"},
+                    count=50,
+                    block=0,
+                )
+                if stale:
+                    for _stream, entries in stale:
+                        for msg_id, fields in entries:
+                            ticker_raw = fields.get(b"ticker") or fields.get("ticker", b"")
+                            ticker = ticker_raw.decode() if isinstance(ticker_raw, bytes) else str(ticker_raw)
+                            logger.debug(
+                                "ENRICHMENT DRAINED %s (no tier-2 source active — "
+                                "enable X API via Config UI to process)",
+                                ticker,
+                            )
+                            await redis.xack(STREAM_ENRICHMENT_REQUESTS, _group, msg_id)
+            except Exception:
+                pass
             await asyncio.sleep(30)
             continue
 
@@ -239,6 +299,15 @@ async def run_enrichment_loop(
                                     "unexpected error: %s",
                                     source.name, ticker, src_exc, exc_info=True,
                                 )
+                            # Signal the ticker should fall back to Phase-1 direct signal
+                            # on the next evaluation cycle rather than silently staying
+                            # stuck waiting for enrichment that will never arrive.
+                            # TTL matches the dedup window so the next enrichment
+                            # attempt can still be made after it expires.
+                            await redis.set(
+                                f"enrichment:fallback:{ticker}", "1",
+                                ex=300,  # 5-minute fallback window
+                            )
 
                 except Exception as exc:
                     logger.warning("enrichment loop processing error: %s", exc)
