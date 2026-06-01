@@ -260,6 +260,10 @@ class WatchlistManager:
         A ticker mentioned by multiple sources gets a 6-hour recency credit,
         making it harder to evict than a similarly-aged single-source ticker.
 
+        Tickers with an active enrichment request or fallback key are protected
+        from eviction — they are mid-signal-pipeline and evicting them would cause
+        the signal to be silently lost.
+
         Returns True if a ticker was evicted, False if all active slots are pinned.
         """
         seeds_raw = await self._redis.smembers(SEED_KEY)
@@ -278,6 +282,17 @@ class WatchlistManager:
         worst_score: float = float("inf")
 
         for ticker, last_seen in non_seed_entries:
+            # Skip tickers mid-pipeline: they have an active enrichment request
+            # or a pending fallback key.  Evicting them would silently drop a
+            # signal that is in progress.
+            is_enriching = await self._redis.exists(
+                f"enrichment:sent:{ticker}",
+                f"enrichment:fallback:{ticker}",
+            )
+            if is_enriching:
+                logger.debug("watchlist eviction skip %s (active enrichment pipeline)", ticker)
+                continue
+
             src_count = await self._redis.scard(TICKER_SOURCES_PREFIX + ticker)
             bonus = MULTI_SOURCE_BONUS_SECS if src_count >= 2 else 0
             composite = last_seen + bonus

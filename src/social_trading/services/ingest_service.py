@@ -170,14 +170,42 @@ async def run_enrichment_loop(
 
     _group = "ingest"
     _consumer = "ingest-enrichment-0"
+    _STALE_PENDING_MIN_IDLE_MS = 5 * 60 * 1000   # reclaim messages pending > 5 min
 
     try:
         await redis.xgroup_create(STREAM_ENRICHMENT_REQUESTS, _group, id="$", mkstream=True)
     except Exception:
         pass  # group already exists
 
+    async def _reclaim_stale_pending() -> None:
+        """Claim and discard pending messages idle longer than _STALE_PENDING_MIN_IDLE_MS."""
+        try:
+            claimed_id, claimed_msgs, _ = await redis.xautoclaim(
+                STREAM_ENRICHMENT_REQUESTS, _group, _consumer,
+                min_idle_time=_STALE_PENDING_MIN_IDLE_MS,
+                start_id="0-0",
+                count=100,
+            )
+            if claimed_msgs:
+                for msg_id, fields in claimed_msgs:
+                    ticker_raw = fields.get(b"ticker") or fields.get("ticker", b"")
+                    ticker = ticker_raw.decode() if isinstance(ticker_raw, bytes) else str(ticker_raw)
+                    logger.info(
+                        "ENRICHMENT reclaimed stale pending message ticker=%s "
+                        "(idle >5 min) — discarding",
+                        ticker,
+                    )
+                    await redis.xack(STREAM_ENRICHMENT_REQUESTS, _group, msg_id)
+        except Exception as exc:
+            logger.debug("ENRICHMENT stale-message reclaim skipped: %s", exc)
+
+    # Initial reclaim of stale messages from a previous consumer instance.
+    await _reclaim_stale_pending()
+
     logger.info("Enrichment loop started (tier-2 sources: %s)",
                 [s.name for s in registry.tier2_sources()])
+
+    _last_reclaim_ts = time.time()
 
     while True:
         # ── Dynamic Twitter registration ─────────────────────────────────────
@@ -205,6 +233,13 @@ async def run_enrichment_loop(
 
         # Stamp tier2_active so signal_service and UI reflect the same truth.
         await redis.set("ingest:tier2_active", "1" if tier2_sources else "0")
+
+        # Periodically reclaim pending messages that have gone stale since startup
+        # (e.g., delivered to this consumer but never acked due to an error).
+        now_ts = time.time()
+        if now_ts - _last_reclaim_ts >= 300:  # every 5 minutes
+            _last_reclaim_ts = now_ts
+            await _reclaim_stale_pending()
 
         if not tier2_sources:
             # Drain any pending enrichment requests so the queue doesn't grow
@@ -258,6 +293,22 @@ async def run_enrichment_loop(
                     if not ticker:
                         continue
 
+                    # Skip messages that are too old — they represent a backlog from
+                    # previous evaluate cycles.  Signal_service will re-request if the
+                    # ticker still qualifies on the next evaluate cycle.  This prevents
+                    # an ever-growing queue of stale requests from delaying current ones.
+                    msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
+                    msg_ts_ms = int(msg_id_str.split("-")[0])
+                    msg_age_sec = (time.time() * 1000 - msg_ts_ms) / 1000
+                    if msg_age_sec > 2 * cfg.signal_poll_interval_sec:
+                        logger.debug(
+                            "ENRICHMENT SKIP stale request ticker=%s age=%.0fs — "
+                            "signal_service will re-request if still needed",
+                            ticker, msg_age_sec,
+                        )
+                        # fall through to finally block to ACK
+                        continue
+
                     phase1_score = float(
                         (fields.get(b"phase1_score") or fields.get("phase1_score", b"0")).decode()
                         if isinstance(fields.get(b"phase1_score") or fields.get("phase1_score"), bytes)
@@ -280,10 +331,19 @@ async def run_enrichment_loop(
                                 )
                                 await redis.set("sentiment:last_poll_ts", str(time.time()))
                             else:
+                                # Twitter returned no posts — this ticker has no Tier-2
+                                # signal confirmation available.  Set the fallback key so
+                                # signal_service fires a Phase-1 direct signal rather than
+                                # looping indefinitely requesting enrichment that never yields
+                                # data.  (Fallback TTL = 5 min to allow next cycle to retry.)
                                 logger.info(
                                     "ENRICHMENT EMPTY source=%s ticker=%s — "
-                                    "no new posts found (Phase-2 may still suppress)",
+                                    "no posts found; signalling Phase-1 fallback",
                                     source.name, ticker,
+                                )
+                                await redis.set(
+                                    f"enrichment:fallback:{ticker}", "1",
+                                    ex=300,
                                 )
                         except Exception as src_exc:
                             from social_trading.core.exceptions import RateLimitError

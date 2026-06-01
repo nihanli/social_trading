@@ -279,10 +279,36 @@ async def run_evaluate_task(
                             ticker, sig.direction, sig.quality_score,
                         )
                     else:
-                        logger.debug(
-                            "PHASE2 BELOW_THRESHOLD %s (need ≥%.2f)",
-                            ticker, cfg.signal_phase2_threshold,
+                        # Phase 2 threshold not met even though Tier-2 data exists.
+                        # Fall back to Phase 1 if the Phase 1 threshold is satisfied —
+                        # Twitter data provided some signal but not enough for Phase 2
+                        # confidence.  This prevents valid signals from being silently
+                        # dropped when Phase 2 enrichment returns inconclusive data.
+                        sig_p1 = generator.evaluate(
+                            stats, cfg=cfg,
+                            quality_threshold=cfg.signal_phase1_threshold,
+                            volume_zscore=volume_zscore,
                         )
+                        if sig_p1 is not None:
+                            sig_p1 = sig_p1.model_copy(update={"signal_phase": "phase1"})
+                            batch_signals.append(sig_p1)
+                            phase1_direct += 1
+                            SIGNALS_GENERATED.labels(ticker=ticker, direction=sig_p1.direction).inc()
+                            SIGNAL_QUALITY.observe(sig_p1.quality_score)
+                            SENTIMENT_SCORE.labels(ticker=ticker).set(sig_p1.sentiment_score)
+                            VOLUME_ZSCORE.labels(ticker=ticker).set(sig_p1.volume_z_score)
+                            logger.info(
+                                "PHASE1 SIGNAL (phase2 fallback) %s dir=%s score=%.3f "
+                                "— Tier-2 data present but below phase2 threshold (%.2f)",
+                                ticker, sig_p1.direction, sig_p1.quality_score,
+                                cfg.signal_phase2_threshold,
+                            )
+                        else:
+                            logger.debug(
+                                "PHASE2 BELOW_THRESHOLD %s (need ≥%.2f, phase1 also below %.2f)",
+                                ticker, cfg.signal_phase2_threshold,
+                                cfg.signal_phase1_threshold,
+                            )
 
                 else:
                     # ── Phase 1 (free sources only) ─────────────────────────
