@@ -1,4 +1,4 @@
-.PHONY: install test test-integration test-all lint type-check up down start migrate services-up clean
+.PHONY: install test test-integration test-all lint type-check up down start stop migrate services-up clean
 
 install:
 	pip install -e ".[dev]"
@@ -33,6 +33,11 @@ down:
 # Start all app services in one terminal (requires: make up first)
 start:
 	honcho start
+
+# Stop all app services and clean up orphaned processes.
+# Use this when Ctrl+C leaves processes behind.
+stop:
+	@./stop.sh
 
 migrate:
 	.venv/bin/python migrations/migrate.py

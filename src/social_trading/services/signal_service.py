@@ -78,6 +78,12 @@ _TIER2_SOURCE_NAMES: frozenset[str] = frozenset({"twitter"})
 # TTL = signal_poll_interval_sec so at most one request is sent per cycle.
 _ENRICHMENT_SENT_KEY = "enrichment:sent:{ticker}"
 
+# Fallback reactive threshold (fraction) used when ATR data is unavailable.
+# When ATR is available, the threshold is 1.5 × (atr_14 / last_price) so
+# high-volatility tickers require a proportionally larger move to be flagged
+# as reactive.  3% covers typical mid-cap 1.5–2σ daily moves.
+_REACTIVE_THRESHOLD = 0.03  # 3% daily move
+
 
 # ── Deserialisation ───────────────────────────────────────────────────────────
 
@@ -259,6 +265,45 @@ async def run_evaluate_task(
                 volume_zscore = await aggregator.get_volume_zscore(ticker)
                 has_tier2 = _stats_has_tier2_data(stats.sources)
 
+                # ── Price momentum from execution-service market snapshot ────
+                # execution_service writes market_data:{ticker} every ~5 min for
+                # all watchlist tickers (IB primary → yfinance fallback).  The
+                # "momentum" field holds the intraday return (open → current).
+                # Missing = 0.0 (neutral — does not penalise quality score).
+                price_momentum = 0.0
+                mkt_raw = await redis.hgetall(f"market_data:{ticker}")
+                if mkt_raw:
+                    raw_mom = mkt_raw.get(b"momentum") or mkt_raw.get("momentum")
+                    if raw_mom:
+                        try:
+                            price_momentum = float(raw_mom)
+                        except (ValueError, TypeError):
+                            pass
+
+                # is_reactive threshold: ATR-relative so high-vol tickers need a
+                # larger move to be considered "reactive" (crowd chasing an already-
+                # extended move).  Falls back to _REACTIVE_THRESHOLD when ATR data
+                # is absent (e.g. execution_service snapshot not yet written).
+                reactive_threshold = _REACTIVE_THRESHOLD
+                if mkt_raw:
+                    try:
+                        atr_14 = float(mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14") or 0.0)
+                        last_px = float(mkt_raw.get(b"last") or mkt_raw.get("last") or 0.0)
+                        if atr_14 > 0 and last_px > 0:
+                            reactive_threshold = 1.5 * (atr_14 / last_px)
+                    except (ValueError, TypeError):
+                        pass
+
+                # is_reactive: crowd is reacting to an existing price move rather
+                # than front-running one — suppress proactivity credit (p=0).
+                is_reactive = (
+                    price_momentum != 0.0
+                    and (
+                        (stats.direction == "LONG" and price_momentum > reactive_threshold)
+                        or (stats.direction == "SHORT" and price_momentum < -reactive_threshold)
+                    )
+                )
+
                 if has_tier2:
                     # ── Phase 2 ─────────────────────────────────────────────
                     phase2_evaluated += 1
@@ -266,6 +311,8 @@ async def run_evaluate_task(
                         stats, cfg=cfg,
                         quality_threshold=cfg.signal_phase2_threshold,
                         volume_zscore=volume_zscore,
+                        price_momentum=price_momentum,
+                        is_reactive=is_reactive,
                     )
                     if sig is not None:
                         sig = sig.model_copy(update={"signal_phase": "phase2"})
@@ -288,6 +335,8 @@ async def run_evaluate_task(
                             stats, cfg=cfg,
                             quality_threshold=cfg.signal_phase1_threshold,
                             volume_zscore=volume_zscore,
+                            price_momentum=price_momentum,
+                            is_reactive=is_reactive,
                         )
                         if sig_p1 is not None:
                             sig_p1 = sig_p1.model_copy(update={"signal_phase": "phase1"})
@@ -316,6 +365,8 @@ async def run_evaluate_task(
                         stats, cfg=cfg,
                         quality_threshold=cfg.signal_phase1_threshold,
                         volume_zscore=volume_zscore,
+                        price_momentum=price_momentum,
+                        is_reactive=is_reactive,
                     )
                     if sig is not None:
                         SENTIMENT_SCORE.labels(ticker=ticker).set(sig.sentiment_score)

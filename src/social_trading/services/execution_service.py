@@ -574,6 +574,20 @@ async def _write_market_snapshot_and_get_price(
             if market_cap > 0:
                 mapping["market_cap_usd"] = str(market_cap)
 
+            # Price momentum: intraday return (today's open → current price).
+            # Captures the move during the *current trading session*, which is
+            # directly contemporaneous with the social mention window.  Using
+            # yesterday's close would include overnight gaps unrelated to today's
+            # social activity.  Uses IB primary → yfinance fallback.
+            # Field omitted (= 0.0 neutral) when open price unavailable.
+            try:
+                ohlcv = await market_data.get_ohlcv(ticker, period="1d", interval="1d")
+                if ohlcv and ohlcv[0].get("open", 0) > 0:
+                    mom = (last - ohlcv[0]["open"]) / ohlcv[0]["open"]
+                    mapping["momentum"] = str(round(mom, 6))
+            except Exception as _m_exc:
+                logger.debug("momentum fetch failed for %s: %s", ticker, _m_exc)
+
             await redis.hset(key, mapping=mapping)
             # Expire after 4 hours — prevents stale tickers accumulating as
             # the watchlist rotates.  Active tickers are refreshed every cycle
