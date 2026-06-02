@@ -93,10 +93,18 @@ def query(sql: str, params: tuple | None = None) -> pd.DataFrame:
     Returns an empty DataFrame on any database error.
     Rolls back and reconnects automatically if the connection is in a broken
     transaction state (e.g. after a failed query on a missing table).
+
+    Uses a raw psycopg2 cursor rather than pd.read_sql() to avoid the
+    "DBAPI2 objects are not tested" UserWarning that pandas emits when passed
+    a bare psycopg2 connection.
     """
     conn = get_connection()
     try:
-        return pd.read_sql(sql, conn, params=params)
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            cols = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
     except Exception as exc:
         # Roll back the broken transaction so the connection is reusable
         try:
