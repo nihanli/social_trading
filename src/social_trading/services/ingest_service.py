@@ -63,6 +63,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Hard cap on how long an enrichment request may sit in the queue before it is
+# considered stale and dropped.  Social-media signals are time-sensitive; there
+# is no value processing a Phase-1 candidate that was queued more than 15 minutes
+# ago — the market context will have changed.
+_ENRICHMENT_MAX_AGE_SEC: int = 900  # 15 minutes
+
 # Maps source name → SystemConfig attribute for poll interval.
 # Discovery-only sources (no social posts) share discovery_poll_interval_sec.
 _POLL_INTERVAL_ATTR: dict[str, str] = {
@@ -300,11 +306,12 @@ async def run_enrichment_loop(
                     msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
                     msg_ts_ms = int(msg_id_str.split("-")[0])
                     msg_age_sec = (time.time() * 1000 - msg_ts_ms) / 1000
-                    if msg_age_sec > 2 * cfg.signal_poll_interval_sec:
+                    stale_threshold = min(2 * cfg.signal_poll_interval_sec, _ENRICHMENT_MAX_AGE_SEC)
+                    if msg_age_sec > stale_threshold:
                         logger.debug(
-                            "ENRICHMENT SKIP stale request ticker=%s age=%.0fs — "
+                            "ENRICHMENT SKIP stale request ticker=%s age=%.0fs (threshold=%.0fs) — "
                             "signal_service will re-request if still needed",
-                            ticker, msg_age_sec,
+                            ticker, msg_age_sec, stale_threshold,
                         )
                         # fall through to finally block to ACK
                         continue

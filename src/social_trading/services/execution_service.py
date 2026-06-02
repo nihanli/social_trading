@@ -280,6 +280,9 @@ async def run_trade_loop(
                     if result.status in ("filled", "submitted"):
                         submitted += 1
                         ORDERS_PLACED.labels(ticker=signal.ticker, status=result.status).inc()
+                        # Immediately push the new position to positions:live so the
+                        # UI reflects it without waiting for the next exit-loop cycle.
+                        await _write_positions_to_redis(redis, engine)
                         await _publish_execution_event(redis, "position_opened", {
                             "ticker": signal.ticker,
                             "direction": signal.direction,
@@ -508,6 +511,7 @@ async def run_exit_loop(
             # close them) were filled by IB's bracket legs or closed in TWS.
             now_open_tickers = {p.ticker for p in open_positions} - just_closed
             if _prev_open_tickers:
+                externally_closed = _prev_open_tickers - now_open_tickers - just_closed
                 await _reconcile_external_closes(
                     redis, engine,
                     prev_open=_prev_open_tickers,
@@ -515,6 +519,10 @@ async def run_exit_loop(
                     just_closed=just_closed,
                     mode=mode,
                 )
+                # Immediately remove externally-closed tickers from positions:live
+                # so the UI reflects the change without waiting for the next cycle.
+                if externally_closed:
+                    await _write_positions_to_redis(redis, engine)
             _prev_open_tickers = now_open_tickers
 
             # ── 5. Persist state + metrics ────────────────────────────────────
