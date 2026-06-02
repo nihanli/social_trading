@@ -146,6 +146,10 @@ class ExecutionEngine(Protocol):
 
     async def health_check(self) -> bool: ...
 
+    async def get_market_prices(self, tickers: list[str]) -> dict[str, float]:
+        """Batch-fetch current prices; returns empty dict if not supported."""
+        ...
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  5. Event Bus  (storage layer)

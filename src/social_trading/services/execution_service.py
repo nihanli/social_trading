@@ -46,6 +46,7 @@ from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS
 from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
+from social_trading.core.protocols import MarketDataProvider
 from social_trading.market_data.composite import FallbackMarketData
 from social_trading.market_data.yfinance import YFinanceMarketData
 from social_trading.monitoring.metrics import (
@@ -189,7 +190,7 @@ async def run_trade_loop(
     bus: TradingEventBus,
     engine: PaperTradingEngine,
     redis: aioredis.Redis,
-    market_data: YFinanceMarketData | None = None,
+    market_data: MarketDataProvider | None = None,
     mode: str = "paper",
 ) -> None:
     """
@@ -331,7 +332,7 @@ async def run_trade_loop(
 async def run_exit_loop(
     engine: PaperTradingEngine,
     exit_manager: PositionExitManager,
-    market_data: YFinanceMarketData,
+    market_data: MarketDataProvider,
     breaker: CircuitBreaker,
     redis: aioredis.Redis,
     mode: str = "paper",
@@ -349,7 +350,9 @@ async def run_exit_loop(
     logger.info("Execution exit loop started")
 
     WATCHLIST_REFRESH_SECS = 300  # 5 minutes
+    POSITION_FULL_SNAPSHOT_SECS = 300  # full ATR/OHLCV refresh cadence for open positions
     _watchlist_last_refresh: dict[str, float] = {}
+    _position_last_full_snapshot: dict[str, float] = {}
     # Tracks tickers that were open at the end of the previous cycle.
     # Used to detect positions closed externally by IB between cycles.
     _prev_open_tickers: set[str] = set()
@@ -383,19 +386,75 @@ async def run_exit_loop(
                 t for t in watchlist_tickers
                 if now_ts - _watchlist_last_refresh.get(t, 0) >= WATCHLIST_REFRESH_SECS
             }
-            all_tickers = open_tickers | stale_watchlist
 
-            for ticker in all_tickers:
+            # ── 2a. Open position prices: batch-fetch from IB ─────────────────
+            # Use engine.get_market_prices() for a single concurrent IB snapshot
+            # of all open positions.  This gives real-time prices without the
+            # per-ticker 1.5s sleep of the yfinance/reqMktData approach.
+            # Tickers where IB returns no price fall back to yfinance below.
+            ib_prices: dict[str, float] = {}
+            if open_tickers:
+                try:
+                    ib_prices = await engine.get_market_prices(list(open_tickers))
+                except Exception as exc:
+                    logger.debug("IB batch price fetch failed: %s", exc)
+
+            for ticker in open_tickers:
+                if ticker in ib_prices:
+                    # IB returned a live price — update engine cache and Redis
+                    engine.set_price(ticker, ib_prices[ticker])
+                    # Write just the price fields to Redis (fast path).
+                    # Full snapshot (ATR/OHLCV) runs on a slower cadence below.
+                    try:
+                        await redis.hset(f"market_data:{ticker}", mapping={
+                            "last": str(ib_prices[ticker]),
+                            "updated_at": datetime.now(UTC).isoformat(),
+                            "source": "ib",
+                        })
+                        await redis.expire(f"market_data:{ticker}", 4 * 3600)
+                    except Exception:
+                        pass
+                else:
+                    # IB gave no price (e.g. outside hours, no subscription) —
+                    # fall back to full yfinance snapshot for this ticker.
+                    logger.debug(
+                        "[SYNC] IB price unavailable for %s — using yfinance fallback",
+                        ticker,
+                    )
+                    try:
+                        snapshot = await _write_market_snapshot_and_get_price(
+                            redis, ticker, market_data, vix=vix
+                        )
+                        if snapshot is not None:
+                            engine.set_price(ticker, snapshot)
+                    except Exception as exc:
+                        logger.debug("yfinance fallback failed for %s: %s", ticker, exc)
+
+                # Full snapshot (ATR, OHLCV, momentum) for open positions runs
+                # every POSITION_FULL_SNAPSHOT_SECS so signal generation and
+                # startup reconciliation always have fresh ATR data.
+                if now_ts - _position_last_full_snapshot.get(ticker, 0) >= POSITION_FULL_SNAPSHOT_SECS:
+                    try:
+                        await _write_market_snapshot_and_get_price(
+                            redis, ticker, market_data, vix=vix
+                        )
+                        _position_last_full_snapshot[ticker] = now_ts
+                    except Exception as exc:
+                        logger.debug("Full snapshot failed for %s: %s", ticker, exc)
+
+            # ── 2b. Watchlist prices: full yfinance snapshot ──────────────────
+            # Watchlist tickers are not open positions; use yfinance (or IB
+            # FallbackMarketData) for their full snapshot on the slow cadence.
+            for ticker in stale_watchlist - open_tickers:
                 try:
                     snapshot = await _write_market_snapshot_and_get_price(
                         redis, ticker, market_data, vix=vix
                     )
                     if snapshot is not None:
                         engine.set_price(ticker, snapshot)
-                    if ticker in stale_watchlist:
-                        _watchlist_last_refresh[ticker] = now_ts
+                    _watchlist_last_refresh[ticker] = now_ts
                 except Exception as exc:
-                    logger.debug("Price refresh failed for %s: %s", ticker, exc)
+                    logger.debug("Watchlist price refresh failed for %s: %s", ticker, exc)
 
             # ── 3. Evaluate exit rules ────────────────────────────────────────
             # Re-fetch positions after price updates (HWM may have moved).
@@ -546,10 +605,10 @@ async def _get_sentiment_context(
 async def _write_market_snapshot_and_get_price(
     redis: aioredis.Redis,
     ticker: str,
-    market_data: YFinanceMarketData,
+    market_data: MarketDataProvider,
     vix: float = 20.0,
 ) -> float | None:
-    """Fetch snapshot, write to Redis, return last price."""
+    """Fetch snapshot via IB (primary) → yfinance (fallback), write to Redis, return last price."""
     try:
         quote = await market_data.get_quote(ticker)
         last = quote.get("last", 0.0)
@@ -934,19 +993,19 @@ async def main(use_ibkr: bool = False) -> None:
             await ib.reqPositionsAsync()
             engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib, account=ib_account)  # type: ignore[assignment]
             # Use IB for real-time prices; yfinance as fallback for any gaps
-            market_data: YFinanceMarketData = FallbackMarketData(  # type: ignore[assignment]
-                primary=IBKRMarketData(ib=ib),
-                secondary=YFinanceMarketData(),
+            market_data: MarketDataProvider = FallbackMarketData(  # type: ignore[assignment]
+                primary=IBKRMarketData(ib=ib),     # IB: real-time quotes, ATR, OHLCV
+                secondary=YFinanceMarketData(),    # fallback: missing subscriptions / off-hours
             )
-            logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary)", port, client_id, ib_account or "(auto)")
+            logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary, yfinance fallback)", port, client_id, ib_account or "(auto)")
         except Exception as exc:
             logger.error("IBKR connection failed: %s — falling back to paper mode", exc)
             engine = PaperTradingEngine(initial_cash=100_000.0)
-            market_data = YFinanceMarketData()
+            market_data: MarketDataProvider = YFinanceMarketData()  # type: ignore[assignment]
     else:
         initial_cash = float(os.getenv("PAPER_INITIAL_CASH", "100000"))
         engine = PaperTradingEngine(initial_cash=initial_cash)
-        market_data = YFinanceMarketData()
+        market_data: MarketDataProvider = YFinanceMarketData()  # type: ignore[assignment]
         logger.info("Paper trading mode — initial cash $%.2f", initial_cash)
     exit_manager = PositionExitManager()
     breaker = CircuitBreaker(redis)

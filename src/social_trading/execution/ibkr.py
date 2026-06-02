@@ -583,3 +583,50 @@ class IBKRExecutionEngine:
 
     async def health_check(self) -> bool:
         return bool(self._ib.isConnected())
+
+    async def get_market_prices(self, tickers: list[str]) -> dict[str, float]:
+        """
+        Fetch current market prices for a list of tickers from IB in one batch call.
+
+        Uses reqTickersAsync (snapshot mode) which sends all requests concurrently
+        and resolves when data arrives — no fixed sleep delay.
+
+        Returns a dict of {ticker: price} for tickers where IB returned a valid
+        (finite, non-zero) price.  Tickers with no IB subscription or missing data
+        are omitted; the caller should fall back to an alternative source for those.
+        """
+        if not _IB_AVAILABLE or not tickers:
+            return {}
+
+        import math  # noqa: PLC0415
+        from ib_async import Stock  # noqa: PLC0415
+
+        try:
+            # Set delayed data once so paper/non-subscribed accounts still get prices
+            self._ib.reqMarketDataType(3)
+            contracts = [Stock(t, "SMART", "USD") for t in tickers]
+            ticker_objects = await self._ib.reqTickersAsync(*contracts)
+        except Exception as exc:
+            logger.warning("[IBKR] get_market_prices batch request failed: %s", exc)
+            return {}
+
+        prices: dict[str, float] = {}
+        for contract, ticker_obj in zip(contracts, ticker_objects):
+            sym = contract.symbol
+            try:
+                price = ticker_obj.marketPrice()
+                if math.isfinite(price) and price > 0:
+                    prices[sym] = float(price)
+                else:
+                    # Try close price as fallback (e.g. outside market hours)
+                    close = ticker_obj.close
+                    if close and math.isfinite(float(close)) and float(close) > 0:
+                        prices[sym] = float(close)
+            except Exception as exc:
+                logger.debug("[IBKR] Price extraction failed for %s: %s", sym, exc)
+
+        logger.debug(
+            "[IBKR] get_market_prices: requested=%d, received=%d",
+            len(tickers), len(prices),
+        )
+        return prices

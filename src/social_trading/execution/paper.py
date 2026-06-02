@@ -273,7 +273,10 @@ class PaperTradingEngine:
     async def health_check(self) -> bool:
         return True
 
-    # ── Convenience helpers ───────────────────────────────────────────────────
+    async def get_market_prices(self, tickers: list[str]) -> dict[str, float]:
+        """Paper engine has no external price feed; returns empty dict."""
+        return {}
+
 
     def reset_daily_pnl(self) -> None:
         """Call at market open each day."""
