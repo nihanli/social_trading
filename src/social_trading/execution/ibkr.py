@@ -123,6 +123,7 @@ class IBKRExecutionEngine:
         quantity: int,
         stop_loss: float,
         take_profit: float,
+        take_profit_pct: float = 0.04,
     ) -> OrderResult:
         """
         Submit a market entry order, wait for IB acknowledgement, then attach
@@ -136,6 +137,8 @@ class IBKRExecutionEngine:
             3. Attach OCA stop + limit (both transmit=True).
                When fill_price is not yet known we trust the risk service's
                SL/TP values and skip the directional sanity-check.
+               If fill_price is known and the pre-computed TP is on the wrong
+               side of fill (due to spike slippage), recompute TP from fill.
             4. If OCA submission raises a Python exception: immediately close
                the position to avoid an unprotected open.
 
@@ -267,6 +270,20 @@ class IBKRExecutionEngine:
                     or (signal.direction == "SHORT" and take_profit < fp)
                 )
 
+            # If fill price is known and the pre-computed TP is stale (wrong side
+            # of fill due to spike slippage between signal approval and fill),
+            # recompute TP from the actual fill price so the OCA leg is always placed.
+            effective_take_profit = take_profit
+            if fill_price and not _tp_valid(fill_price):
+                if signal.direction == "LONG":
+                    effective_take_profit = round(fill_price * (1.0 + take_profit_pct), 2)
+                else:
+                    effective_take_profit = round(fill_price * (1.0 - take_profit_pct), 2)
+                logger.warning(
+                    "[IBKR] TP %.4f stale vs fill %.4f (%s) — recomputed to %.4f",
+                    take_profit, fill_price, signal.direction, effective_take_profit,
+                )
+
             oca_group = f"oca_{entry_id}"
             oca_errors: list[str] = []
             oca_trades = []
@@ -296,9 +313,9 @@ class IBKRExecutionEngine:
                     stop_loss, fill_price, signal.direction,
                 )
 
-            if _tp_valid(fill_price):
+            if effective_take_profit > 0:
                 try:
-                    limit_order = LimitOrder(close_action, quantity, round(take_profit, 2))
+                    limit_order = LimitOrder(close_action, quantity, round(effective_take_profit, 2))
                     limit_order.ocaGroup = oca_group
                     limit_order.ocaType  = 1
                     limit_order.tif      = "GTC"  # persist until triggered or cancelled
@@ -309,15 +326,15 @@ class IBKRExecutionEngine:
                     oca_trades.append(tp_trade)
                     logger.info(
                         "[IBKR] OCA limit placed: %s tp=%.4f orderId=%d",
-                        ticker, take_profit, tp_trade.order.orderId,
+                        ticker, effective_take_profit, tp_trade.order.orderId,
                     )
                 except Exception as exc:
                     oca_errors.append(f"limit: {exc}")
                     logger.error("[IBKR] OCA limit failed for %s: %s", ticker, exc)
             else:
                 logger.warning(
-                    "[IBKR] take_profit=%.4f invalid vs fill=%s (%s) — OCA limit skipped",
-                    take_profit, fill_price, signal.direction,
+                    "[IBKR] take_profit=%.4f invalid — OCA limit skipped",
+                    take_profit,
                 )
 
             # Flush OCA messages to IB and allow acknowledgement callbacks to fire
@@ -349,7 +366,7 @@ class IBKRExecutionEngine:
             # Save position params so exit rules work correctly after restart
             self._position_params[ticker] = {
                 "stop_loss": stop_loss,
-                "take_profit": take_profit,
+                "take_profit": effective_take_profit,
                 "opened_at": opened_at_dt.isoformat(),
                 "direction": signal.direction,
             }

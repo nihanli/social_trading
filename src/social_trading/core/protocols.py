@@ -127,6 +127,7 @@ class ExecutionEngine(Protocol):
         quantity: int,
         stop_loss: float,
         take_profit: float,
+        take_profit_pct: float = 0.04,
     ) -> OrderResult:
         """Submit a bracket order (entry + stop + target) for a signal."""
         ...

@@ -100,6 +100,7 @@ class PaperTradingEngine:
         quantity: int,
         stop_loss: float,
         take_profit: float,
+        take_profit_pct: float = 0.04,
     ) -> OrderResult:
         """
         Simulate a bracket order fill.

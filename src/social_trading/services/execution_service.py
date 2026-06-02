@@ -270,6 +270,7 @@ async def run_trade_loop(
                         quantity=quantity,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
+                        take_profit_pct=cfg.take_profit_pct,
                     )
 
                     if result.status in ("filled", "submitted"):
