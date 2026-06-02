@@ -157,9 +157,49 @@ async def _write_positions_to_redis(
     """
     try:
         positions = await engine.get_positions()
+
+        # Safety guard: if the engine reports 0 positions but position:params
+        # still has entries, IB may have returned an empty cache due to a
+        # transient disconnect (e.g. TWS nightly auto-restart at ~11:45 PM ET).
+        # Preserve the existing positions:live key rather than wiping it and
+        # making positions vanish from the UI until the reconnect handler
+        # reseeds the IB cache via reqPositionsAsync().
+        if not positions:
+            params_raw = await redis.hgetall(_POSITION_PARAMS_KEY)
+            if params_raw:
+                logger.warning(
+                    "[POSITIONS] IB returned 0 open positions but %d ticker(s) in "
+                    "position:params — possible transient disconnect; preserving "
+                    "positions:live until IB cache is reseeded",
+                    len(params_raw),
+                )
+                return
+
+        # Only publish positions that this system opened — manual IB positions
+        # are managed elsewhere and must not appear in system UI or be
+        # subject to system exit rules.
+        all_params_raw = await redis.hgetall(_POSITION_PARAMS_KEY)
+        system_tickers: set[str] = set()
+        params_by_ticker: dict[str, dict] = {}
+        for k, v in all_params_raw.items():
+            ticker_key = k.decode() if isinstance(k, bytes) else k
+            try:
+                p = json.loads(v.decode() if isinstance(v, bytes) else v)
+                if p.get("source", "system") == "system":
+                    system_tickers.add(ticker_key)
+                    params_by_ticker[ticker_key] = p
+            except Exception:
+                pass
+
         pipe = redis.pipeline()
         pipe.delete(_POSITIONS_LIVE_KEY)
         for pos in positions:
+            if pos.ticker not in system_tickers:
+                logger.debug(
+                    "[POSITIONS] Skipping %s — not a system-managed position",
+                    pos.ticker,
+                )
+                continue
             current_price = engine.get_price(pos.ticker) or pos.entry_price
             if pos.direction == "LONG":
                 computed_upnl = (current_price - pos.entry_price) * pos.shares
@@ -177,6 +217,7 @@ async def _write_positions_to_redis(
                 "unrealized_pnl": round(unrealized_pnl, 2),
                 "high_water_mark": pos.high_water_mark,
                 "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+                "source": "system",
             }))
         await pipe.execute()
     except Exception as exc:
@@ -380,7 +421,10 @@ async def run_exit_loop(
             await redis.set("market:vix", str(vix))
 
             # ── 2. Refresh market data ────────────────────────────────────────
-            open_positions = await engine.get_positions()
+            # Only track market data for system-managed positions.
+            all_ib_positions = await engine.get_positions()
+            _sys_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}  # type: ignore[union-attr]
+            open_positions = [p for p in all_ib_positions if p.ticker in _sys_params]
             open_tickers = {p.ticker for p in open_positions}
 
             watchlist_raw = await redis.zrange("watchlist:active", 0, -1)
@@ -467,7 +511,11 @@ async def run_exit_loop(
             # Write positions:live NOW (before any exits) so the UI always shows
             # accurate sl/tp values — clearing params after a close would make
             # sl/tp appear as 0 if we write after the evaluation loop.
-            open_positions = await engine.get_positions()
+            all_pos = await engine.get_positions()
+            # Only manage positions opened by this system; manual IB positions
+            # are managed by the user elsewhere and must not be touched.
+            system_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}  # type: ignore[union-attr]
+            open_positions = [p for p in all_pos if p.ticker in system_params]
             await _write_positions_to_redis(redis, engine)
             now = datetime.now(UTC)
             just_closed: set[str] = set()
@@ -775,6 +823,12 @@ async def _reconcile_startup(
     Any ticker present in Redis state but absent from IB was closed while the
     service was offline (bracket fill, manual close in TWS, etc.).  Clean up
     so stale sl/tp/hwm don't trigger false exits on the first cycle.
+
+    For IB positions with no persisted params (opened in a prior session or
+    manually in TWS), we check open orders for ORDER_REF = "social_trading"
+    to decide whether they are system-managed ("system") or manual ("manual").
+    Both are adopted into the exit loop — manual positions are labelled so the
+    UI can display them differently.
     """
     if not hasattr(engine, "get_position_params"):
         return  # Paper engine — no IB to reconcile against
@@ -799,51 +853,80 @@ async def _reconcile_startup(
         )
 
     orphaned_in_ib = current_tickers - set(params)
-    if orphaned_in_ib:
-        for pos in current:
-            if pos.ticker not in orphaned_in_ib:
-                continue
-            # Position is open in IB but has no persisted params (opened in a prior
-            # session or manually in TWS).  Seed params from Redis market data so the
-            # software exit loop can monitor stop-loss / take-profit.
-            mkt_raw = await redis.hgetall(f"market_data:{pos.ticker}")
-            atr = 0.0
-            try:
-                atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
-                if atr_val:
-                    atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
-            except (ValueError, AttributeError):
-                pass
+    if not orphaned_in_ib:
+        return
 
-            if atr > 0 and pos.entry_price > 0:
-                if pos.direction == "LONG":
-                    stop_loss = round(pos.entry_price - 2.0 * atr, 2)
-                    take_profit = round(pos.entry_price + 3.0 * atr, 2)
-                else:
-                    stop_loss = round(pos.entry_price + 2.0 * atr, 2)
-                    take_profit = round(pos.entry_price - 3.0 * atr, 2)
-                seeded_params: dict = {
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
-                    "direction": pos.direction,
-                }
-                engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
-                await redis.hset(
-                    _POSITION_PARAMS_KEY,
-                    pos.ticker,
-                    json.dumps(seeded_params),
-                )
-                logger.warning(
-                    "[SYNC] %s: orphaned IB position — seeded sl=%.2f tp=%.2f from ATR=%.4f",
-                    pos.ticker, stop_loss, take_profit, atr,
-                )
+    # Determine which orphaned IB positions were opened by this system vs.
+    # manually via TWS.  We check open orders (GTC bracket legs remain open
+    # until filled) for ORDER_REF = "social_trading".
+    system_tickers: set[str] = set()
+    try:
+        from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
+        open_trades = engine._ib.openTrades()  # type: ignore[union-attr]
+        for trade in open_trades:
+            sym = trade.contract.symbol if hasattr(trade, "contract") else ""
+            ref = trade.order.orderRef if hasattr(trade, "order") else ""
+            if sym in orphaned_in_ib and ref == ORDER_REF:
+                system_tickers.add(sym)
+    except Exception as exc:
+        logger.debug("[SYNC] Could not check open orders for orderRef: %s", exc)
+
+    for pos in current:
+        if pos.ticker not in orphaned_in_ib:
+            continue
+        source = "system" if pos.ticker in system_tickers else "manual"
+
+        # Manual positions are managed by the user elsewhere — do not adopt
+        # them into system params, exit rules, or positions:live.
+        if source == "manual":
+            logger.info(
+                "[SYNC] %s: open in IB but no system orderRef — treating as manual, skipping adoption",
+                pos.ticker,
+            )
+            continue
+
+        # Position is open in IB but has no persisted params (opened in a prior
+        # session by this system).  Seed params from Redis market data so
+        # the software exit loop can monitor stop-loss / take-profit.
+        mkt_raw = await redis.hgetall(f"market_data:{pos.ticker}")
+        atr = 0.0
+        try:
+            atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
+            if atr_val:
+                atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
+        except (ValueError, AttributeError):
+            pass
+
+        if atr > 0 and pos.entry_price > 0:
+            if pos.direction == "LONG":
+                stop_loss = round(pos.entry_price - 2.0 * atr, 2)
+                take_profit = round(pos.entry_price + 3.0 * atr, 2)
             else:
-                logger.warning(
-                    "[SYNC] %s: open in IB but no persisted params and ATR unavailable — "
-                    "software exits will use entry price as stop (immediate exit risk)",
-                    pos.ticker,
-                )
+                stop_loss = round(pos.entry_price + 2.0 * atr, 2)
+                take_profit = round(pos.entry_price - 3.0 * atr, 2)
+            seeded_params: dict = {
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
+                "direction": pos.direction,
+                "source": "system",
+            }
+            engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
+            await redis.hset(
+                _POSITION_PARAMS_KEY,
+                pos.ticker,
+                json.dumps(seeded_params),
+            )
+            logger.warning(
+                "[SYNC] %s: prior-session system position — seeded sl=%.2f tp=%.2f from ATR=%.4f",
+                pos.ticker, stop_loss, take_profit, atr,
+            )
+        else:
+            logger.warning(
+                "[SYNC] %s: prior-session system position but ATR unavailable — "
+                "software exits will use entry price as stop (immediate exit risk)",
+                pos.ticker, source,
+            )
 
 
 async def _reconcile_external_closes(

@@ -35,6 +35,11 @@ from social_trading.core.models import (
 
 logger = logging.getLogger(__name__)
 
+# orderRef stamped on every order placed by this system.
+# Allows distinguishing system-managed positions from manually-created ones
+# in TWS or via other API clients.
+ORDER_REF = "social_trading"
+
 _IB_AVAILABLE: bool
 try:
     import ib_async as _ib_async_mod  # noqa: F401
@@ -70,6 +75,26 @@ class IBKRExecutionEngine:
         # Persisted position params: stop_loss, take_profit, opened_at per ticker.
         # Restored from Redis on restart so exit rules work correctly.
         self._position_params: dict[str, dict] = {}
+
+        # Subscribe to ib_async's connectedEvent so the position cache is
+        # automatically reseeded after TWS auto-restart or any reconnect.
+        # (TWS restarts nightly at ~11:45 PM ET; without this the cache is
+        # empty until service restart, causing positions to vanish from UI.)
+        self._ib.connectedEvent += self._on_ib_reconnect
+
+    def _on_ib_reconnect(self) -> None:
+        """Callback fired by ib_async whenever a (re)connection is established."""
+        logger.info("[IBKR] Connection established — reseeding position cache via reqPositionsAsync")
+        asyncio.ensure_future(self._reseed_positions())
+
+    async def _reseed_positions(self) -> None:
+        """Request all positions from IB to repopulate the local ib_async cache."""
+        try:
+            await self._ib.reqPositionsAsync()
+            count = len([p for p in self._ib.positions() if p.position != 0])
+            logger.info("[IBKR] Position cache reseeded after reconnect — %d open position(s)", count)
+        except Exception as exc:
+            logger.warning("[IBKR] Failed to reseed position cache after reconnect: %s", exc)
 
     # ── Price cache (mirrors PaperTradingEngine interface) ────────────────────
 
@@ -171,6 +196,7 @@ class IBKRExecutionEngine:
             # ── 1. Entry order — transmit immediately ────────────────────────
             entry = MarketOrder(action, quantity)
             entry.transmit = True
+            entry.orderRef = ORDER_REF
             if self._account:
                 entry.account = self._account
             entry_trade = self._ib.placeOrder(contract, entry)
@@ -296,6 +322,7 @@ class IBKRExecutionEngine:
                     stop_order.tif        = "GTC" # persist until triggered or cancelled
                     stop_order.outsideRth = True  # trigger in after-hours (protective stop)
                     stop_order.transmit   = True
+                    stop_order.orderRef   = ORDER_REF
                     if self._account:
                         stop_order.account = self._account
                     sl_trade = self._ib.placeOrder(contract, stop_order)
@@ -320,6 +347,7 @@ class IBKRExecutionEngine:
                     limit_order.ocaType  = 1
                     limit_order.tif      = "GTC"  # persist until triggered or cancelled
                     limit_order.transmit = True
+                    limit_order.orderRef = ORDER_REF
                     if self._account:
                         limit_order.account = self._account
                     tp_trade = self._ib.placeOrder(contract, limit_order)
@@ -369,6 +397,7 @@ class IBKRExecutionEngine:
                 "take_profit": effective_take_profit,
                 "opened_at": opened_at_dt.isoformat(),
                 "direction": signal.direction,
+                "source": "system",
             }
             return OrderResult(
                 order_id=str(entry_id),
