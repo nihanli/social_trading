@@ -229,6 +229,9 @@ class IBKRExecutionEngine:
             # Use actual fill price if already available; None otherwise
             # (paper fills with delayed data may arrive after we return)
             fill_price: float | None = None
+            # Capture opened_at ONCE here so position_params and the
+            # position_opened event always carry the exact same timestamp.
+            opened_at_dt = datetime.now(UTC)
             if entry_trade.fills:
                 fill_price = float(entry_trade.fills[0].execution.price)
                 logger.info(
@@ -270,7 +273,7 @@ class IBKRExecutionEngine:
 
             if _sl_valid(fill_price):
                 try:
-                    stop_order = StopOrder(close_action, quantity, stop_loss)
+                    stop_order = StopOrder(close_action, quantity, round(stop_loss, 2))
                     stop_order.ocaGroup   = oca_group
                     stop_order.ocaType    = 1     # cancel sibling on fill
                     stop_order.tif        = "GTC" # persist until triggered or cancelled
@@ -295,7 +298,7 @@ class IBKRExecutionEngine:
 
             if _tp_valid(fill_price):
                 try:
-                    limit_order = LimitOrder(close_action, quantity, take_profit)
+                    limit_order = LimitOrder(close_action, quantity, round(take_profit, 2))
                     limit_order.ocaGroup = oca_group
                     limit_order.ocaType  = 1
                     limit_order.tif      = "GTC"  # persist until triggered or cancelled
@@ -347,7 +350,7 @@ class IBKRExecutionEngine:
             self._position_params[ticker] = {
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
-                "opened_at": datetime.now(UTC).isoformat(),
+                "opened_at": opened_at_dt.isoformat(),
                 "direction": signal.direction,
             }
             return OrderResult(
@@ -356,6 +359,7 @@ class IBKRExecutionEngine:
                 direction=signal.direction,
                 quantity=quantity,
                 fill_price=fill_price,
+                submitted_at=opened_at_dt,
                 status="submitted",
             )
 
@@ -459,7 +463,10 @@ class IBKRExecutionEngine:
             )
 
     async def get_positions(self) -> list[Position]:
-        """Return open positions from IBKR as Position objects."""
+        """Return open positions from IBKR as Position objects.
+
+        Only positions belonging to the configured account are returned.
+        """
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed")
 
@@ -467,9 +474,16 @@ class IBKRExecutionEngine:
         for p in self._ib.positions():
             if p.position == 0:
                 continue
-            direction: Direction = "LONG" if p.position > 0 else "SHORT"
-            entry_price = float(p.avgCost / abs(p.position)) if p.position != 0 else 0.0
+            # Filter to configured account only
+            if self._account and p.account != self._account:
+                continue
+
             ticker = p.contract.symbol
+            total_qty = float(p.position)
+            # ib_async avgCost = per-share cost basis
+            entry_price = round(float(p.avgCost), 4)
+            direction: Direction = "LONG" if total_qty > 0 else "SHORT"
+            shares = abs(int(round(total_qty)))
 
             # Seed HWM on first encounter (before any set_price call has arrived)
             if ticker not in self._hwm:
@@ -479,14 +493,11 @@ class IBKRExecutionEngine:
             # Apply correct HWM polarity: LONG tracks max, SHORT tracks min
             raw_hwm = self._hwm.get(ticker, entry_price)
             if direction == "SHORT":
-                # For shorts, HWM is the lowest price seen; invert the stored max
                 current_price = self._prices.get(ticker, entry_price)
                 raw_hwm = min(raw_hwm, current_price) if raw_hwm != entry_price else current_price
                 self._hwm[ticker] = raw_hwm
 
-            # Restore persisted position params (sl/tp/opened_at) if available.
-            # Without these, exit rules 2 (STOP_LOSS) and 3 (TAKE_PROFIT) silently skip
-            # on IBKR restart since IB doesn't expose bracket leg prices.
+            # Restore persisted position params (sl/tp/opened_at)
             params = self._position_params.get(ticker, {})
             stop_loss = float(params.get("stop_loss", 0.0))
             take_profit = float(params.get("take_profit", 0.0))
@@ -495,28 +506,38 @@ class IBKRExecutionEngine:
             except (ValueError, KeyError):
                 opened_at = datetime.now(UTC)
 
+            # Compute unrealised PnL from price cache
+            current_price = self._prices.get(ticker, entry_price)
+            if direction == "LONG":
+                unrealized = (current_price - entry_price) * shares
+            else:
+                unrealized = (entry_price - current_price) * shares
+
             positions.append(Position(
                 ticker=ticker,
                 direction=direction,
-                shares=abs(int(p.position)),
+                shares=shares,
                 entry_price=entry_price,
                 opened_at=opened_at,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                unrealized_pnl=float(p.unrealizedPNL or 0),
+                unrealized_pnl=round(unrealized, 4),
                 high_water_mark=raw_hwm,
             ))
         return positions
 
     async def get_account_state(self) -> AccountState:
-        """Return account state from IBKR portfolio summary."""
+        """Return account state from IBKR for the configured single user account."""
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed")
 
         account_values = self._ib.accountValues()
+
         summary: dict[str, float] = {}
         for av in account_values:
-            if av.currency == "USD":
+            if self._account and av.account != self._account:
+                continue
+            if av.currency in ("USD", "BASE"):
                 import contextlib
                 with contextlib.suppress(ValueError):
                     summary[av.tag] = float(av.value)
@@ -525,6 +546,13 @@ class IBKRExecutionEngine:
         cash = summary.get("TotalCashValue", 0.0)
         daily_pnl = summary.get("DailyPnL", 0.0)
         unrealized = summary.get("UnrealizedPnL", 0.0)
+
+        if nlv == 0.0:
+            logger.warning(
+                "[IBKR] NetLiquidation is 0 — accountValues returned %d entries "
+                "(account filter=%r). Check IB connection / account subscription.",
+                len(account_values), self._account or "(none)",
+            )
 
         positions = await self.get_positions()
         return AccountState(

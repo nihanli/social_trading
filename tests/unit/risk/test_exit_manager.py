@@ -92,12 +92,24 @@ def test_hold_when_healthy(manager: PositionExitManager, cfg: SystemConfig) -> N
 def test_emergency_single_trade_loss(
     manager: PositionExitManager, cfg: SystemConfig
 ) -> None:
-    """2% loss on a position breaches 1% single-trade limit."""
-    pos = make_long(entry_price=100.0, quantity=100)
+    """2% loss on a position with NO ATR stop set breaches 1% single-trade limit."""
+    # stop_loss=0 means ATR data was unavailable — emergency fires as last-resort safety net
+    pos = make_long(entry_price=100.0, quantity=100, stop_loss=0.0, take_profit=0.0)
     # entry_cost = 10_000; pnl = (98-100)*100 = -200; loss_pct = 2%
     decision = manager.evaluate(pos, current_price=98.0, cfg=cfg)
     assert decision.should_exit is True
     assert decision.reason == "EMERGENCY"
+
+
+def test_emergency_skipped_when_atr_stop_present(
+    manager: PositionExitManager, cfg: SystemConfig
+) -> None:
+    """When a valid ATR stop is set, emergency does NOT fire above the stop price."""
+    # Position with ATR-based stop at 96; price at 97 (2% loss) is still above stop.
+    # EMERGENCY must not fire — the ATR stop will handle exit at the intended level.
+    pos = make_long(entry_price=100.0, quantity=100, stop_loss=96.0)
+    decision = manager.evaluate(pos, current_price=97.0, cfg=cfg)
+    assert decision.should_exit is False
 
 
 # ── STOP_LOSS ─────────────────────────────────────────────────────────────────
@@ -119,10 +131,11 @@ def test_stop_loss_short(manager: PositionExitManager, cfg: SystemConfig) -> Non
 
 
 def test_above_stop_loss_no_exit(manager: PositionExitManager, cfg: SystemConfig) -> None:
-    # 97 > stop_loss 96, but emergency check: (100-97)*100/10000 = 3% > 1%
+    # 97 > stop_loss 96: price is between entry and stop; no exit expected.
+    # With stop_loss > 0, EMERGENCY is suppressed (ATR stop will handle it).
     pos = make_long(entry_price=100.0, stop_loss=96.0)
     decision = manager.evaluate(pos, current_price=97.0, cfg=cfg)
-    assert decision.should_exit is True
+    assert decision.should_exit is False
 
 
 # ── TAKE_PROFIT ───────────────────────────────────────────────────────────────

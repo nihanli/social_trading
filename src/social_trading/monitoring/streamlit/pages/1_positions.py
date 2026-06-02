@@ -14,14 +14,17 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../../"))
 
+from datetime import UTC, datetime
+
+import pandas as pd
 import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from social_trading.monitoring.streamlit.utils.db import query
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
+    get_live_positions,
     get_system_state,
 )
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
@@ -29,7 +32,7 @@ from social_trading.monitoring.streamlit.utils.refresh_countdown import (
 )
 
 st.set_page_config(page_title="Positions", page_icon="📂", layout="wide")
-st_autorefresh(interval=15_000, key="positions_refresh")
+st_autorefresh(interval=5_000, key="positions_refresh")   # 5s — Redis is real-time
 sidebar_refresh_countdown()
 st.title("Open Positions")
 
@@ -39,25 +42,39 @@ state = get_system_state()
 if state["circuit"] != "NORMAL":
     st.error(f"Circuit breaker active: **{state['circuit']}** — new trades may be blocked")
 
-# ── Positions table ───────────────────────────────────────────────────────────
-positions = query("""
-    SELECT
-        ticker, direction, shares,
-        ROUND(entry_price::numeric, 2)       AS entry_price,
-        ROUND(stop_loss::numeric, 2)         AS stop_loss,
-        ROUND(take_profit::numeric, 2)       AS take_profit,
-        ROUND(unrealized_pnl::numeric, 2)    AS unrealized_pnl,
-        ROUND((unrealized_pnl /
-          NULLIF(entry_price * shares, 0) * 100)::numeric, 2) AS pnl_pct,
-        ROUND(EXTRACT(EPOCH FROM (NOW() - opened_at)) / 3600, 1) AS hold_hrs,
-        opened_at
-    FROM positions
-    ORDER BY unrealized_pnl DESC
-""")
+# ── Load positions from Redis (real-time) ────────────────────────────────────
+raw_positions = get_live_positions()
 
-if positions.empty:
+if not raw_positions:
     st.info("No open positions")
     st.stop()
+
+# Build DataFrame from Redis data
+now_utc = datetime.now(UTC)
+rows = []
+for p in raw_positions:
+    try:
+        opened_at = datetime.fromisoformat(p.get("opened_at", ""))
+        hold_hrs = round((now_utc - opened_at).total_seconds() / 3600, 1)
+    except Exception:
+        hold_hrs = 0.0
+    entry = float(p.get("entry_price", 0))
+    shares = int(p.get("shares", 0))
+    unreal = float(p.get("unrealized_pnl", 0))
+    pnl_pct = round(unreal / (entry * shares) * 100, 2) if entry and shares else 0.0
+    rows.append({
+        "ticker":         p.get("ticker", ""),
+        "direction":      p.get("direction", ""),
+        "shares":         shares,
+        "entry_price":    round(entry, 2),
+        "stop_loss":      round(float(p.get("stop_loss", 0)), 2),
+        "take_profit":    round(float(p.get("take_profit", 0)), 2),
+        "unrealized_pnl": round(unreal, 2),
+        "pnl_pct":        pnl_pct,
+        "hold_hrs":       hold_hrs,
+    })
+
+positions = pd.DataFrame(rows).sort_values("unrealized_pnl", ascending=False)
 
 # KPI row
 total_unrealized = positions["unrealized_pnl"].sum()
@@ -86,7 +103,7 @@ st.plotly_chart(fig, use_container_width=True)
 
 # Positions table
 st.dataframe(
-    positions.drop(columns=["opened_at"]),
+    positions,
     use_container_width=True,
     hide_index=True,
 )

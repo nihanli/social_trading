@@ -318,8 +318,19 @@ async def run_risk_service(
                     continue
 
                 # ── Publish approved signal ───────────────────────────────────
+                atr = market["atr_14"]
+                if atr <= 0:
+                    logger.info(
+                        "REJECTED (atr_zero) %s: ATR=0 — cannot compute stop-loss safely",
+                        signal.ticker,
+                    )
+                    rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="atr_zero").inc()
+                    await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
+                    continue
+
                 stop_loss = sizer.stop_loss_price(
-                    signal.direction, entry_price, market["atr_14"], cfg
+                    signal.direction, entry_price, atr, cfg
                 )
                 take_profit = sizer.take_profit_price(
                     signal.direction, entry_price, cfg

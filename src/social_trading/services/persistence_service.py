@@ -463,13 +463,27 @@ def _write_trade_closed(data: dict) -> None:
                         "ORDER BY id DESC LIMIT 1",
                         (ticker, opened_at),
                     )
+                    row = cur.fetchone()
+                    if not row:
+                        # Exact timestamp match failed (e.g. microsecond drift from
+                        # a service restart). Fall back to the most recent open trade.
+                        logger.debug(
+                            "No exact opened_at match for %s (%s) — using latest open trade",
+                            ticker, opened_at,
+                        )
+                        cur.execute(
+                            "SELECT id, entry_price, shares, direction FROM trades "
+                            "WHERE ticker = %s AND status = 'open' ORDER BY id DESC LIMIT 1",
+                            (ticker,),
+                        )
+                        row = cur.fetchone()
                 else:
                     cur.execute(
                         "SELECT id, entry_price, shares, direction FROM trades "
                         "WHERE ticker = %s AND status = 'open' ORDER BY id DESC LIMIT 1",
                         (ticker,),
                     )
-                row = cur.fetchone()
+                    row = cur.fetchone()
                 if not row:
                     logger.debug("No open trade found for %s to close", ticker)
                     return

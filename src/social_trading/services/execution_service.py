@@ -397,8 +397,12 @@ async def run_exit_loop(
                     logger.debug("Price refresh failed for %s: %s", ticker, exc)
 
             # ── 3. Evaluate exit rules ────────────────────────────────────────
-            # Re-fetch positions after price updates (HWM may have moved)
+            # Re-fetch positions after price updates (HWM may have moved).
+            # Write positions:live NOW (before any exits) so the UI always shows
+            # accurate sl/tp values — clearing params after a close would make
+            # sl/tp appear as 0 if we write after the evaluation loop.
             open_positions = await engine.get_positions()
+            await _write_positions_to_redis(redis, engine)
             now = datetime.now(UTC)
             just_closed: set[str] = set()
 
@@ -454,7 +458,6 @@ async def run_exit_loop(
             await _persist_hwm_to_redis(redis, engine)
             await _persist_position_params_to_redis(redis, engine)
             await _write_account_state(redis, engine)
-            await _write_positions_to_redis(redis, engine)
 
             state = await engine.get_account_state()
             PAPER_EQUITY.set(state.net_liquidation)
@@ -697,8 +700,6 @@ async def _reconcile_startup(
     if not hasattr(engine, "get_position_params"):
         return  # Paper engine — no IB to reconcile against
     params = engine.get_position_params()  # type: ignore[union-attr]
-    if not params:
-        return
     try:
         current = await engine.get_positions()
         current_tickers = {p.ticker for p in current}
@@ -706,6 +707,7 @@ async def _reconcile_startup(
         logger.warning("[SYNC] Startup reconciliation skipped — IB unavailable: %s", exc)
         return
 
+    # Tickers in persisted params but no longer in IB were closed while offline.
     orphaned = set(params) - current_tickers
     for ticker in orphaned:
         engine.forget_position(ticker)  # type: ignore[union-attr]
@@ -717,13 +719,52 @@ async def _reconcile_startup(
             ticker,
         )
 
-    if current_tickers - set(params):
-        for ticker in current_tickers - set(params):
-            logger.warning(
-                "[SYNC] %s: open in IB but no persisted params — "
-                "orphaned position (opened manually or from prior session)",
-                ticker,
-            )
+    orphaned_in_ib = current_tickers - set(params)
+    if orphaned_in_ib:
+        for pos in current:
+            if pos.ticker not in orphaned_in_ib:
+                continue
+            # Position is open in IB but has no persisted params (opened in a prior
+            # session or manually in TWS).  Seed params from Redis market data so the
+            # software exit loop can monitor stop-loss / take-profit.
+            mkt_raw = await redis.hgetall(f"market_data:{pos.ticker}")
+            atr = 0.0
+            try:
+                atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
+                if atr_val:
+                    atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
+            except (ValueError, AttributeError):
+                pass
+
+            if atr > 0 and pos.entry_price > 0:
+                if pos.direction == "LONG":
+                    stop_loss = round(pos.entry_price - 2.0 * atr, 2)
+                    take_profit = round(pos.entry_price + 3.0 * atr, 2)
+                else:
+                    stop_loss = round(pos.entry_price + 2.0 * atr, 2)
+                    take_profit = round(pos.entry_price - 3.0 * atr, 2)
+                seeded_params: dict = {
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
+                    "direction": pos.direction,
+                }
+                engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
+                await redis.hset(
+                    _POSITION_PARAMS_KEY,
+                    pos.ticker,
+                    json.dumps(seeded_params),
+                )
+                logger.warning(
+                    "[SYNC] %s: orphaned IB position — seeded sl=%.2f tp=%.2f from ATR=%.4f",
+                    pos.ticker, stop_loss, take_profit, atr,
+                )
+            else:
+                logger.warning(
+                    "[SYNC] %s: open in IB but no persisted params and ATR unavailable — "
+                    "software exits will use entry price as stop (immediate exit risk)",
+                    pos.ticker,
+                )
 
 
 async def _reconcile_external_closes(
@@ -869,8 +910,19 @@ async def main(use_ibkr: bool = False) -> None:
             ib = IB()
             port = int(os.getenv("IBKR_PORT", "7497"))  # default paper
             client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
-            ib_account = os.getenv("IBKR_ACCOUNT", "")
+            ib_account = os.getenv("IBKR_ACCOUNT", "").strip()
+            if ib_account.upper().startswith("DFQ"):
+                raise ValueError(
+                    f"IBKR_ACCOUNT={ib_account!r} is a Financial Advisor master account. "
+                    "This app only supports individual user accounts. "
+                    "Set IBKR_ACCOUNT to one of the sub-accounts (e.g. DUQ…)."
+                )
             await ib.connectAsync("127.0.0.1", port, clientId=client_id)
+            # Explicitly load all existing positions into the ib_async local cache.
+            # ib_async does NOT auto-request positions on connect, so without this
+            # call any positions opened by a previous session would be invisible to
+            # ib.positions() and therefore absent from positions:live.
+            await ib.reqPositionsAsync()
             engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib, account=ib_account)  # type: ignore[assignment]
             # Use IB for real-time prices; yfinance as fallback for any gaps
             market_data: YFinanceMarketData = FallbackMarketData(  # type: ignore[assignment]

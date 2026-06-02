@@ -92,13 +92,19 @@ class PositionExitManager:
         entry_cost = position.cost_basis
 
         # ── 1. Emergency single-trade loss ────────────────────────────────────
-        if entry_cost > 0 and pnl < 0:
+        # Only activate when there is no valid ATR-based stop_loss already set.
+        # If stop_loss > 0, the position has a proper ATR stop that will handle
+        # exit at the intended price; applying an additional percentage cap on top
+        # would fire on normal intraday fluctuations and undermine the strategy.
+        # EMERGENCY is reserved for positions where ATR data was unavailable and
+        # stop_loss defaults to 0 — a true last-resort safety net.
+        if entry_cost > 0 and pnl < 0 and position.stop_loss <= 0:
             loss_pct = -pnl / entry_cost
             if loss_pct > cfg.loss_limit_single_trade:
                 return ExitDecision(
                     should_exit=True,
                     reason="EMERGENCY",
-                    detail=f"Single trade loss {loss_pct:.1%} > {cfg.loss_limit_single_trade:.1%}",
+                    detail=f"Single trade loss {loss_pct:.1%} > {cfg.loss_limit_single_trade:.1%} (no ATR stop)",
                 )
 
         # ── 2. ATR stop-loss ─────────────────────────────────────────────────

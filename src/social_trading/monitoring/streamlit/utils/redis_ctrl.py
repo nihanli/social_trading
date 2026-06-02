@@ -275,7 +275,27 @@ def get_phase_pipeline_stats() -> dict:
     return stats
 
 
-def get_recent_signals_from_redis() -> list[dict]:
+def get_live_positions() -> list[dict]:
+    """
+    Read open positions directly from the positions:live Redis hash.
+    Returns near-real-time data without the 30-second DB sync lag.
+    """
+    import json as _json
+    r = _get_redis()
+    result = []
+    try:
+        raw = r.hgetall("positions:live")
+        for _, v in raw.items():
+            try:
+                p = _json.loads(v)
+                result.append(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return result
+
+
     """
     Read recent signals from Redis stream as fallback when PG not available.
     Returns up to 20 most recent entries from strategy_signals stream.

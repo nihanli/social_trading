@@ -53,17 +53,21 @@ class FallbackMarketData:
 
     async def get_atr(self, ticker: str, period: int = 14) -> float:
         try:
-            return await self._primary.get_atr(ticker, period=period)
+            result = await self._primary.get_atr(ticker, period=period)
+            if result > 0:
+                return result
         except Exception as exc:
             logger.debug("IB get_atr failed for %s (%s) — using yfinance", ticker, exc)
-            return await self._secondary.get_atr(ticker, period=period)
+        return await self._secondary.get_atr(ticker, period=period)
 
     async def get_realised_vol(self, ticker: str, days: int = 30) -> float:
         try:
-            return await self._primary.get_realised_vol(ticker, days=days)
+            result = await self._primary.get_realised_vol(ticker, days=days)
+            if result > 0:
+                return result
         except Exception as exc:
             logger.debug("IB get_realised_vol failed for %s (%s) — using yfinance", ticker, exc)
-            return await self._secondary.get_realised_vol(ticker, days=days)
+        return await self._secondary.get_realised_vol(ticker, days=days)
 
     async def get_vix(self) -> float:
         try:

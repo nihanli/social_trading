@@ -164,8 +164,8 @@ class PositionSizer:
         """
         offset = cfg.atr_multiplier * atr
         if direction == "LONG":
-            return round(entry_price - offset, 4)
-        return round(entry_price + offset, 4)
+            return round(entry_price - offset, 2)
+        return round(entry_price + offset, 2)
 
     def take_profit_price(
         self,
@@ -178,7 +178,9 @@ class PositionSizer:
 
         LONG:  entry × (1 + take_profit_pct)
         SHORT: entry × (1 - take_profit_pct)
+
+        Rounded to 2 decimal places (US equity minimum price variation = $0.01).
         """
         if direction == "LONG":
-            return round(entry_price * (1.0 + cfg.take_profit_pct), 4)
-        return round(entry_price * (1.0 - cfg.take_profit_pct), 4)
+            return round(entry_price * (1.0 + cfg.take_profit_pct), 2)
+        return round(entry_price * (1.0 - cfg.take_profit_pct), 2)
