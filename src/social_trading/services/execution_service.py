@@ -192,11 +192,14 @@ async def run_trade_loop(
     redis: aioredis.Redis,
     market_data: MarketDataProvider | None = None,
     mode: str = "paper",
+    cfg: SystemConfig | None = None,
 ) -> None:
     """
     Consume selected_signals and submit to execution engine.
     Runs until cancelled.
     """
+    if cfg is None:
+        cfg = await SystemConfig.load(redis)
     await bus.create_group(STREAM_SELECTED_SIGNALS, _GROUP)
     logger.info("Execution trade loop listening on %s", STREAM_SELECTED_SIGNALS)
 
@@ -1023,7 +1026,7 @@ async def main(use_ibkr: bool = False) -> None:
 
     tasks = [
         asyncio.create_task(
-            run_trade_loop(bus, engine, redis, market_data, mode=mode),
+            run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg),
             name="exec:trade",
         ),
         asyncio.create_task(
