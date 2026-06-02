@@ -28,6 +28,7 @@ def cfg() -> SystemConfig:
         loss_limit_single_trade=0.01,
         signal_reversal_threshold=-0.20,
         mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
     )
 
 
@@ -224,7 +225,8 @@ def test_no_reversal_when_sentiment_zero(
 # ── MENTION_DECAY ─────────────────────────────────────────────────────────────
 
 def test_mention_decay(manager: PositionExitManager, cfg: SystemConfig) -> None:
-    pos = make_long()
+    # Position held 2h — past the 1h minimum hold gate, so decay check runs.
+    pos = make_long(hours_ago=2)
     decision = manager.evaluate(
         pos, current_price=101.0, cfg=cfg, mention_ratio=0.10
     )
@@ -232,10 +234,30 @@ def test_mention_decay(manager: PositionExitManager, cfg: SystemConfig) -> None:
     assert decision.reason == "MENTION_DECAY"
 
 
+def test_mention_decay_skipped_within_min_hold(
+    manager: PositionExitManager, cfg: SystemConfig
+) -> None:
+    """MENTION_DECAY must not fire if the position hasn't been held long enough.
+
+    This is the core fix for premature MENTION_DECAY: the spike that triggered
+    entry naturally falls in the very next poll window, so we must wait at least
+    mention_decay_min_hold_hours before evaluating decay.
+    """
+    # Position held only 10 minutes — well below the 1h minimum.
+    from datetime import timedelta
+    pos = make_long(entry_price=100.0, stop_loss=96.0, take_profit=104.0)
+    # Override opened_at to be 10 minutes ago
+    object.__setattr__(pos, "opened_at", datetime.utcnow() - timedelta(minutes=10))
+    decision = manager.evaluate(
+        pos, current_price=101.0, cfg=cfg, mention_ratio=0.05  # way below threshold
+    )
+    assert decision.should_exit is False  # decay gate not yet open
+
+
 def test_mention_ratio_above_threshold(
     manager: PositionExitManager, cfg: SystemConfig
 ) -> None:
-    pos = make_long()
+    pos = make_long(hours_ago=2)
     decision = manager.evaluate(
         pos, current_price=101.0, cfg=cfg, mention_ratio=0.50
     )

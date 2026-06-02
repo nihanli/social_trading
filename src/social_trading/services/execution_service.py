@@ -408,7 +408,7 @@ async def run_exit_loop(
 
             for pos in open_positions:
                 current_price = engine.get_price(pos.ticker) or pos.entry_price
-                sentiment, mention_ratio = await _get_sentiment_context(redis, pos.ticker)
+                sentiment, mention_ratio = await _get_sentiment_context(redis, pos.ticker, cfg=cfg)
                 decision = exit_manager.evaluate(
                     pos, current_price, cfg,
                     current_sentiment=sentiment,
@@ -485,6 +485,7 @@ async def _get_sentiment_context(
     redis: aioredis.Redis,
     ticker: str,
     window_secs: float = 3600.0,
+    cfg: "SystemConfig | None" = None,
 ) -> tuple[float, float]:
     """
     Read current sentiment score and mention ratio for a ticker from Redis.
@@ -492,13 +493,14 @@ async def _get_sentiment_context(
     Returns:
         (current_sentiment, mention_ratio)
         current_sentiment: engagement-weighted avg score ∈ [-1, 1], 0.0 if no data
-        mention_ratio: current_hour_mentions / peak_hour_mentions, 1.0 if no data
+        mention_ratio: smoothed_recent_mentions / peak_mentions, 1.0 if no data
     """
     import json as _json  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     current_sentiment = 0.0
     mention_ratio = 1.0
+    smooth_samples = cfg.mention_decay_smooth_samples if cfg is not None else 3
 
     try:
         # ── Sentiment: average score of posts in last window_secs ─────────────
@@ -520,14 +522,20 @@ async def _get_sentiment_context(
         pass
 
     try:
-        # ── Mention ratio: latest hourly count / peak count ───────────────────
+        # ── Mention ratio: smoothed recent average / peak count ───────────────
+        # Use the mean of the last `smooth_samples` poll windows as "current"
+        # rather than the single latest poll.  After a spike, the very next
+        # 5-min window will look nearly empty — a single-sample ratio collapses
+        # to near-zero and would fire MENTION_DECAY immediately.  Smoothing over
+        # multiple windows gives a more stable signal of sustained interest.
         raw_history = await redis.lrange(f"mention_history:{ticker}", 0, -1)
         if raw_history:
             counts = [float(v) for v in raw_history]
             peak = max(counts)
-            current = counts[-1]
+            recent = counts[-smooth_samples:]
+            smoothed_current = sum(recent) / len(recent)
             if peak > 0:
-                mention_ratio = current / peak
+                mention_ratio = smoothed_current / peak
     except Exception:
         pass
 

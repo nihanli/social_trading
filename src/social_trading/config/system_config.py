@@ -97,7 +97,9 @@ class SystemConfig:
     trailing_stop_pct: float = 0.08        # trailing stop from high-water mark
     take_profit_pct: float = 0.04          # take profit target
     signal_reversal_threshold: float = -0.20
-    mention_decay_threshold: float = 0.25  # exit when mentions drop to this fraction
+    mention_decay_threshold: float = 0.25  # exit when smoothed mentions drop to this fraction of peak
+    mention_decay_min_hold_hours: float = 1.0  # don't fire MENTION_DECAY until held this long
+    mention_decay_smooth_samples: int = 3      # number of recent poll samples to average for mention ratio
 
     # ── Circuit Breakers ──────────────────────────────────────────────────────
     loss_limit_single_trade: float = 0.01  # 1%  — close position immediately

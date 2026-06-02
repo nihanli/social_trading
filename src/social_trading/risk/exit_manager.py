@@ -90,6 +90,7 @@ class PositionExitManager:
 
         pnl = _unrealised_pnl(position, current_price)
         entry_cost = position.cost_basis
+        hours_held = (now - position.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
 
         # ── 1. Emergency single-trade loss ────────────────────────────────────
         # Only activate when there is no valid ATR-based stop_loss already set.
@@ -152,18 +153,24 @@ class PositionExitManager:
                 )
 
         # ── 6. Mention decay ──────────────────────────────────────────────────
-        if mention_ratio < cfg.mention_decay_threshold:
+        # Only evaluate after the minimum hold period — the spike that triggered
+        # entry will naturally decay in the very next poll window (5 min), so
+        # firing immediately produces false exits before the trade can develop.
+        if (
+            hours_held >= cfg.mention_decay_min_hold_hours
+            and mention_ratio < cfg.mention_decay_threshold
+        ):
             return ExitDecision(
                 should_exit=True,
                 reason="MENTION_DECAY",
                 detail=(
                     f"Mention ratio {mention_ratio:.2f} < "
-                    f"threshold {cfg.mention_decay_threshold:.2f}"
+                    f"threshold {cfg.mention_decay_threshold:.2f} "
+                    f"(held {hours_held:.1f}h)"
                 ),
             )
 
         # ── 7. Hard time stop ─────────────────────────────────────────────────
-        hours_held = (now - position.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
         if hours_held >= cfg.max_hold_hours:
             return ExitDecision(
                 should_exit=True,

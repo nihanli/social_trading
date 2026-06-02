@@ -354,7 +354,20 @@ with col_e3:
     cfg.mention_decay_threshold = st.slider(
         "Mention decay exit (fraction of peak)", 0.05, 0.5,
         float(cfg.mention_decay_threshold), 0.05,
-        help="Exit when mentions fall below this fraction of peak.",
+        help="Exit when smoothed mentions fall below this fraction of peak.",
+    )
+    cfg.mention_decay_min_hold_hours = st.slider(
+        "Mention decay min hold (hours)", 0.25, 8.0,
+        float(cfg.mention_decay_min_hold_hours), 0.25,
+        help="Minimum time a position must be held before MENTION_DECAY exit can fire. "
+             "Prevents the spike that triggered entry from immediately triggering exit.",
+    )
+    cfg.mention_decay_smooth_samples = st.slider(
+        "Mention decay smooth samples", 1, 12,
+        int(cfg.mention_decay_smooth_samples), 1,
+        help="Number of recent poll windows to average when computing the mention ratio. "
+             "Each poll window is ~5 min, so 3 = ~15 min smoothing, 6 = ~30 min. "
+             "Higher values reduce noise but make the signal less responsive.",
     )
 
 st.divider()
