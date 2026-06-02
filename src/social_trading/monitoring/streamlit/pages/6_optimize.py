@@ -109,14 +109,14 @@ with tab_history:
         ))
         fig.update_layout(title="Cumulative P&L across all sessions",
                           height=240, margin={"t": 30, "b": 20})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # Full table
     display_cols = ["run_date", "mode", "config_hash", "total_pnl", "win_rate",
                     "sharpe_ratio", "avg_hold_hours", "signals_generated", "signals_executed"]
     existing = [c for c in display_cols if c in df.columns]
     st.dataframe(df[existing].sort_values("run_date", ascending=False),
-                 use_container_width=True, hide_index=True)
+                 width='stretch', hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -152,7 +152,7 @@ with tab_sensitivity:
                 title=f"{param_col} vs {metric_col}",
             )
             fig.update_layout(height=380, margin={"t": 40, "b": 20})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             # Correlation coefficient
             if len(scatter_df) >= 3:
@@ -393,9 +393,9 @@ with tab_grid:
                     text_auto=".2f",
                 )
                 fig.update_layout(height=350)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
-            st.dataframe(res_df, use_container_width=True, hide_index=True)
+            st.dataframe(res_df, width='stretch', hide_index=True)
 
             # Apply best settings
             best = res_df.iloc[0]

@@ -99,7 +99,7 @@ with col_left:
             },
         )
         fig.update_layout(height=300, margin={"t": 40, "b": 10})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("No signal history yet")
 
@@ -123,7 +123,7 @@ with col_right:
             color_discrete_map={"LONG": "#28a745", "SHORT": "#dc3545", "FLAT": "#6c757d"},
         )
         fig2.update_layout(height=300, margin={"t": 40, "b": 10})
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
     else:
         st.info("No signal history yet")
 
@@ -178,7 +178,7 @@ if not funnel_df.empty and funnel_df.iloc[0]["total"] > 0:
         height=300,
         margin={"t": 40, "b": 10, "l": 10, "r": 10},
     )
-    st.plotly_chart(funnel_fig, use_container_width=True)
+    st.plotly_chart(funnel_fig, width='stretch')
 
 st.divider()
 
@@ -208,7 +208,7 @@ if not phase_trend.empty:
         },
     )
     fig3.update_layout(height=250, margin={"t": 40, "b": 10})
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width='stretch')
 
 st.divider()
 
@@ -254,7 +254,7 @@ if not full_signals.empty:
         }.get(val, "")
 
     styled = full_signals.style.map(_phase_style, subset=["phase"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width='stretch', hide_index=True)
     st.caption(f"{len(full_signals)} signals shown (max 300)")
 else:
     st.info("No signals match the current filters")

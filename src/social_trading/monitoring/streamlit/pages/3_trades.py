@@ -89,7 +89,7 @@ if not cum_pnl.empty:
         margin={"t": 30, "b": 20},
         yaxis_title="USD",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 # ── Daily P&L bars ────────────────────────────────────────────────────────────
 daily_pnl = query(f"""
@@ -113,7 +113,7 @@ if not daily_pnl.empty:
         labels={"daily_pnl": "P&L (USD)", "day": "Date"},
     )
     fig2.update_layout(height=280, margin={"t": 30, "b": 20}, coloraxis_showscale=False)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
 st.divider()
 
@@ -134,7 +134,7 @@ with col_left:
     """)
     if not by_exit.empty:
         st.subheader("P&L by Exit Reason")
-        st.dataframe(by_exit, use_container_width=True, hide_index=True)
+        st.dataframe(by_exit, width='stretch', hide_index=True)
 
 with col_right:
     by_ticker = query(f"""
@@ -150,7 +150,7 @@ with col_right:
     """)
     if not by_ticker.empty:
         st.subheader("P&L by Ticker")
-        st.dataframe(by_ticker, use_container_width=True, hide_index=True)
+        st.dataframe(by_ticker, width='stretch', hide_index=True)
 
 st.divider()
 
@@ -173,7 +173,7 @@ all_trades = query(f"""
     LIMIT 500
 """)
 if not all_trades.empty:
-    st.dataframe(all_trades, use_container_width=True, hide_index=True)
+    st.dataframe(all_trades, width='stretch', hide_index=True)
     st.caption(f"{len(all_trades)} trades shown (max 500)")
 else:
     st.info(f"No closed {mode} trades in the last {days} days")

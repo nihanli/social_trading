@@ -78,7 +78,7 @@ if not heatmap_df.empty:
         xaxis_title=None,
         yaxis_title="Mentions",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 else:
     st.info(f"No sentiment data in the last {hours} hour(s)")
 
@@ -118,7 +118,7 @@ if ticker_select:
         )
         fig2.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
         fig2.update_layout(height=300, margin={"t": 40, "b": 20})
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
 st.divider()
 
@@ -143,7 +143,7 @@ with col_left:
             title=f"Post sources (last {hours}h)",
         )
         fig3.update_layout(height=280)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
     else:
         st.info("No classified posts in window")
 
@@ -176,6 +176,6 @@ with col_right:
             title=f"Sentiment distribution (last {hours}h)",
         )
         fig4.update_layout(height=280)
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width='stretch')
     else:
         st.info("No sentiment results in window")

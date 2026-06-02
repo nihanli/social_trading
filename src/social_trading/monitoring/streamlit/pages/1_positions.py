@@ -99,12 +99,12 @@ fig = px.bar(
 )
 fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
 fig.update_layout(height=300, margin={"t": 40, "b": 10})
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 # Positions table
 st.dataframe(
     positions,
-    use_container_width=True,
+    width='stretch',
     hide_index=True,
 )
 
@@ -119,7 +119,7 @@ for i, (_, row) in enumerate(positions.iterrows()):
             f"Close {row['ticker']} ({pnl_label})",
             key=f"close_{row['ticker']}",
             type=btn_type,
-            use_container_width=True,
+            width='stretch',
         ):
             close_position(row["ticker"])
             st.warning(f"Close command sent for {row['ticker']}")

@@ -62,7 +62,7 @@ with col_wl:
     st.write(f"**{len(watchlist)} tickers currently monitored**")
     if ordered:
         st.caption("\\* = pinned (never auto-expires)")
-        st.dataframe({"Ticker": ordered}, use_container_width=True, hide_index=True)
+        st.dataframe({"Ticker": ordered}, width='stretch', hide_index=True)
     else:
         st.info("Watchlist is empty — run seed_watchlist.py or pin tickers below")
 
@@ -413,7 +413,7 @@ st.divider()
 col_save, col_reset = st.columns([3, 1])
 
 with col_save:
-    if st.button("Save Configuration", type="primary", use_container_width=True):
+    if st.button("Save Configuration", type="primary", width='stretch'):
         errors = save_config(cfg)
         if errors:
             for e in errors:
@@ -423,7 +423,7 @@ with col_save:
             st.balloons()
 
 with col_reset:
-    if st.button("Reset to Defaults", use_container_width=True):
+    if st.button("Reset to Defaults", width='stretch'):
         errs = save_config(SystemConfig())
         if not errs:
             st.warning("Reset to factory defaults.")

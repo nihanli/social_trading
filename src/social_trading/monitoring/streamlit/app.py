@@ -76,12 +76,12 @@ with st.sidebar:
     # Halt / Resume toggle
     if state["halt_new"]:
         st.warning("New trades HALTED")
-        if st.button("Resume Trading", use_container_width=True):
+        if st.button("Resume Trading", width='stretch'):
             resume_trading()
             st.success("Resume command sent")
             st.rerun()
     else:
-        if st.button("Halt New Trades", use_container_width=True, type="primary"):
+        if st.button("Halt New Trades", width='stretch', type="primary"):
             halt_new_trades()
             st.warning("Halt command sent")
             st.rerun()
@@ -90,15 +90,14 @@ with st.sidebar:
 
     with st.expander("Emergency Actions", expanded=False):
         st.warning("Immediate and irreversible.")
-        if st.button("Close ALL Positions", use_container_width=True):
+        if st.button("Close ALL Positions", width='stretch'):
             close_all_positions()
             st.error("Close-all command sent to execution engine")
 
     st.divider()
 
-    st.markdown("**Daily P&L**")
     pnl_color = "normal" if state["daily_pnl_pct"] > -2 else "inverse"
-    st.metric("", f"{state['daily_pnl_pct']:+.2f}%", delta_color=pnl_color)
+    st.metric("Daily P&L", f"{state['daily_pnl_pct']:+.2f}%", delta_color=pnl_color)
 
     st.markdown("**Drawdown from HWM**")
     st.progress(
@@ -189,7 +188,7 @@ if not eq_hist.empty:
         xaxis_title=None,
         yaxis_title="USD",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 else:
     st.info("No equity history yet — starts recording after first trade.")
 
@@ -212,7 +211,7 @@ with col_left:
     if positions.empty:
         st.info("No open positions")
     else:
-        st.dataframe(positions, use_container_width=True, hide_index=True)
+        st.dataframe(positions, width='stretch', hide_index=True)
         for _, row in positions.iterrows():
             if st.button(f"Close {row['ticker']}", key=f"close_{row['ticker']}"):
                 close_position(row["ticker"])
@@ -233,7 +232,7 @@ with col_right:
         LIMIT 20
     """)
     if not signals.empty:
-        st.dataframe(signals, use_container_width=True, hide_index=True)
+        st.dataframe(signals, width='stretch', hide_index=True)
     else:
         st.info("No signals recorded yet")
 
@@ -285,7 +284,7 @@ if not heatmap_df.empty:
         xaxis_title=None,
         yaxis_title="Mentions",
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 else:
     st.info("No sentiment data in the last hour")
 
@@ -305,7 +304,7 @@ trades = query("""
     LIMIT 30
 """)
 if not trades.empty:
-    st.dataframe(trades, use_container_width=True, hide_index=True)
+    st.dataframe(trades, width='stretch', hide_index=True)
 else:
     st.info("No closed trades yet")
 
