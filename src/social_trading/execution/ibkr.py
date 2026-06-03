@@ -255,8 +255,13 @@ class IBKRExecutionEngine:
                     error=f"order not acknowledged after {_SUBMIT_TIMEOUT_SEC}s",
                 )
 
-            # Use actual fill price if already available; None otherwise
-            # (paper fills with delayed data may arrive after we return)
+            # Use actual fill price if already available; None otherwise.
+            # Paper accounts fill asynchronously — poll for up to 3s so the
+            # OCA TP recompute guard below has a fill price to work with.
+            # Without this, if the market moved up between signal approval and
+            # fill, the risk-service TP (computed from a stale snapshot price)
+            # can be BELOW the actual fill price, causing IB to execute the OCA
+            # limit sell immediately and cancel the stop-loss leg.
             fill_price: float | None = None
             # Capture opened_at ONCE here so position_params and the
             # position_opened event always carry the exact same timestamp.
@@ -268,10 +273,23 @@ class IBKRExecutionEngine:
                     action, ticker, quantity, fill_price,
                 )
             else:
-                logger.info(
-                    "[IBKR] ENTRY accepted %s %s qty=%d status=%s (fill pending)",
-                    action, ticker, quantity, entry_trade.orderStatus.status,
-                )
+                # Brief wait to collect a delayed paper fill before OCA placement
+                _FILL_WAIT_SEC = 3.0
+                _fill_elapsed = 0.0
+                while _fill_elapsed < _FILL_WAIT_SEC and not entry_trade.fills:
+                    await asyncio.sleep(0.25)
+                    _fill_elapsed += 0.25
+                if entry_trade.fills:
+                    fill_price = float(entry_trade.fills[0].execution.price)
+                    logger.info(
+                        "[IBKR] ENTRY filled %s %s qty=%d fill=%.4f (arrived after %.2fs)",
+                        action, ticker, quantity, fill_price, _fill_elapsed,
+                    )
+                else:
+                    logger.info(
+                        "[IBKR] ENTRY accepted %s %s qty=%d status=%s (fill pending after %.1fs wait)",
+                        action, ticker, quantity, entry_trade.orderStatus.status, _FILL_WAIT_SEC,
+                    )
 
             # ── 3. Attach OCA stop + limit ───────────────────────────────────
             # When fill_price is known, validate direction; otherwise trust the

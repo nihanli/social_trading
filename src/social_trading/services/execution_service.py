@@ -324,7 +324,30 @@ async def run_trade_loop(
                         ORDERS_PLACED.labels(ticker=signal.ticker, status=result.status).inc()
                         # Immediately push the new position to positions:live so the
                         # UI reflects it without waiting for the next exit-loop cycle.
-                        await _write_positions_to_redis(redis, engine)
+                        # We write directly rather than calling _write_positions_to_redis
+                        # because IB's position cache may not reflect the fill yet —
+                        # _write_positions_to_redis would see 0 positions and either
+                        # trigger the disconnect-guard (early return) or produce an
+                        # empty hash, neither of which shows the new position in the UI.
+                        fill_px = result.fill_price or 0.0
+                        try:
+                            await redis.hset(_POSITIONS_LIVE_KEY, signal.ticker, json.dumps({
+                                "ticker": signal.ticker,
+                                "direction": signal.direction,
+                                "shares": quantity,
+                                "entry_price": fill_px,
+                                "stop_loss": stop_loss,
+                                "take_profit": take_profit,
+                                "unrealized_pnl": 0.0,
+                                "high_water_mark": fill_px,
+                                "opened_at": result.submitted_at.isoformat(),
+                                "source": "system",
+                            }))
+                        except Exception as _write_exc:
+                            logger.warning(
+                                "[EXEC] Failed to write %s to positions:live: %s",
+                                signal.ticker, _write_exc,
+                            )
                         await _publish_execution_event(redis, "position_opened", {
                             "ticker": signal.ticker,
                             "direction": signal.direction,
