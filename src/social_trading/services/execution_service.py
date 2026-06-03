@@ -47,6 +47,7 @@ from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Signal
 from social_trading.execution.paper import PaperTradingEngine
 from social_trading.core.protocols import MarketDataProvider
+from social_trading.ingest.base import MENTION_HISTORY_TIER1_SOURCES
 from social_trading.market_data.composite import FallbackMarketData
 from social_trading.market_data.yfinance import YFinanceMarketData
 from social_trading.monitoring.metrics import (
@@ -641,20 +642,26 @@ async def _get_sentiment_context(
         pass
 
     try:
-        # ── Mention ratio: smoothed recent average / peak count ───────────────
-        # Use the mean of the last `smooth_samples` poll windows as "current"
-        # rather than the single latest poll.  After a spike, the very next
-        # 5-min window will look nearly empty — a single-sample ratio collapses
-        # to near-zero and would fire MENTION_DECAY immediately.  Smoothing over
-        # multiple windows gives a more stable signal of sustained interest.
-        raw_history = await redis.lrange(f"mention_history:{ticker}", 0, -1)
-        if raw_history:
+        # ── Mention ratio: max(per-source smoothed/peak) ──────────────────────
+        # Only Tier-1 sources (Bluesky, StockTwits) are used here. Twitter is
+        # excluded because it is only polled on Phase-1 events — after entry its
+        # history receives no new samples, so smoothed_current ≈ peak ≈ 1.0
+        # permanently, which would block decay exits indefinitely with max().
+        source_ratios: list[float] = []
+        for source in MENTION_HISTORY_TIER1_SOURCES:
+            raw_history = await redis.lrange(f"mention_history:{source}:{ticker}", 0, -1)
+            if not raw_history:
+                continue
             counts = [float(v) for v in raw_history]
             peak = max(counts)
+            if peak <= 2:  # ignore noise-floor sources (< 3 posts ever seen)
+                continue
             recent = counts[-smooth_samples:]
             smoothed_current = sum(recent) / len(recent)
-            if peak > 0:
-                mention_ratio = smoothed_current / peak
+            source_ratios.append(smoothed_current / peak)
+
+        if source_ratios:
+            mention_ratio = max(source_ratios)
     except Exception:
         pass
 

@@ -33,8 +33,6 @@ logger = logging.getLogger(__name__)
 
 X_COUNTS_URL = "https://api.x.com/2/tweets/counts/recent"
 X_SEARCH_URL = "https://api.x.com/2/tweets/search/recent"
-MENTION_HISTORY_KEY = "mention_history:{ticker}"   # Redis LIST — 168 hourly counts
-MENTION_HISTORY_LEN = 168                          # 7 days × 24 hours
 
 
 class TwitterDataSource(BaseDataSource):
@@ -144,43 +142,6 @@ class TwitterDataSource(BaseDataSource):
         self._handle_http_error(resp, "counts")
         data = resp.json()
         return int(data.get("meta", {}).get("total_tweet_count", 0))
-
-    # ── Spike detection ───────────────────────────────────────────────────────
-
-    async def _check_spike(self, ticker: str, current_count: int) -> bool:
-        """
-        Z-score spike detection against 7-day rolling history stored in Redis.
-        Returns True when z-score ≥ cfg.spike_zscore_threshold.
-        Appends current_count to history regardless of result.
-        """
-        import numpy as np
-
-        key = MENTION_HISTORY_KEY.format(ticker=ticker)
-        raw_history = await self._redis.lrange(key, 0, -1)
-        history = [float(x) for x in raw_history]
-
-        # Always append and trim to rolling window
-        await self._redis.rpush(key, current_count)
-        await self._redis.ltrim(key, -MENTION_HISTORY_LEN, -1)
-
-        if len(history) < 24:
-            # Not enough history yet — build baseline before detecting spikes
-            return False
-
-        mean = float(np.mean(history))
-        raw_std = float(np.std(history))
-        # Use a relative floor (10% of mean) so a perfectly flat series still
-        # allows detection of large absolute jumps, while tiny noise on flat
-        # baselines doesn't produce false spikes.
-        std = max(raw_std, mean * 0.10, 1.0)
-        zscore = (current_count - mean) / std
-
-        logger.debug(
-            "%s count=%d mean=%.1f std=%.1f zscore=%.2f threshold=%.1f",
-            ticker, current_count, mean, std, zscore,
-            self._cfg.spike_zscore_threshold,
-        )
-        return zscore >= self._cfg.spike_zscore_threshold
 
     # ── Tier 2: Content pull ──────────────────────────────────────────────────
 

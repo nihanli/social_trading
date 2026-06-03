@@ -30,9 +30,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Redis key pattern for mention-volume history used by spike detection
-MENTION_HISTORY_KEY = "mention_history:{ticker}"
-MENTION_HISTORY_LEN = 168   # 7 days × 24 hourly samples
+# Redis key pattern for per-source mention-volume history used by spike detection
+# and mention-decay evaluation.  Keyed by source name so each source's baseline
+# is computed independently — avoids contamination from high-volume vs low-volume
+# sources (e.g. Twitter counts vs Bluesky post counts).
+MENTION_HISTORY_KEY = "mention_history:{source}:{ticker}"
+MENTION_HISTORY_LEN = 168   # 7 days × ~5-min samples (1 sample/poll/source)
+MENTION_HISTORY_TTL_SECS = 8 * 24 * 3600  # 8 days — auto-expires stale/disabled sources
+
+# Tier-1 (always active) source names that write to mention history.
+# Twitter (Tier-2) is only included when ingest:tier2_active == 1.
+MENTION_HISTORY_TIER1_SOURCES: tuple[str, ...] = ("bluesky", "stocktwits")
 
 # Maximum backoff between retries (seconds)
 _MAX_BACKOFF = 300
@@ -210,21 +218,29 @@ class BaseDataSource(ABC):
         """
         Z-score spike detector shared by all volume-counting sources.
 
-        Appends *count* to the rolling 7-day history stored at
-        ``mention_history:{ticker}`` and returns True when the current
-        count's Z-score exceeds ``cfg.spike_zscore_threshold``.
+        Appends *count* to the per-source rolling history stored at
+        ``mention_history:{source}:{ticker}`` and returns True when the
+        current count's Z-score exceeds ``cfg.spike_zscore_threshold``.
+
+        Using per-source keys prevents high-volume sources (e.g. Twitter
+        returning tweet counts in the hundreds) from inflating the baseline
+        used by low-volume sources (e.g. Bluesky returning single-digit
+        post counts), which would make the latter's spikes invisible.
 
         At least 24 samples are required before detection activates so a
         flat baseline can be established first.
         """
         import numpy as np
 
-        key = MENTION_HISTORY_KEY.format(ticker=ticker)
+        key = MENTION_HISTORY_KEY.format(source=self.name, ticker=ticker)
         raw_history = await self._redis.lrange(key, 0, -1)
+        # Read history BEFORE appending so baseline excludes the current sample
         history = [float(x) for x in raw_history]
 
         await self._redis.rpush(key, count)
         await self._redis.ltrim(key, -MENTION_HISTORY_LEN, -1)
+        # Refresh TTL so keys from disabled/unwatchlisted sources expire naturally
+        await self._redis.expire(key, MENTION_HISTORY_TTL_SECS)
 
         if len(history) < 24:
             return False

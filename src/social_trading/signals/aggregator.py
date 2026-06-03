@@ -35,6 +35,7 @@ import redis.asyncio as aioredis
 
 from social_trading.config.system_config import SystemConfig
 from social_trading.core.models import SentimentResult
+from social_trading.ingest.base import MENTION_HISTORY_TIER1_SOURCES
 
 logger = logging.getLogger(__name__)
 
@@ -139,28 +140,35 @@ class SentimentAggregator:
 
     async def get_volume_zscore(self, ticker: str) -> float:
         """
-        Read the 7-day mention history stored by TwitterDataSource
-        (key: mention_history:{ticker}) and compute the current Z-score.
+        Read per-source mention histories and return the equal-weight average
+        Z-score across continuously-polled Tier-1 sources (Bluesky, StockTwits).
 
-        Returns 0.0 if insufficient history (< 24 data points).
-        This mirrors the spike detection logic in TwitterDataSource._check_spike()
-        but without needing numpy in the signal service.
+        Twitter is intentionally excluded: it is only polled on Phase-1 spike
+        events, so its history is a biased sample of spike-only counts. Using
+        it as a baseline comparator would produce unreliable Z-scores.
+
+        Sources with fewer than 24 baseline samples are excluded from the
+        average so warm-up periods don't corrupt the signal.
         """
-        key = f"mention_history:{ticker}"
-        raw = await self._redis.lrange(key, 0, -1)
-        if len(raw) < 24:
+        zscores: list[float] = []
+        for source in MENTION_HISTORY_TIER1_SOURCES:
+            key = f"mention_history:{source}:{ticker}"
+            raw = await self._redis.lrange(key, 0, -1)
+            if len(raw) < 25:  # need at least 24 baseline + 1 current
+                continue
+            values = [float(v) for v in raw]
+            current = values[-1]
+            history = values[:-1]  # baseline excludes current sample
+            n = len(history)
+            mean = sum(history) / n
+            variance = sum((v - mean) ** 2 for v in history) / n
+            std = math.sqrt(variance)
+            std = max(std, mean * 0.10, 1.0)
+            zscores.append((current - mean) / std)
+
+        if not zscores:
             return 0.0
-
-        values = [float(v) for v in raw]
-        n = len(values)
-        mean = sum(values) / n
-        variance = sum((v - mean) ** 2 for v in values) / n
-        std = math.sqrt(variance)
-
-        # Use relative floor to match TwitterDataSource._check_spike() behaviour
-        std = max(std, mean * 0.10, 1.0)
-        current = values[-1]
-        return (current - mean) / std
+        return sum(zscores) / len(zscores)
 
     async def active_tickers(self) -> list[str]:
         """

@@ -10,10 +10,8 @@ import pytest
 
 from social_trading.config.system_config import SystemConfig
 from social_trading.core.exceptions import RateLimitError
-from social_trading.ingest.sources.twitter import (
-    MENTION_HISTORY_KEY,
-    TwitterDataSource,
-)
+from social_trading.ingest.base import MENTION_HISTORY_KEY
+from social_trading.ingest.sources.twitter import TwitterDataSource
 
 
 def make_counts_response(count: int = 10) -> httpx.Response:
@@ -76,7 +74,7 @@ async def test_poll_no_spike_returns_empty(twitter, mock_http, redis, cfg):
     mock_http.get = AsyncMock(return_value=make_counts_response(count=5))
 
     # Build 30+ history points with mean=5, std≈0 — zscore will be ~0
-    key = MENTION_HISTORY_KEY.format(ticker="AAPL")
+    key = MENTION_HISTORY_KEY.format(source="twitter", ticker="AAPL")
     for _ in range(30):
         await redis.rpush(key, 5)
 
@@ -99,7 +97,7 @@ async def test_poll_spike_triggers_tier2(twitter, mock_http, redis, cfg):
     )
 
     # Build low baseline history → spike will be detected
-    key = MENTION_HISTORY_KEY.format(ticker="AAPL")
+    key = MENTION_HISTORY_KEY.format(source="twitter", ticker="AAPL")
     for _ in range(30):
         await redis.rpush(key, 5)
 
@@ -115,30 +113,30 @@ async def test_poll_spike_triggers_tier2(twitter, mock_http, redis, cfg):
 
 async def test_check_spike_insufficient_history(twitter, redis):
     """< 24 history points → never fires (no baseline yet)."""
-    key = MENTION_HISTORY_KEY.format(ticker="NVDA")
+    key = MENTION_HISTORY_KEY.format(source="twitter", ticker="NVDA")
     for _ in range(10):
         await redis.rpush(key, 5)
-    is_spike = await twitter._check_spike("NVDA", current_count=999)
+    is_spike = await twitter._check_spike("NVDA", count=999)
     assert not is_spike
 
 
 async def test_check_spike_fires_above_threshold(twitter, redis, cfg):
     cfg.spike_zscore_threshold = 2.0
-    key = MENTION_HISTORY_KEY.format(ticker="TSLA")
+    key = MENTION_HISTORY_KEY.format(source="twitter", ticker="TSLA")
     for _ in range(30):
         await redis.rpush(key, 10)
     # current count far above baseline → spike
-    is_spike = await twitter._check_spike("TSLA", current_count=500)
+    is_spike = await twitter._check_spike("TSLA", count=500)
     assert is_spike
 
 
 async def test_check_spike_does_not_fire_below_threshold(twitter, redis, cfg):
     cfg.spike_zscore_threshold = 2.0
-    key = MENTION_HISTORY_KEY.format(ticker="MSFT")
+    key = MENTION_HISTORY_KEY.format(source="twitter", ticker="MSFT")
     for _ in range(30):
         await redis.rpush(key, 100)
     # current count close to baseline → no spike
-    is_spike = await twitter._check_spike("MSFT", current_count=102)
+    is_spike = await twitter._check_spike("MSFT", count=102)
     assert not is_spike
 
 

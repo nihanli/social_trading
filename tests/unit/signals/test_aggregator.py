@@ -132,9 +132,9 @@ async def test_get_stats_per_source_scores(agg: SentimentAggregator) -> None:
 async def test_get_volume_zscore_insufficient_history(
     agg: SentimentAggregator, redis
 ) -> None:
-    # Only 5 data points → < 24 minimum
+    # Only 5 data points → < 24 minimum (write to a tier-1 source key)
     for v in [100, 110, 105, 108, 102]:
-        await redis.rpush("mention_history:AAPL", v)
+        await redis.rpush("mention_history:bluesky:AAPL", v)
     zscore = await agg.get_volume_zscore("AAPL")
     assert zscore == 0.0
 
@@ -144,7 +144,7 @@ async def test_get_volume_zscore_flat_history(
 ) -> None:
     # Flat history + tiny current → no spike
     for _ in range(30):
-        await redis.rpush("mention_history:TSLA", 100)
+        await redis.rpush("mention_history:bluesky:TSLA", 100)
     zscore = await agg.get_volume_zscore("TSLA")
     # With flat history and last=100 equal to mean → z=0
     assert abs(zscore) < 0.5
@@ -153,8 +153,8 @@ async def test_get_volume_zscore_flat_history(
 async def test_get_volume_zscore_spike(agg: SentimentAggregator, redis) -> None:
     # 30 values at 10, then spike to 500
     for _ in range(29):
-        await redis.rpush("mention_history:NVDA", 10)
-    await redis.rpush("mention_history:NVDA", 500)
+        await redis.rpush("mention_history:bluesky:NVDA", 10)
+    await redis.rpush("mention_history:bluesky:NVDA", 500)
     zscore = await agg.get_volume_zscore("NVDA")
     assert zscore > 2.0  # clearly a spike
 
