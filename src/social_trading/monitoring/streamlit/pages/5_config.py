@@ -30,10 +30,13 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     clear_watchlist,
     get_pinned_tickers,
+    get_source_enabled_states,
+    get_source_registry,
     get_watchlist,
     load_config,
     pin_ticker,
     save_config,
+    set_source_enabled,
     unpin_ticker,
 )
 
@@ -228,7 +231,95 @@ with st.expander("⚠️  X (Twitter) API — disabled by default"):
 
 st.divider()
 # ═══════════════════════════════════════════════════════════════
-st.header("3. Signal Quality")
+# 2c. SOURCE ON/OFF CONTROLS
+# ═══════════════════════════════════════════════════════════════
+st.subheader("2c. Source On/Off Controls")
+st.caption(
+    "Enable or disable individual sources at runtime. Changes take effect on the next "
+    "poll cycle (~30 s). Sources remain registered — no service restart required."
+)
+
+# Human-readable metadata for each source name.
+# Drives display labels, descriptions, and any extra notes in the UI.
+_SOURCE_META: dict[str, dict] = {
+    "bluesky":       {"label": "Bluesky",           "desc": "AT Protocol social feed. Free account + app password required."},
+    "stocktwits":    {"label": "StockTwits",         "desc": "Public StockTwits trending API. No API key required."},
+    "apewisdom":     {"label": "ApeWisdom",          "desc": "Reddit/social mention leaderboard. No API key required."},
+    "yfinance":      {"label": "Yahoo Finance",      "desc": "most_actives / day_gainers / day_losers screeners. No key required."},
+    "alpha_vantage": {"label": "Alpha Vantage",      "desc": "Top gainers/losers endpoint. Free API key required (25 req/day)."},
+    "ibkr":          {"label": "IBKR Market Scanner","desc": "Real-time IBKR scanner for high-volume movers. Requires TWS/Gateway."},
+    "google_trends": {"label": "Google Trends",      "desc": "Trending searches for financial tickers. No API key required."},
+    "reddit":        {"label": "Reddit",             "desc": "PRAW streaming source. Requires REDDIT_CLIENT_ID in .env."},
+    "twitter":       {"label": "X (Twitter)",        "desc": "Paid tier-2 enrichment. Controlled by X API toggle above (section 2b)."},
+}
+
+# Tier-1 mention-history sources — disabling these affects Z-score baselines.
+_ZSCORE_SOURCES = {"bluesky", "stocktwits", "apewisdom"}
+
+source_registry = get_source_registry()
+enabled_states = get_source_enabled_states()
+
+if not source_registry:
+    st.info(
+        "No sources registered yet. Ingest service publishes this list on startup — "
+        "start ingest_service and reload this page.",
+        icon="ℹ️",
+    )
+else:
+    # Split into controllable polling sources and read-only sources.
+    polling_tier1 = {
+        name: meta for name, meta in source_registry.items()
+        if not meta.get("streaming") and meta.get("tier", 1) == 1 and name != "twitter"
+    }
+    streaming_sources = {
+        name: meta for name, meta in source_registry.items()
+        if meta.get("streaming")
+    }
+    tier2_sources = {
+        name: meta for name, meta in source_registry.items()
+        if meta.get("tier", 1) == 2
+    }
+
+    if polling_tier1:
+        st.markdown("**Tier-1 Polling Sources**")
+        for name in sorted(polling_tier1):
+            meta = _SOURCE_META.get(name, {"label": name, "desc": ""})
+            is_enabled = enabled_states.get(name, True)
+
+            col_chk, col_info = st.columns([1, 5])
+            with col_chk:
+                new_val = st.checkbox(
+                    meta["label"],
+                    value=is_enabled,
+                    key=f"src_enabled_{name}",
+                )
+                if new_val != is_enabled:
+                    set_source_enabled(name, new_val)
+                    st.rerun()
+            with col_info:
+                st.caption(meta["desc"])
+                if not is_enabled and name in _ZSCORE_SOURCES:
+                    st.warning(
+                        f"⚠️ {meta['label']} is a mention-history source. "
+                        "Disabling it may bias Z-score calculations until existing "
+                        "history entries expire (~1 h).",
+                        icon="⚠️",
+                    )
+
+    if streaming_sources or tier2_sources:
+        st.markdown("**Read-only sources** *(require restart to change)*")
+        for name in sorted({**streaming_sources, **tier2_sources}):
+            meta = _SOURCE_META.get(name, {"label": name, "desc": ""})
+            note = (
+                "🔄 Streaming — disable via .env (remove credentials) + restart ingest_service."
+                if source_registry.get(name, {}).get("streaming")
+                else "💳 Tier-2 paid source — controlled by X API toggle in section 2b above."
+            )
+            st.markdown(f"**{meta['label']}** — {meta['desc']}")
+            st.caption(note)
+
+st.divider()
+
 col_s1, col_s2 = st.columns(2)
 
 with col_s1:

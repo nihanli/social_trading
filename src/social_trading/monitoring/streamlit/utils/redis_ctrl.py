@@ -309,3 +309,44 @@ def get_live_positions() -> list[dict]:
         return result
     except Exception:
         return []
+
+
+# ── Source on/off helpers ─────────────────────────────────────────────────────
+
+_SOURCES_REGISTRY_KEY = "ingest:sources:registry"
+_SOURCES_ENABLED_KEY = "ingest:sources:enabled"
+
+
+def get_source_registry() -> dict[str, dict]:
+    """
+    Return all sources registered by ingest_service at startup.
+    Returns ``{name: {"tier": int, "streaming": bool}}``.
+    Falls back to an empty dict when ingest_service has not yet written the key.
+    """
+    r = _get_redis()
+    raw = r.hgetall(_SOURCES_REGISTRY_KEY) or {}
+    result: dict[str, dict] = {}
+    for name, v in raw.items():
+        with contextlib.suppress(Exception):
+            result[name] = json.loads(v)
+    return result
+
+
+def get_source_enabled_states() -> dict[str, bool]:
+    """
+    Return the current runtime enabled state for each source.
+    A source not present in the hash defaults to ``True`` (enabled).
+    """
+    r = _get_redis()
+    raw = r.hgetall(_SOURCES_ENABLED_KEY) or {}
+    return {k: v != "0" for k, v in raw.items()}
+
+
+def set_source_enabled(name: str, enabled: bool) -> None:
+    """
+    Enable or disable a source at runtime.
+    The change is picked up by ingest_service on the next poll cycle
+    (~30 s when disabled, next interval when re-enabled).
+    """
+    r = _get_redis()
+    r.hset(_SOURCES_ENABLED_KEY, name, "1" if enabled else "0")

@@ -29,6 +29,7 @@ Environment variables (from .env):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -110,6 +111,13 @@ async def run_poll_loop(
         # category this source belongs to (discovery vs. sentiment/social).
         interval_attr = _POLL_INTERVAL_ATTR.get(source.name, "discovery_poll_interval_sec")
         interval = getattr(cfg, interval_attr)
+
+        # Check runtime on/off toggle (set via Config UI → Source Controls).
+        # Use a short 30 s sleep while disabled to avoid a tight loop.
+        enabled = await redis.hget("ingest:sources:enabled", source.name)
+        if enabled == b"0":
+            await asyncio.sleep(30)
+            continue
 
         # Discover trending tickers on this source
         await source.get_trending()
@@ -470,6 +478,20 @@ async def main() -> None:
         )
 
     logger.info("Registered sources: %s", registry.names)
+
+    # Publish a snapshot of registered sources to Redis so the Config UI can
+    # render per-source on/off toggles without hardcoding source names.
+    # DEL before HSET ensures stale entries from a previous run are cleared.
+    await redis.delete("ingest:sources:registry")
+    if registry.names:
+        await redis.hset(
+            "ingest:sources:registry",
+            mapping={
+                s.name: json.dumps({"tier": getattr(s, "tier", 1), "streaming": s.is_streaming})
+                for s in registry.active_sources()
+            },
+        )
+    logger.info("Source registry published to Redis")
 
     # ── Build task list ───────────────────────────────────────────────────────
 
