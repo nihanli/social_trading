@@ -17,6 +17,7 @@ dependencies = [
     "praw>=7.7.0",
     "httpx>=0.26.0",
     "atproto>=0.0.50",
+    "pytrends>=4.9.0",
     # NLP
     "transformers>=4.35.0",
     "torch>=2.1.0",

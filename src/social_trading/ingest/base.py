@@ -40,7 +40,7 @@ MENTION_HISTORY_TTL_SECS = 8 * 24 * 3600  # 8 days — auto-expires stale/disabl
 
 # Tier-1 (always active) source names that write to mention history.
 # Twitter (Tier-2) is only included when ingest:tier2_active == 1.
-MENTION_HISTORY_TIER1_SOURCES: tuple[str, ...] = ("bluesky", "stocktwits")
+MENTION_HISTORY_TIER1_SOURCES: tuple[str, ...] = ("bluesky", "stocktwits", "apewisdom")
 
 # Maximum backoff between retries (seconds)
 _MAX_BACKOFF = 300

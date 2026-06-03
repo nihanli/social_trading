@@ -42,7 +42,9 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.ingest.base import BaseDataSource
 from social_trading.ingest.registry import DataSourceRegistry
 from social_trading.ingest.sources.alpha_vantage import AlphaVantageDataSource
+from social_trading.ingest.sources.apewisdom import ApeWisdomDataSource
 from social_trading.ingest.sources.bluesky import BlueskyDataSource
+from social_trading.ingest.sources.google_trends import GoogleTrendsDataSource
 from social_trading.ingest.sources.ibkr_scanner import IBKRScannerDataSource
 from social_trading.ingest.sources.reddit import RedditDataSource
 from social_trading.ingest.sources.stocktwits import StockTwitsDataSource
@@ -75,9 +77,11 @@ _POLL_INTERVAL_ATTR: dict[str, str] = {
     "twitter":       "counts_poll_interval_sec",
     "stocktwits":    "stocktwits_poll_interval_sec",
     "bluesky":       "stocktwits_poll_interval_sec",   # same cadence as stocktwits
+    "apewisdom":     "stocktwits_poll_interval_sec",   # leaderboard updates ~every few minutes
     "yfinance":      "discovery_poll_interval_sec",
     "alpha_vantage": "discovery_poll_interval_sec",
     "ibkr":          "discovery_poll_interval_sec",
+    "google_trends": "discovery_poll_interval_sec",    # rate-limited internally to 55 min
 }
 
 
@@ -437,6 +441,10 @@ async def main() -> None:
             "Create a free account at bsky.app and set an App Password."
         )
 
+    # ApeWisdom — no auth required; always enabled
+    registry.register(ApeWisdomDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+    logger.info("ApeWisdom source enabled (unauthenticated public API)")
+
     # ── Discovery sources (trending ticker candidates only) ───────────────────
 
     # Yahoo Finance screener — always enabled, no key required
@@ -449,6 +457,17 @@ async def main() -> None:
 
     # IBKR scanner — enabled if TWS/Gateway is reachable (checked at first call)
     registry.register(IBKRScannerDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+
+    # Google Trends — discovery-only; rate-limited internally to 55 min
+    try:
+        import pytrends  # noqa: F401
+        registry.register(GoogleTrendsDataSource(redis=redis, cfg=cfg, watchlist=watchlist))
+        logger.info("Google Trends source enabled (pytrends, no API key required)")
+    except ImportError:
+        logger.warning(
+            "pytrends not installed — Google Trends source disabled. "
+            "Install with: pip install pytrends"
+        )
 
     logger.info("Registered sources: %s", registry.names)
 
