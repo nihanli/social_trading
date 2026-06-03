@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import subprocess
 
 # Ensure src/ is on the path when running via `streamlit run`
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../"))
@@ -93,6 +94,28 @@ with st.sidebar:
         if st.button("Close ALL Positions", width='stretch'):
             close_all_positions()
             st.error("Close-all command sent to execution engine")
+
+        st.divider()
+        st.markdown("**Stop All Services**")
+        if st.button("🛑 Stop All Services", width='stretch', type="secondary"):
+            st.session_state["_confirm_stop_services"] = True
+
+        if st.session_state.get("_confirm_stop_services"):
+            st.error("This will terminate ALL services including this UI. Continue?")
+            col_yes, col_no = st.columns(2)
+            if col_yes.button("Yes, stop everything", type="primary"):
+                st.session_state.pop("_confirm_stop_services", None)
+                _stop_script = os.path.normpath(os.path.join(
+                    os.path.dirname(__file__), "../../../../stop.sh"
+                ))
+                try:
+                    subprocess.Popen(["bash", _stop_script])
+                    st.error("☠️ Shutdown signal sent — all services terminating…")
+                except Exception as _e:
+                    st.error(f"Failed to run stop.sh: {_e}")
+            if col_no.button("Cancel"):
+                st.session_state.pop("_confirm_stop_services", None)
+                st.rerun()
 
     st.divider()
 
