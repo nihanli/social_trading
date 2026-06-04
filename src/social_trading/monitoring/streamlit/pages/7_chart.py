@@ -271,7 +271,7 @@ fig.update_layout(
 fig.update_xaxes(gridcolor="#1E2130", zeroline=False)
 fig.update_yaxes(gridcolor="#1E2130", zeroline=False)
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 # ── Info bar ───────────────────────────────────────────────────────────────────
 last_bar = df.iloc[-1]
@@ -296,6 +296,6 @@ if show_signals and not signals_df.empty:
     with st.expander(f"Signals for {ticker} in window ({len(signals_df)} total)", expanded=False):
         st.dataframe(
             signals_df.rename(columns={"generated_at": "time"}),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )

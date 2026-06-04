@@ -252,7 +252,7 @@ if not factor_df.empty:
         showlegend=False,
         yaxis={"range": [0, 1.05]},
     )
-    st.plotly_chart(bar_fig, use_container_width=True)
+    st.plotly_chart(bar_fig, width='stretch')
 
     # ── Per-signal factor heatmap (most recent 30) ────────────────────────────
     with st.expander("Per-signal factor heatmap (latest 30)", expanded=False):
@@ -276,7 +276,7 @@ if not factor_df.empty:
             labels={"color": "Factor value"},
         )
         heat_fig.update_layout(height=max(300, 20 * len(heat_data)), margin={"t": 40, "b": 10})
-        st.plotly_chart(heat_fig, use_container_width=True)
+        st.plotly_chart(heat_fig, width='stretch')
 
     # ── Factor table ──────────────────────────────────────────────────────────
     with st.expander("Factor detail table", expanded=False):
@@ -288,7 +288,7 @@ if not factor_df.empty:
                 "m_momentum":    "M (momentum)",
                 "c_convergence": "C (convergence)",
             }),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 else:

@@ -889,7 +889,7 @@ st.divider()
 col_save, col_reset = st.columns([3, 1])
 
 with col_save:
-    if st.button("💾 Save Configuration", type="primary", use_container_width=True):
+    if st.button("💾 Save Configuration", type="primary", width='stretch'):
         errors = save_config(cfg)
         if errors:
             for e in errors:
@@ -899,7 +899,7 @@ with col_save:
             st.balloons()
 
 with col_reset:
-    if st.button("↺ Reset to Defaults", use_container_width=True):
+    if st.button("↺ Reset to Defaults", width='stretch'):
         errs = save_config(SystemConfig())
         if not errs:
             st.warning("Reset to factory defaults.")

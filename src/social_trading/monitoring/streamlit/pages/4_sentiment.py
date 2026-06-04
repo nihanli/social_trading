@@ -269,11 +269,11 @@ else:
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.01,
                 "xanchor": "right", "x": 1},
     )
-    st.plotly_chart(fig5, use_container_width=True)
+    st.plotly_chart(fig5, width='stretch')
 
     with st.expander("Full breakdown table"):
         st.dataframe(
             combined_df.sort_values(["ticker", "source"]),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
