@@ -211,8 +211,8 @@ def _engagement_weight(result: SentimentResult, now: float, decay_lambda: float)
     hours_ago = (now - result.classified_at.timestamp()) / 3600.0
     hours_ago = max(hours_ago, 0.0)
 
-    engagement = math.log1p(result.likes + 2 * result.reposts)
-    authority = math.log1p(result.author_followers)
+    engagement = math.log1p(max(0, result.likes + 2 * result.reposts))
+    authority = math.log1p(max(0, result.author_followers))
     time_decay = math.exp(-decay_lambda * hours_ago)
 
     return engagement * authority * time_decay
