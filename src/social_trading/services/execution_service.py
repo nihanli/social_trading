@@ -616,6 +616,18 @@ async def run_exit_loop(
                     else (pos.entry_price - cur) * pos.shares
                 POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
+            # ── 6. EOD snapshot ───────────────────────────────────────────────
+            # Save session metrics ~5 minutes after NYSE close (16:05 ET).
+            # Use a Redis key to ensure we only write once per calendar day.
+            _eod_key = f"eod_snapshot_done:{datetime.now(UTC).date().isoformat()}:{mode}"
+            if not _NYSE.is_open() and not await redis.exists(_eod_key):
+                now_dt = datetime.now(UTC)
+                # Only trigger in the 16:05–17:00 ET window (not pre-market)
+                ny_hour = (now_dt.hour - 4) % 24  # rough ET offset
+                if 20 <= now_dt.hour <= 21:  # 16:00–17:00 ET = 20:00–21:00 UTC
+                    await _save_eod_snapshot(cfg, mode)
+                    await redis.setex(_eod_key, 86400, "1")  # expire after 24h
+
         except asyncio.CancelledError:
             raise  # let the task be cancelled normally on shutdown
         except Exception as exc:
@@ -966,6 +978,146 @@ async def _reconcile_startup(
                 logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
 
+async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
+    """
+    Compute today's session metrics from the DB and write one config_runs row.
+    Called once after market close (~16:05 ET) and again on clean shutdown.
+    Safe to call multiple times — UPSERT on (run_date, mode).
+
+    Exit-reason mapping (runtime names → config_runs columns):
+        STOP_LOSS           → exits_atr_stop
+        TAKE_PROFIT         → exits_take_profit
+        TRAILING_STOP       → exits_trailing_stop
+        SENTIMENT_REVERSAL  → exits_sentiment_reversal
+        MENTION_DECAY       → exits_mention_decay
+        TIME_STOP           → exits_time_stop
+        everything else     → exits_manual
+    """
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME", "trading"),
+            user=os.getenv("DB_USER", "trader"),
+            password=os.getenv("DB_PASSWORD", ""),
+        )
+        today = datetime.now(UTC).date().isoformat()
+        with conn, conn.cursor() as cur:
+            # ── Closed trades today ───────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                          AS total_trades,
+                    SUM(net_pnl)                                      AS total_pnl,
+                    SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)     AS win_count,
+                    AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600)
+                                                                      AS avg_hold_hours,
+                    -- Exit reason breakdown
+                    SUM(CASE WHEN exit_reason = 'TAKE_PROFIT'         THEN 1 ELSE 0 END) AS tp,
+                    SUM(CASE WHEN exit_reason = 'TIME_STOP'           THEN 1 ELSE 0 END) AS ts,
+                    SUM(CASE WHEN exit_reason = 'STOP_LOSS'           THEN 1 ELSE 0 END) AS sl,
+                    SUM(CASE WHEN exit_reason = 'TRAILING_STOP'       THEN 1 ELSE 0 END) AS tr,
+                    SUM(CASE WHEN exit_reason = 'SENTIMENT_REVERSAL'  THEN 1 ELSE 0 END) AS sr,
+                    SUM(CASE WHEN exit_reason = 'MENTION_DECAY'       THEN 1 ELSE 0 END) AS md,
+                    SUM(CASE WHEN exit_reason NOT IN (
+                        'TAKE_PROFIT','TIME_STOP','STOP_LOSS',
+                        'TRAILING_STOP','SENTIMENT_REVERSAL','MENTION_DECAY'
+                    ) THEN 1 ELSE 0 END)                              AS manual,
+                    STDDEV(net_pnl)                                   AS pnl_std
+                FROM trades
+                WHERE closed_at::date = %(today)s
+                  AND mode = %(mode)s
+                  AND exit_price IS NOT NULL
+            """, {"today": today, "mode": mode})
+            row = cur.fetchone()
+            total_trades   = int(row[0] or 0)
+            total_pnl      = float(row[1] or 0)
+            win_count      = int(row[2] or 0)
+            avg_hold_hours = float(row[3] or 0)
+            exits_tp       = int(row[4] or 0)
+            exits_ts       = int(row[5] or 0)
+            exits_sl       = int(row[6] or 0)
+            exits_tr       = int(row[7] or 0)
+            exits_sr       = int(row[8] or 0)
+            exits_md       = int(row[9] or 0)
+            exits_manual   = int(row[10] or 0)
+            pnl_std        = float(row[11] or 0)
+
+            win_rate     = (win_count / total_trades) if total_trades else None
+            avg_daily_pnl = total_pnl / total_trades if total_trades else 0
+            sharpe       = (avg_daily_pnl / pnl_std * (252 ** 0.5)) if pnl_std > 0 else None
+            # Max drawdown from cumulative PnL curve
+            cur.execute("""
+                SELECT net_pnl FROM trades
+                WHERE closed_at::date = %(today)s AND mode = %(mode)s AND exit_price IS NOT NULL
+                ORDER BY closed_at
+            """, {"today": today, "mode": mode})
+            pnls = [r[0] for r in cur.fetchall() if r[0] is not None]
+            max_dd = 0.0
+            if pnls:
+                peak = 0.0
+                cumulative = 0.0
+                for p in pnls:
+                    cumulative += float(p)
+                    peak = max(peak, cumulative)
+                    max_dd = max(max_dd, (peak - cumulative) / (abs(peak) + 1e-9))
+            profit_factor_val = None
+            gross_wins = sum(float(p) for p in pnls if float(p) > 0)
+            gross_losses = sum(abs(float(p)) for p in pnls if float(p) < 0)
+            if gross_losses > 0:
+                profit_factor_val = round(gross_wins / gross_losses, 4)
+
+            # ── Signal funnel today ───────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                                AS generated,
+                    SUM(CASE WHEN executed = TRUE THEN 1 ELSE 0 END)       AS executed,
+                    AVG(quality_score)                                      AS avg_quality,
+                    AVG(mention_zscore)                                     AS avg_zscore
+                FROM signals
+                WHERE created_at::date = %(today)s AND mode = %(mode)s
+            """, {"today": today, "mode": mode})
+            sig_row = cur.fetchone()
+            sig_generated = int(sig_row[0] or 0)
+            sig_executed  = int(sig_row[1] or 0)
+            avg_quality   = float(sig_row[2]) if sig_row[2] is not None else None
+            avg_zscore    = float(sig_row[3]) if sig_row[3] is not None else None
+
+        conn.close()
+
+        metrics = {
+            "total_pnl":                round(total_pnl, 2),
+            "total_trades":             total_trades,
+            "win_count":                win_count,
+            "win_rate":                 round(win_rate, 4) if win_rate is not None else None,
+            "sharpe_ratio":             round(sharpe, 4) if sharpe is not None else None,
+            "max_drawdown":             round(max_dd, 4),
+            "avg_hold_hours":           round(avg_hold_hours, 2),
+            "profit_factor":            profit_factor_val,
+            "exits_take_profit":        exits_tp,
+            "exits_time_stop":          exits_ts,
+            "exits_atr_stop":           exits_sl,   # STOP_LOSS → atr_stop column
+            "exits_trailing_stop":      exits_tr,
+            "exits_sentiment_reversal": exits_sr,
+            "exits_mention_decay":      exits_md,
+            "exits_manual":             exits_manual,
+            "signals_generated":        sig_generated,
+            "signals_executed":         sig_executed,
+            "avg_signal_quality":       round(avg_quality, 4) if avg_quality is not None else None,
+            "avg_mention_zscore":       round(avg_zscore, 2) if avg_zscore is not None else None,
+        }
+        await cfg.save_run_snapshot(metrics, mode=mode)
+        logger.info(
+            "[EOD] Snapshot saved: mode=%s trades=%d win_rate=%s total_pnl=%.2f",
+            mode, total_trades,
+            f"{win_rate:.1%}" if win_rate is not None else "—",
+            total_pnl,
+        )
+    except Exception as exc:
+        logger.error("[EOD] Failed to save session snapshot: %s", exc)
+
+
 async def _reconcile_external_closes(
     redis: aioredis.Redis,
     engine: PaperTradingEngine,
@@ -1181,6 +1333,13 @@ async def main(use_ibkr: bool = False) -> None:
     except asyncio.CancelledError:
         logger.info("Execution service stopped")
     finally:
+        # Save EOD snapshot on shutdown so every session is captured even if
+        # the service is stopped before the 16:05 window fires.
+        try:
+            cfg_final = await SystemConfig.load(redis)
+            await _save_eod_snapshot(cfg_final, mode)
+        except Exception as exc:
+            logger.error("[EOD] Shutdown snapshot failed: %s", exc)
         await redis.aclose()
 
 

@@ -223,6 +223,7 @@ class SystemConfig:
             password=os.getenv("DB_PASSWORD", ""),
         )
         config_json = json.dumps(asdict(self))
+        # UPSERT: unique constraint on (run_date, mode) prevents duplicates on restart.
         sql = """
             INSERT INTO config_runs (
                 run_date, mode, config_snapshot, config_hash,
@@ -243,6 +244,28 @@ class SystemConfig:
                 %(signals_generated)s, %(signals_executed)s,
                 %(avg_signal_quality)s, %(avg_mention_zscore)s
             )
+            ON CONFLICT (run_date, mode) DO UPDATE SET
+                config_snapshot     = EXCLUDED.config_snapshot,
+                config_hash         = EXCLUDED.config_hash,
+                total_pnl           = EXCLUDED.total_pnl,
+                total_trades        = EXCLUDED.total_trades,
+                win_count           = EXCLUDED.win_count,
+                win_rate            = EXCLUDED.win_rate,
+                sharpe_ratio        = EXCLUDED.sharpe_ratio,
+                max_drawdown        = EXCLUDED.max_drawdown,
+                avg_hold_hours      = EXCLUDED.avg_hold_hours,
+                profit_factor       = EXCLUDED.profit_factor,
+                exits_take_profit        = EXCLUDED.exits_take_profit,
+                exits_time_stop          = EXCLUDED.exits_time_stop,
+                exits_atr_stop           = EXCLUDED.exits_atr_stop,
+                exits_trailing_stop      = EXCLUDED.exits_trailing_stop,
+                exits_sentiment_reversal = EXCLUDED.exits_sentiment_reversal,
+                exits_mention_decay      = EXCLUDED.exits_mention_decay,
+                exits_manual             = EXCLUDED.exits_manual,
+                signals_generated   = EXCLUDED.signals_generated,
+                signals_executed    = EXCLUDED.signals_executed,
+                avg_signal_quality  = EXCLUDED.avg_signal_quality,
+                avg_mention_zscore  = EXCLUDED.avg_mention_zscore
         """
         params = {
             "mode": mode,
