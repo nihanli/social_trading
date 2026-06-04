@@ -461,7 +461,7 @@ with tab_sig:
     with col_p1:
         cfg.signal_phase1_threshold = st.slider(
             "Phase 1 threshold (Tier-1 sources only)", 0.2, 0.95,
-            float(cfg.signal_phase1_threshold), 0.05,
+            float(cfg.signal_phase1_threshold), 0.01,
             help=(
                 "Composite signal score (0–1) required to pass the first evaluation phase. "
                 "Scores are a weighted sum of volume Z-score, sentiment strength, proactivity, "
@@ -472,7 +472,7 @@ with tab_sig:
         )
         cfg.signal_phase2_threshold = st.slider(
             "Phase 2 threshold (Tier-1 + Tier-2 sources)", 0.2, 0.95,
-            float(cfg.signal_phase2_threshold), 0.05,
+            float(cfg.signal_phase2_threshold), 0.01,
             help=(
                 "Stricter composite score threshold applied after Tier-2 (X API) enrichment. "
                 "Only signals that re-score above this level proceed to execution. "

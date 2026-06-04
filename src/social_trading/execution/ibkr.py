@@ -384,8 +384,13 @@ class IBKRExecutionEngine:
                     oca_errors.append(f"stop: {exc}")
                     logger.error("[IBKR] OCA stop failed for %s: %s", ticker, exc)
             else:
+                # Stop cannot be placed — treat this identically to OCA_FAILED so
+                # the position is closed immediately rather than left unprotected.
+                oca_errors.append(
+                    f"stop_invalid: sl={effective_stop_loss:.4f} invalid vs fill={fill_price} ({signal.direction})"
+                )
                 logger.error(
-                    "[IBKR] OCA stop SKIPPED for %s: effective_sl=%.4f invalid vs fill=%s (%s) — position unprotected!",
+                    "[IBKR] OCA stop INVALID for %s: sl=%.4f vs fill=%s (%s) — closing to avoid unprotected position",
                     ticker, effective_stop_loss, fill_price, signal.direction,
                 )
 

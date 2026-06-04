@@ -953,11 +953,17 @@ async def _reconcile_startup(
                 pos.ticker, stop_loss, take_profit, atr,
             )
         else:
-            logger.warning(
-                "[SYNC] %s: prior-session system position but ATR unavailable — "
-                "software exits will use entry price as stop (immediate exit risk)",
-                pos.ticker, source,
+            # ATR unavailable — cannot compute a safe stop, so close immediately
+            # rather than let the position run unprotected.
+            logger.error(
+                "[SYNC] %s: prior-session system position with no ATR available — "
+                "closing to avoid running unprotected (cancel any remaining OCA orders in TWS)",
+                pos.ticker,
             )
+            try:
+                await engine.close_position(pos.ticker, reason="NO_STOP_ON_RESTART")  # type: ignore[union-attr]
+            except Exception as exc:
+                logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
 
 async def _reconcile_external_closes(
