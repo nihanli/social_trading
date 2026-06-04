@@ -38,7 +38,9 @@ from social_trading.core.events import (
     STREAM_SELECTED_SIGNALS,
     STREAM_STRATEGY_SIGNALS,
 )
-from social_trading.core.models import AccountState, Signal
+import json
+
+from social_trading.core.models import AccountState, Position, Signal
 from social_trading.monitoring.metrics import (
     SIGNALS_APPROVED,
     SIGNALS_REJECTED,
@@ -167,6 +169,7 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
     """
     Read account state from Redis hash "account:state".
     Written by execution service (Phase 5). Falls back to empty defaults.
+    Also loads open positions from positions:live so social_exposure is accurate.
     """
     raw = await redis.hgetall("account:state")
     if not raw:
@@ -182,12 +185,38 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
         v = raw.get(key) or raw.get(key.encode())
         return float(v) if v is not None else default
 
+    # Load open positions so the social_exposure concentration check works
+    open_positions: list[Position] = []
+    try:
+        pos_raw = await redis.hgetall("positions:live")
+        for val in pos_raw.values():
+            try:
+                d = json.loads(val.decode() if isinstance(val, bytes) else val)
+                open_positions.append(
+                    Position(
+                        ticker=d["ticker"],
+                        direction=d["direction"],
+                        shares=int(d["shares"]),
+                        entry_price=float(d["entry_price"]),
+                        stop_loss=float(d.get("stop_loss", 0.0)),
+                        take_profit=float(d.get("take_profit", 0.0)),
+                        opened_at=datetime.fromisoformat(d["opened_at"]) if d.get("opened_at") else datetime.now(UTC),
+                        unrealized_pnl=float(d.get("unrealized_pnl", 0.0)),
+                        high_water_mark=float(d.get("high_water_mark", 0.0)),
+                    )
+                )
+            except Exception:
+                pass  # skip malformed entries
+    except Exception:
+        pass  # Redis unavailable — proceed without position data
+
     return AccountState(
         net_liquidation=_f("net_liquidation", 100_000.0),
         cash=_f("cash", 100_000.0),
         daily_pnl=_f("daily_pnl", 0.0),
         weekly_pnl=_f("weekly_pnl", 0.0),
         drawdown_pct=_f("drawdown_pct", 0.0),
+        open_positions=open_positions,
     )
 
 
