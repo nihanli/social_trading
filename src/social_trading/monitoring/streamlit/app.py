@@ -223,7 +223,9 @@ col_left, col_right = st.columns(2)
 with col_left:
     st.subheader("Open Positions")
     positions = query("""
-        SELECT ticker, direction, shares, entry_price,
+        SELECT ticker,
+               '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+               direction, shares, entry_price,
                ROUND(unrealized_pnl::numeric, 2)      AS unrealized_pnl,
                ROUND((unrealized_pnl /
                  NULLIF(entry_price * shares, 0) * 100)::numeric, 1) AS pnl_pct,
@@ -234,7 +236,18 @@ with col_left:
     if positions.empty:
         st.info("No open positions")
     else:
-        st.dataframe(positions, width='stretch', hide_index=True)
+        st.dataframe(
+            positions,
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "chart": st.column_config.LinkColumn(
+                    "📈",
+                    help="Open chart",
+                    display_text="📈",
+                ),
+            },
+        )
         for _, row in positions.iterrows():
             if st.button(f"Close {row['ticker']}", key=f"close_{row['ticker']}"):
                 close_position(row["ticker"])
@@ -243,7 +256,9 @@ with col_left:
 with col_right:
     st.subheader("Recent Signals")
     signals = query("""
-        SELECT ticker, direction,
+        SELECT ticker,
+               '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+               direction,
                COALESCE(signal_phase, 'legacy')    AS phase,
                ROUND(confidence::numeric, 2)        AS quality,
                ROUND(sentiment_score::numeric, 2)   AS sentiment,
@@ -255,7 +270,18 @@ with col_right:
         LIMIT 20
     """)
     if not signals.empty:
-        st.dataframe(signals, width='stretch', hide_index=True)
+        st.dataframe(
+            signals,
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "chart": st.column_config.LinkColumn(
+                    "📈",
+                    help="Open chart",
+                    display_text="📈",
+                ),
+            },
+        )
     else:
         st.info("No signals recorded yet")
 
@@ -316,7 +342,9 @@ else:
 # ═══════════════════════════════════════
 st.subheader("Recent Closed Trades")
 trades = query("""
-    SELECT ticker, direction, shares, entry_price, exit_price,
+    SELECT ticker,
+           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           direction, shares, entry_price, exit_price,
            ROUND(net_pnl::numeric, 2) AS net_pnl,
            exit_reason,
            TO_CHAR(opened_at,  'MM-DD HH24:MI') AS opened,
@@ -327,7 +355,18 @@ trades = query("""
     LIMIT 30
 """)
 if not trades.empty:
-    st.dataframe(trades, width='stretch', hide_index=True)
+    st.dataframe(
+        trades,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "chart": st.column_config.LinkColumn(
+                "📈",
+                help="Open chart",
+                display_text="📈",
+            ),
+        },
+    )
 else:
     st.info("No closed trades yet")
 

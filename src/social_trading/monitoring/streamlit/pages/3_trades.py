@@ -158,7 +158,9 @@ st.divider()
 st.subheader("All Closed Trades")
 days = st.selectbox("Show last N days", [7, 30, 90, 365], index=1)
 all_trades = query(f"""
-    SELECT ticker, direction, shares,
+    SELECT ticker,
+           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           direction, shares,
            ROUND(entry_price::numeric, 2) AS entry,
            ROUND(exit_price::numeric, 2)  AS exit,
            ROUND(net_pnl::numeric, 2)     AS net_pnl,
@@ -173,7 +175,18 @@ all_trades = query(f"""
     LIMIT 500
 """)
 if not all_trades.empty:
-    st.dataframe(all_trades, width='stretch', hide_index=True)
+    st.dataframe(
+        all_trades,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "chart": st.column_config.LinkColumn(
+                "📈",
+                help="Open chart",
+                display_text="📈",
+            ),
+        },
+    )
     st.caption(f"{len(all_trades)} trades shown (max 500)")
 else:
     st.info(f"No closed {mode} trades in the last {days} days")

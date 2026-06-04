@@ -62,8 +62,10 @@ for p in raw_positions:
     shares = int(p.get("shares", 0))
     unreal = float(p.get("unrealized_pnl", 0))
     pnl_pct = round(unreal / (entry * shares) * 100, 2) if entry and shares else 0.0
+    _t = p.get("ticker", "")
     rows.append({
-        "ticker":         p.get("ticker", ""),
+        "chart":          f"/chart?ticker={_t}&tf=1M",
+        "ticker":         _t,
         "direction":      p.get("direction", ""),
         "shares":         shares,
         "entry_price":    round(entry, 2),
@@ -106,6 +108,13 @@ st.dataframe(
     positions,
     width='stretch',
     hide_index=True,
+    column_config={
+        "chart": st.column_config.LinkColumn(
+            "📈",
+            help="Open chart in new tab",
+            display_text="📈",
+        ),
+    },
 )
 
 # ── Per-position close buttons ────────────────────────────────────────────────

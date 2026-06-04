@@ -343,7 +343,9 @@ elif phase_filter != "All":
     where += f" AND signal_phase = '{phase_filter}'"
 
 full_signals = query(f"""
-    SELECT ticker, direction,
+    SELECT ticker,
+           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           direction,
            COALESCE(signal_phase, 'legacy')             AS phase,
            ROUND(confidence::numeric, 3)                AS quality,
            ROUND(sentiment_score::numeric, 3)           AS sentiment,
@@ -369,7 +371,18 @@ if not full_signals.empty:
         }.get(val, "")
 
     styled = full_signals.style.map(_phase_style, subset=["phase"])
-    st.dataframe(styled, width='stretch', hide_index=True)
+    st.dataframe(
+        styled,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "chart": st.column_config.LinkColumn(
+                "📈",
+                help="Open chart in new tab",
+                display_text="📈",
+            ),
+        },
+    )
     st.caption(f"{len(full_signals)} signals shown (max 300)")
 else:
     st.info("No signals match the current filters")
