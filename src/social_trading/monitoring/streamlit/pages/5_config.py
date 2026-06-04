@@ -737,6 +737,15 @@ with tab_risk:
                 "profitable — the ATR stop handles those. Default: 1%."
             ),
         ) / 100
+        cfg.trailing_stop_min_pct = st.slider(
+            "Trailing stop minimum (%)", 0.5, 5.0, float(cfg.trailing_stop_min_pct * 100), 0.25,
+            help=(
+                "Floor for both the ATR stop distance and the tightened trailing stop "
+                "produced by mention decay. Neither the ATR stop nor a mention-decay "
+                "tightened trail can be narrower than this. Also sets the tightest "
+                "trail used when mentions fall to the decay threshold. Default: 2%."
+            ),
+        ) / 100
         cfg.atr_multiplier = st.slider(
             "ATR stop multiplier", 0.5, 5.0, float(cfg.atr_multiplier), 0.25,
             help=(

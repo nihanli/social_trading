@@ -1,16 +1,19 @@
 """
 PositionExitManager — evaluates open positions for exit conditions.
 
-Exit rules (design §6c, evaluated in priority order):
+Exit rules (design §6b, evaluated in priority order):
   1. Single-trade loss limit  → EMERGENCY close
   2. ATR stop-loss breached   → STOP_LOSS close
   3. Take-profit target hit   → TAKE_PROFIT close
   4. Trailing stop triggered  → TRAILING_STOP close
+     (trailing_stop_pct may be tightened by mention decay in execution_service)
   5. Sentiment reversal       → SENTIMENT_REVERSAL close
-  6. Mention decay            → MENTION_DECAY close
-  7. Hard time stop           → TIME_STOP close
+  6. Hard time stop           → TIME_STOP close
 
 If multiple rules fire, the highest-priority one wins.
+
+Note: mention decay no longer produces a hard exit. Instead execution_service
+dynamically tightens trailing_stop_pct in the cfg passed to evaluate().
 
 Usage:
     manager = PositionExitManager()
@@ -37,7 +40,6 @@ ExitReason = Literal[
     "TAKE_PROFIT",
     "TRAILING_STOP",
     "SENTIMENT_REVERSAL",
-    "MENTION_DECAY",
     "TIME_STOP",
     "HOLD",
 ]
@@ -152,25 +154,7 @@ class PositionExitManager:
                     detail=f"Sentiment {current_sentiment:.3f} reversed against {position.direction}",
                 )
 
-        # ── 6. Mention decay ──────────────────────────────────────────────────
-        # Only evaluate after the minimum hold period — the spike that triggered
-        # entry will naturally decay in the very next poll window (5 min), so
-        # firing immediately produces false exits before the trade can develop.
-        if (
-            hours_held >= cfg.mention_decay_min_hold_hours
-            and mention_ratio < cfg.mention_decay_threshold
-        ):
-            return ExitDecision(
-                should_exit=True,
-                reason="MENTION_DECAY",
-                detail=(
-                    f"Mention ratio {mention_ratio:.2f} < "
-                    f"threshold {cfg.mention_decay_threshold:.2f} "
-                    f"(held {hours_held:.1f}h)"
-                ),
-            )
-
-        # ── 7. Hard time stop ─────────────────────────────────────────────────
+        # ── 6. Hard time stop ─────────────────────────────────────────────────
         if hours_held >= cfg.max_hold_hours:
             return ExitDecision(
                 should_exit=True,

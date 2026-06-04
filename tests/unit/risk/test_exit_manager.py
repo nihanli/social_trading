@@ -15,6 +15,7 @@ from social_trading.risk.exit_manager import (
     _sentiment_reversal,
     _unrealised_pnl,
 )
+from social_trading.services.execution_service import _effective_trailing_pct
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -222,45 +223,112 @@ def test_no_reversal_when_sentiment_zero(
     assert decision.should_exit is False
 
 
-# ── MENTION_DECAY ─────────────────────────────────────────────────────────────
+# ── MENTION_DECAY → trailing stop tightening ─────────────────────────────────
+# Mention decay no longer triggers a hard exit. Instead, execution_service
+# dynamically tightens trailing_stop_pct via _effective_trailing_pct().
+# The exit_manager receives the tightened cfg; the TRAILING_STOP rule fires
+# when price falls through the tightened trail.
 
-def test_mention_decay(manager: PositionExitManager, cfg: SystemConfig) -> None:
-    # Position held 2h — past the 1h minimum hold gate, so decay check runs.
-    pos = make_long(hours_ago=2)
+def test_effective_trailing_pct_full_mentions() -> None:
+    """At full mentions (ratio=1.0), no tightening — returns trailing_stop_pct."""
+    cfg = SystemConfig(
+        trailing_stop_pct=0.08,
+        trailing_stop_min_pct=0.02,
+        mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
+    )
+    result = _effective_trailing_pct(mention_ratio=1.0, hours_held=2.0, cfg=cfg)
+    assert result == pytest.approx(0.08)
+
+
+def test_effective_trailing_pct_at_threshold() -> None:
+    """At exactly the decay threshold (t=0), returns trailing_stop_min_pct."""
+    cfg = SystemConfig(
+        trailing_stop_pct=0.08,
+        trailing_stop_min_pct=0.02,
+        mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
+    )
+    result = _effective_trailing_pct(mention_ratio=0.25, hours_held=2.0, cfg=cfg)
+    assert result == pytest.approx(0.02)
+
+
+def test_effective_trailing_pct_below_threshold() -> None:
+    """Below the threshold — floor at trailing_stop_min_pct."""
+    cfg = SystemConfig(
+        trailing_stop_pct=0.08,
+        trailing_stop_min_pct=0.02,
+        mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
+    )
+    result = _effective_trailing_pct(mention_ratio=0.10, hours_held=2.0, cfg=cfg)
+    assert result == pytest.approx(0.02)
+
+
+def test_effective_trailing_pct_midpoint() -> None:
+    """
+    Midpoint between threshold and 1.0: t=0.5, effective = min + 0.5*(max-min).
+    threshold=0.25, ratio=0.625 → t = (0.625-0.25)/(1-0.25) = 0.5
+    effective = 0.02 + 0.5*(0.08-0.02) = 0.05
+    """
+    cfg = SystemConfig(
+        trailing_stop_pct=0.08,
+        trailing_stop_min_pct=0.02,
+        mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
+    )
+    result = _effective_trailing_pct(mention_ratio=0.625, hours_held=2.0, cfg=cfg)
+    assert result == pytest.approx(0.05)
+
+
+def test_effective_trailing_pct_within_min_hold() -> None:
+    """Before hold gate: no tightening regardless of mention ratio."""
+    cfg = SystemConfig(
+        trailing_stop_pct=0.08,
+        trailing_stop_min_pct=0.02,
+        mention_decay_threshold=0.25,
+        mention_decay_min_hold_hours=1.0,
+    )
+    result = _effective_trailing_pct(mention_ratio=0.05, hours_held=0.5, cfg=cfg)
+    assert result == pytest.approx(0.08)  # no tightening — hold gate not open
+
+
+def test_mention_decay_tightens_trailing_stop_exit(
+    manager: PositionExitManager, cfg: SystemConfig
+) -> None:
+    """
+    When mention decay tightens the trail via effective_cfg, a smaller price drop
+    should now trigger TRAILING_STOP that wouldn't fire at the default pct.
+
+    Default pct = 8%; tightened to 2% (min). HWM=104, position at 102.
+    Default trail: 104 * (1-0.08) = 95.68 → 102 > 95.68 → HOLD
+    Tightened trail: 104 * (1-0.02) = 101.92 → 102 > 101.92 → HOLD still
+    """
+    pos = make_long(entry_price=100.0, hwm=104.0, stop_loss=96.0, take_profit=110.0)
+    tightened_cfg = SystemConfig(
+        trailing_stop_pct=0.02,        # tightened by mention decay
+        trailing_stop_activation_pct=0.0,  # activation cleared when decaying
+        take_profit_pct=0.04,
+        max_hold_hours=48,
+        loss_limit_single_trade=0.01,
+        signal_reversal_threshold=-0.20,
+    )
+    # Price 101.9 < tightened trail 104 * 0.98 = 101.92 → TRAILING_STOP
+    decision = manager.evaluate(pos, current_price=101.9, cfg=tightened_cfg)
+    assert decision.should_exit is True
+    assert decision.reason == "TRAILING_STOP"
+
+
+def test_no_mention_decay_hard_exit(
+    manager: PositionExitManager, cfg: SystemConfig
+) -> None:
+    """MENTION_DECAY no longer exists as a hard exit reason — positions HOLD with low mentions."""
+    pos = make_long(hours_ago=2, stop_loss=96.0, take_profit=110.0)
+    # Same conditions that previously triggered MENTION_DECAY: ratio below threshold
     decision = manager.evaluate(
         pos, current_price=101.0, cfg=cfg, mention_ratio=0.10
     )
-    assert decision.should_exit is True
-    assert decision.reason == "MENTION_DECAY"
-
-
-def test_mention_decay_skipped_within_min_hold(
-    manager: PositionExitManager, cfg: SystemConfig
-) -> None:
-    """MENTION_DECAY must not fire if the position hasn't been held long enough.
-
-    This is the core fix for premature MENTION_DECAY: the spike that triggered
-    entry naturally falls in the very next poll window, so we must wait at least
-    mention_decay_min_hold_hours before evaluating decay.
-    """
-    # Position held only 10 minutes — well below the 1h minimum.
-    from datetime import timedelta
-    pos = make_long(entry_price=100.0, stop_loss=96.0, take_profit=104.0)
-    # Override opened_at to be 10 minutes ago
-    object.__setattr__(pos, "opened_at", datetime.utcnow() - timedelta(minutes=10))
-    decision = manager.evaluate(
-        pos, current_price=101.0, cfg=cfg, mention_ratio=0.05  # way below threshold
-    )
-    assert decision.should_exit is False  # decay gate not yet open
-
-
-def test_mention_ratio_above_threshold(
-    manager: PositionExitManager, cfg: SystemConfig
-) -> None:
-    pos = make_long(hours_ago=2)
-    decision = manager.evaluate(
-        pos, current_price=101.0, cfg=cfg, mention_ratio=0.50
-    )
+    # Should HOLD — mention decay only tightens the trail, does not force exit
     assert decision.should_exit is False
 
 

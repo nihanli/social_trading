@@ -73,6 +73,7 @@ class IBKRExecutionEngine:
         self._prices: dict[str, float] = {}
         self._hwm: dict[str, float] = {}      # high-water marks for trailing stops (LONG: max, SHORT: min)
         self._hwm_min: dict[str, float] = {}  # separate min tracker for SHORT positions
+        self._ts_order_id: dict[str, int] = {}  # trailing stop OCA order IDs per ticker
         # Persisted position params: stop_loss, take_profit, opened_at per ticker.
         # Restored from Redis on restart so exit rules work correctly.
         self._position_params: dict[str, dict] = {}
@@ -136,6 +137,7 @@ class IBKRExecutionEngine:
         """Remove all in-memory state for a ticker that was closed externally (e.g. IB bracket fill)."""
         self._hwm.pop(ticker, None)
         self._hwm_min.pop(ticker, None)
+        self._ts_order_id.pop(ticker, None)
         self._position_params.pop(ticker, None)
 
     @property
@@ -150,6 +152,8 @@ class IBKRExecutionEngine:
         stop_loss: float,
         take_profit: float,
         take_profit_pct: float = 0.04,
+        trailing_stop_pct: float = 0.08,
+        trailing_stop_min_pct: float = 0.02,
     ) -> OrderResult:
         """
         Submit a market entry order, wait for IB acknowledgement, then attach
@@ -321,9 +325,10 @@ class IBKRExecutionEngine:
             # side of the fill, causing the software exit loop to close immediately.
             effective_stop_loss = stop_loss
             if fill_price and not _sl_valid(fill_price):
-                # SL is on the wrong side of fill — recompute from fill using ATR offset
-                # back-calculated from the original SL distance.
-                original_offset = abs(stop_loss - (entry_price or fill_price))
+                # SL is on the wrong side of fill — recompute from fill using the
+                # ATR offset back-calculated from the original SL distance.
+                # Use fill_price as the reference anchor (entry_price not in scope here).
+                original_offset = abs(stop_loss - fill_price)
                 if signal.direction == "LONG":
                     effective_stop_loss = round(fill_price - original_offset, 2)
                 else:
@@ -336,6 +341,28 @@ class IBKRExecutionEngine:
                 pass  # original SL is still valid relative to fill
             # If fill_price is None (delayed fill), keep original — will be rechecked
             # by exit loop once price updates arrive.
+
+            # Apply trailing_stop_min_pct floor to ATR stop distance.
+            # Prevents stops that are tighter than the minimum trailing stop,
+            # which would make the ATR stop fire before the trail ever activates.
+            if fill_price and fill_price > 0 and effective_stop_loss > 0:
+                min_stop_distance = fill_price * trailing_stop_min_pct
+                if signal.direction == "LONG":
+                    min_sl = round(fill_price - min_stop_distance, 2)
+                    if effective_stop_loss > min_sl:
+                        logger.debug(
+                            "[IBKR] ATR stop %.4f tighter than min floor %.4f for %s — applying floor",
+                            effective_stop_loss, min_sl, ticker,
+                        )
+                        effective_stop_loss = min_sl
+                else:
+                    min_sl = round(fill_price + min_stop_distance, 2)
+                    if effective_stop_loss < min_sl:
+                        logger.debug(
+                            "[IBKR] ATR stop %.4f tighter than min floor %.4f for %s — applying floor",
+                            effective_stop_loss, min_sl, ticker,
+                        )
+                        effective_stop_loss = min_sl
 
             effective_take_profit = take_profit
             if fill_price and not _tp_valid(fill_price):
@@ -419,6 +446,55 @@ class IBKRExecutionEngine:
                     take_profit,
                 )
 
+            # ── 3c. OCA trailing stop (TRAIL) ────────────────────────────────
+            # Third leg of the OCA bracket. Percentage-based trail — IB anchors
+            # automatically from current market price at fill and re-anchors as
+            # price moves. No trailStopPrice needed for initial placement.
+            # Skip if ATR stop is already tighter than the initial trail trigger.
+            initial_trail_trigger = None
+            if fill_price and fill_price > 0:
+                if signal.direction == "LONG":
+                    initial_trail_trigger = fill_price * (1.0 - trailing_stop_pct)
+                else:
+                    initial_trail_trigger = fill_price * (1.0 + trailing_stop_pct)
+
+            atr_stop_subsumed = (
+                fill_price is not None
+                and initial_trail_trigger is not None
+                and effective_stop_loss > 0
+                and (
+                    (signal.direction == "LONG"  and initial_trail_trigger >= effective_stop_loss)
+                    or (signal.direction == "SHORT" and initial_trail_trigger <= effective_stop_loss)
+                )
+            )
+
+            try:
+                from ib_async import Order as _IbOrder  # noqa: PLC0415
+                trail_order = _IbOrder()
+                trail_order.action          = close_action
+                trail_order.totalQuantity   = quantity
+                trail_order.orderType       = "TRAIL"
+                trail_order.trailingPercent = trailing_stop_pct * 100  # e.g. 8.0 for 8%
+                trail_order.tif             = "GTC"
+                trail_order.ocaGroup        = oca_group
+                trail_order.ocaType         = 1
+                trail_order.transmit        = True
+                trail_order.orderRef        = ORDER_REF
+                if self._account:
+                    trail_order.account = self._account
+                ts_trade = self._ib.placeOrder(contract, trail_order)
+                oca_trades.append(ts_trade)
+                self._ts_order_id[ticker] = ts_trade.order.orderId
+                logger.info(
+                    "[IBKR] OCA trail placed: %s trail_pct=%.1f%% orderId=%d%s",
+                    ticker, trailing_stop_pct * 100, ts_trade.order.orderId,
+                    " (ATR stop subsumed)" if atr_stop_subsumed else "",
+                )
+            except Exception as exc:
+                # Trail order failure is non-fatal — ATR stop and TP limit
+                # remain active, and the software exit loop also covers trail.
+                logger.error("[IBKR] OCA trail failed for %s: %s", ticker, exc)
+
             # Flush OCA messages to IB and allow acknowledgement callbacks to fire
             if oca_trades:
                 await asyncio.sleep(0.5)
@@ -452,6 +528,8 @@ class IBKRExecutionEngine:
                 "opened_at": opened_at_dt.isoformat(),
                 "direction": signal.direction,
                 "source": "system",
+                "trailing_stop_pct_applied": trailing_stop_pct,
+                "oca_group": oca_group,
             }
             return OrderResult(
                 order_id=str(entry_id),
@@ -539,6 +617,7 @@ class IBKRExecutionEngine:
             # Clean up in-memory state so re-entry on same ticker starts fresh
             self._hwm.pop(ticker, None)
             self._hwm_min.pop(ticker, None)
+            self._ts_order_id.pop(ticker, None)
             self._position_params.pop(ticker, None)
 
             logger.info("[IBKR] CLOSE %s qty=%d reason=%s fill=%.4f",
@@ -562,6 +641,106 @@ class IBKRExecutionEngine:
                 status="rejected",
                 error=str(exc),
             )
+
+    async def update_trailing_stop(self, ticker: str, new_pct: float) -> bool:
+        """
+        Replace the live TRAIL OCA order with a tighter one anchored from the HWM.
+
+        Used when mention decay tightens the trailing stop (Rule 6 dynamic tightening).
+        The new order uses trailingPercent + trailStopPrice (anchored to HWM) so that
+        profit already locked in by the HWM is preserved, not reset to current price.
+
+        Returns True if the replacement was placed, False on any error.
+        """
+        if not _IB_AVAILABLE:
+            return False
+
+        from ib_async import Order as _IbOrder, Stock  # noqa: PLC0415
+
+        old_order_id = self._ts_order_id.get(ticker)
+        params = self._position_params.get(ticker, {})
+        direction: str = params.get("direction", "LONG")
+
+        try:
+            # Cancel the existing TRAIL order
+            if old_order_id is not None:
+                for trade in self._ib.openTrades():
+                    if trade.order.orderId == old_order_id:
+                        self._ib.cancelOrder(trade.order)
+                        logger.debug(
+                            "[IBKR] Cancelled old TRAIL order %d for %s",
+                            old_order_id, ticker,
+                        )
+                        break
+
+            # Determine current HWM — LONG uses max, SHORT uses min
+            if direction == "LONG":
+                hwm = self._hwm.get(ticker, 0.0)
+                close_action = "SELL"
+            else:
+                hwm = self._hwm_min.get(ticker, 0.0)
+                close_action = "BUY"
+
+            if hwm <= 0.0:
+                logger.warning(
+                    "[IBKR] update_trailing_stop: HWM=0 for %s — cannot anchor trail", ticker
+                )
+                return False
+
+            # Look up quantity from current IB position
+            qty = 0
+            for p in self._ib.positions():
+                if p.contract.symbol == ticker:
+                    qty = abs(int(p.position))
+                    break
+            if qty == 0:
+                logger.warning(
+                    "[IBKR] update_trailing_stop: no open position found for %s", ticker
+                )
+                return False
+
+            # Preserve OCA group from position params so IB links correctly
+            oca_group = params.get("oca_group", "")
+
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+
+            trail_order = _IbOrder()
+            trail_order.action          = close_action
+            trail_order.totalQuantity   = qty
+            trail_order.orderType       = "TRAIL"
+            trail_order.trailingPercent = new_pct * 100   # e.g. 5.0 for 5%
+            # Anchor initial trigger from HWM so locked-in profit is preserved.
+            # LONG: trigger = hwm * (1 - pct); SHORT: trigger = hwm * (1 + pct)
+            if direction == "LONG":
+                trail_order.trailStopPrice = round(hwm * (1.0 - new_pct), 2)
+            else:
+                trail_order.trailStopPrice = round(hwm * (1.0 + new_pct), 2)
+            trail_order.tif      = "GTC"
+            trail_order.transmit = True
+            trail_order.orderRef = ORDER_REF
+            if oca_group:
+                trail_order.ocaGroup = oca_group
+                trail_order.ocaType  = 1
+            if self._account:
+                trail_order.account = self._account
+
+            ts_trade = self._ib.placeOrder(contract, trail_order)
+            await asyncio.sleep(0.25)
+            self._ts_order_id[ticker] = ts_trade.order.orderId
+            if ticker in self._position_params:
+                self._position_params[ticker]["trailing_stop_pct_applied"] = new_pct
+
+            logger.info(
+                "[IBKR] TRAIL updated %s new_pct=%.1f%% trigger=%.4f orderId=%d (HWM=%.4f)",
+                ticker, new_pct * 100, trail_order.trailStopPrice,
+                ts_trade.order.orderId, hwm,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error("[IBKR] update_trailing_stop failed for %s: %s", ticker, exc)
+            return False
 
     async def get_positions(self) -> list[Position]:
         """Return open positions from IBKR as Position objects.

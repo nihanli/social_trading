@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -317,6 +318,8 @@ async def run_trade_loop(
                         stop_loss=stop_loss,
                         take_profit=take_profit,
                         take_profit_pct=cfg.take_profit_pct,
+                        trailing_stop_pct=cfg.trailing_stop_pct,
+                        trailing_stop_min_pct=cfg.trailing_stop_min_pct,
                     )
 
                     if result.status in ("filled", "submitted"):
@@ -427,6 +430,8 @@ async def run_exit_loop(
     # Tracks tickers that were open at the end of the previous cycle.
     # Used to detect positions closed externally by IB between cycles.
     _prev_open_tickers: set[str] = set()
+    # Tracks the last trailing_stop_pct applied per ticker (for change detection).
+    _trailing_pct_applied: dict[str, float] = {}
 
     while True:
         try:
@@ -547,8 +552,39 @@ async def run_exit_loop(
             for pos in open_positions:
                 current_price = engine.get_price(pos.ticker) or pos.entry_price
                 sentiment, mention_ratio = await _get_sentiment_context(redis, pos.ticker, cfg=cfg)
+
+                # ── Mention-decay trailing stop tightening (Rule 6) ───────────
+                hours_held = (now - pos.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
+                effective_pct = _effective_trailing_pct(mention_ratio, hours_held, cfg)
+                last_applied = _trailing_pct_applied.get(pos.ticker, cfg.trailing_stop_pct)
+
+                if abs(effective_pct - last_applied) >= 0.005:  # 0.5% noise gate
+                    if hasattr(engine, "update_trailing_stop"):
+                        await engine.update_trailing_stop(pos.ticker, effective_pct)
+                    _trailing_pct_applied[pos.ticker] = effective_pct
+                    logger.info(
+                        "[TRAIL] %s tightened trailing stop %.1f%% → %.1f%% "
+                        "(mention_ratio=%.2f)",
+                        pos.ticker, last_applied * 100, effective_pct * 100, mention_ratio,
+                    )
+
+                # Build effective cfg with tightened trailing stop for exit manager.
+                # When decaying, also clear the activation gate so the tightened
+                # trail fires unconditionally without requiring a profit threshold.
+                decaying = mention_ratio < cfg.mention_decay_threshold
+                if abs(effective_pct - cfg.trailing_stop_pct) > 1e-9:
+                    effective_cfg = dataclasses.replace(
+                        cfg,
+                        trailing_stop_pct=effective_pct,
+                        trailing_stop_activation_pct=(
+                            0.0 if decaying else cfg.trailing_stop_activation_pct
+                        ),
+                    )
+                else:
+                    effective_cfg = cfg
+
                 decision = exit_manager.evaluate(
-                    pos, current_price, cfg,
+                    pos, current_price, effective_cfg,
                     current_sentiment=sentiment,
                     mention_ratio=mention_ratio,
                     now=now,
@@ -556,6 +592,7 @@ async def run_exit_loop(
                 if decision.should_exit:
                     await engine.close_position(pos.ticker, reason=decision.reason)
                     just_closed.add(pos.ticker)
+                    _trailing_pct_applied.pop(pos.ticker, None)
                     await _publish_execution_event(redis, "position_closed", {
                         "ticker": pos.ticker,
                         "exit_price": current_price,
@@ -701,6 +738,41 @@ async def _get_sentiment_context(
         pass
 
     return current_sentiment, mention_ratio
+
+
+def _effective_trailing_pct(
+    mention_ratio: float,
+    hours_held: float,
+    cfg: SystemConfig,
+) -> float:
+    """
+    Compute the effective trailing stop percentage for a position based on mention decay.
+
+    Design §6b Rule 6: linearly interpolates trailing_stop_pct down to
+    trailing_stop_min_pct as mentions decay from peak to threshold.
+
+    Formula:
+        t = clamp((mention_ratio - threshold) / (1 - threshold), 0, 1)
+        effective_pct = min_pct + t * (max_pct - min_pct)
+
+    Only applied after mention_decay_min_hold_hours to avoid false tightening
+    from the natural decay of the entry spike in the first poll window.
+
+    Returns cfg.trailing_stop_pct (no tightening) when not yet past the hold gate.
+    """
+    if hours_held < cfg.mention_decay_min_hold_hours:
+        return cfg.trailing_stop_pct
+
+    threshold = cfg.mention_decay_threshold
+    max_pct = cfg.trailing_stop_pct
+    min_pct = cfg.trailing_stop_min_pct
+
+    if threshold >= 1.0:
+        return max_pct  # degenerate config — avoid divide-by-zero
+
+    t = (mention_ratio - threshold) / (1.0 - threshold)
+    t = max(0.0, min(1.0, t))  # clamp to [0, 1]
+    return min_pct + t * (max_pct - min_pct)
 
 
 async def _write_market_snapshot_and_get_price(

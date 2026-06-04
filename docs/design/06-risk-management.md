@@ -49,68 +49,209 @@ def calculate_position_size(
 [^14]: Lim, Zohren & Roberts (2019). "Enhancing Time-Series Momentum Strategies Using Deep Neural Networks." arXiv:1904.04912. *Journal of Financial Data Science*
 [^15]: Carver, R. qoppac.blogspot.com — "Kelly versus Classical Portfolio Theory": s* = min(μ/σ, s_max); Half-Kelly = 0.5 × Sharpe Ratio
 
-### 6b. Stop-Loss Strategy
+### 6b. Exit Rules
+
+Position exit is managed at two levels: a **hardware bracket** placed on the IB server at entry
+(operates even if the service is offline), and a **software exit loop** that runs every 60 s and
+evaluates additional rules that IB cannot natively express.
+
+---
+
+#### OCA Bracket (Server-side, placed at entry)
+
+When a position is filled, three closing orders are placed into a single OCA (One-Cancels-All)
+group on the IB server. If any one fires, IB cancels the other two automatically.
+
+| Leg | Order type | Purpose |
+|-----|-----------|---------|
+| ATR stop | `STOP` at `fill_price ± N × ATR` | Hard floor; fires immediately if price gaps through stop |
+| Take-profit | `LIMIT` at `fill_price × (1 + take_profit_pct)` | Lock in profit target |
+| Trailing stop | `TRAIL` with `trailingPercent` | Protect profits as price rises |
+
+**ATR stop distance floor (`trailing_stop_min_pct`):**  
+If the ATR-derived stop distance is narrower than `cfg.trailing_stop_min_pct`, the ATR stop is
+raised to exactly `fill_price × (1 − trailing_stop_min_pct)` for LONG (lowered for SHORT).  
+This prevents overly tight stops on low-volatility days.
+
+**ATR stop leg skipped when trailing stop is already tighter:**  
+If the initial trailing stop trigger  
+`fill_price × (1 − trailing_stop_pct)` ≥ `effective_stop_loss` (LONG),  
+the ATR stop leg is omitted — the trailing stop subsumes it from the start.
+
+**Trailing stop — initial placement:**
 
 ```python
-from config.system_config import SystemConfig
-from datetime import datetime
-import redis
-
-class PositionExitManager:
-    """Multi-trigger exit for social media momentum positions. All thresholds from SystemConfig."""
-
-    def __init__(self, entry_price: float, entry_time: datetime,
-                 entry_sentiment: float, entry_mentions: int,
-                 cfg: SystemConfig = None):
-        self.entry_price    = entry_price
-        self.entry_time     = entry_time
-        self.entry_sentiment = entry_sentiment
-        self.peak_mentions  = entry_mentions
-        self.high_water_mark = entry_price
-
-        cfg = cfg or SystemConfig.load(redis.Redis())
-        self.atr_multiplier            = cfg.atr_multiplier
-        self.max_hold_hours            = cfg.max_hold_hours
-        self.trailing_stop_pct         = cfg.trailing_stop_pct
-        self.take_profit_pct           = cfg.take_profit_pct
-        self.signal_reversal_threshold = cfg.signal_reversal_threshold
-        self.mention_decay_threshold   = cfg.mention_decay_threshold
-
-    def should_exit(self, current_price: float, current_atr: float,
-                    current_sentiment: float, current_mentions: int,
-                    current_time: datetime) -> tuple[bool, str]:
-
-        # 1. ATR-based stop loss
-        atr_stop = self.entry_price - self.atr_multiplier * current_atr
-        if current_price <= atr_stop:
-            return True, f"ATR_STOP (price={current_price:.2f} < stop={atr_stop:.2f})"
-
-        # 2. Take profit
-        profit_pct = (current_price - self.entry_price) / self.entry_price
-        if profit_pct >= self.take_profit_pct:
-            return True, f"TAKE_PROFIT (+{profit_pct:.1%})"
-
-        # 3. Time-based stop (critical for social media alpha decay)
-        hours_held = (current_time - self.entry_time).total_seconds() / 3600
-        if hours_held >= self.max_hold_hours:
-            return True, f"TIME_STOP ({hours_held:.0f}h ≥ {self.max_hold_hours}h)"
-
-        # 4. Trailing stop (protect profits)
-        self.high_water_mark = max(self.high_water_mark, current_price)
-        trailing_stop = self.high_water_mark * (1 - self.trailing_stop_pct)
-        if current_price <= trailing_stop and profit_pct > 0:
-            return True, f"TRAILING_STOP (from HWM {self.high_water_mark:.2f})"
-
-        # 5. Sentiment reversal
-        if current_sentiment < self.signal_reversal_threshold and self.entry_sentiment > 0:
-            return True, f"SENTIMENT_REVERSAL (was {self.entry_sentiment:.2f}, now {current_sentiment:.2f})"
-
-        # 6. Mention decay — hype is dying
-        if current_mentions < self.peak_mentions * self.mention_decay_threshold:
-            return True, f"MENTION_DECAY ({current_mentions} < {self.peak_mentions * self.mention_decay_threshold:.0f})"
-
-        return False, "HOLD"
+trail_order.orderType       = "TRAIL"
+trail_order.trailingPercent = cfg.trailing_stop_pct * 100   # e.g. 8.0 for 8%
+# No trailStopPrice needed — IB anchors automatically from current market price at fill
 ```
+
+IB internally tracks `trigger = best_price_seen × (1 − pct/100)` for SELL TRAIL.  
+The percentage re-anchors automatically as price moves — no stale dollar amount.
+
+**Fill-price recomputation:**  
+All three legs are recomputed from the actual IB fill price, not the signal's estimated entry.  
+For the ATR stop: `effective_stop_loss = fill_price ± original_ATR_offset`.
+
+---
+
+#### Software Exit Rules (evaluated every 60 s per position)
+
+Exit rules are evaluated in priority order. The first match wins.
+
+**Rule 1 — Emergency single-trade loss limit**
+
+> Only active when `stop_loss = 0` (no ATR stop could be placed at entry). Acts as a last-resort
+> safety net for otherwise unprotected positions.
+
+```
+condition:  stop_loss == 0  AND  loss_pct > cfg.loss_limit_single_trade
+action:     EMERGENCY close
+default:    loss_limit_single_trade = 1%
+```
+
+**Rule 2 — ATR stop-loss**
+
+> Software mirror of the IB OCA stop leg. Fires if price crosses the ATR stop level recorded in
+> `position.stop_loss`. Skipped if `stop_loss = 0` (position reconciled after restart without ATR
+> data — the IB OCA order on the server handles it).
+
+```
+LONG:   condition  current_price <= position.stop_loss
+SHORT:  condition  current_price >= position.stop_loss
+action: STOP_LOSS close
+params: atr_multiplier = 2.0 (stop = entry ± N × ATR)
+```
+
+**Rule 3 — Take-profit**
+
+> Software mirror of the IB OCA limit leg. Fires if price reaches or exceeds the take-profit level
+> recorded in `position.take_profit`. Skipped if `take_profit = 0`.
+
+```
+LONG:   condition  current_price >= position.take_profit
+SHORT:  condition  current_price <= position.take_profit
+action: TAKE_PROFIT close
+params: take_profit_pct = 4%  (take_profit = fill × (1 + take_profit_pct))
+```
+
+**Rule 4 — Trailing stop (software)**
+
+> Software mirror / paper-mode equivalent of the IB OCA trailing stop leg.
+> The trailing stop **only activates** once the position has moved at least
+> `trailing_stop_activation_pct` into profit — preventing it from acting as an
+> alternative first stop on positions that never moved in the intended direction
+> (Rule 2 handles those). HWM = high-water mark.
+
+```
+LONG:   activate when  HWM >= entry × (1 + trailing_stop_activation_pct)
+        trigger at     HWM × (1 − trailing_stop_pct_applied)
+SHORT:  activate when  HWM <= entry × (1 − trailing_stop_activation_pct)
+        trigger at     HWM × (1 + trailing_stop_pct_applied)
+action: TRAILING_STOP close
+params: trailing_stop_pct = 8%   (default; tightened dynamically by Rule 6 below)
+        trailing_stop_activation_pct = 1%
+        trailing_stop_min_pct = 2%   (floor — neither ATR nor trailing stop can be tighter than this)
+```
+
+`trailing_stop_pct_applied` is the **effective** trailing pct for this position, which may be
+narrower than `cfg.trailing_stop_pct` if mention decay has tightened it (see Rule 6).
+
+**Rule 5 — Sentiment reversal**
+
+> Exits when aggregated sentiment has crossed from bullish to strongly bearish (LONG) or vice-versa.
+> Skipped when sentiment data is unavailable (`current_sentiment = 0.0`).
+
+```
+LONG:   condition  current_sentiment < cfg.signal_reversal_threshold   (e.g. < −0.20)
+SHORT:  condition  current_sentiment > −cfg.signal_reversal_threshold  (e.g. >  +0.20)
+action: SENTIMENT_REVERSAL close
+params: signal_reversal_threshold = −0.20
+```
+
+**Rule 6 — Mention-decay trailing stop tightening**
+
+> When social media mentions decay, the position's trailing stop is tightened dynamically.
+> Rather than hard-exiting on mention decay, the trailing stop % is reduced proportionally —
+> locking in more profit as the catalyst fades, while letting a strong price trend continue.
+>
+> Rule 6 does **not** produce a direct exit. Instead it feeds a tighter `trailing_stop_pct_applied`
+> into Rule 4 (and updates the live IB TRAIL order). The position exits naturally through Rule 4
+> once price falls through the tightened trail.
+
+**Tightening formula:**
+
+```
+mention_ratio = smoothed_current_mentions / peak_mentions
+                (smoothed over cfg.mention_decay_smooth_samples windows)
+
+t = clamp((mention_ratio − mention_decay_threshold) / (1 − mention_decay_threshold), 0, 1)
+    # t = 1.0  → mentions at full peak  (use max/default trailing pct)
+    # t = 0.0  → mentions at or below threshold (use min trailing pct)
+
+effective_pct = trailing_stop_min_pct + t × (trailing_stop_pct − trailing_stop_min_pct)
+```
+
+Rule 6 is only evaluated after `mention_decay_min_hold_hours` to avoid false triggers from the
+natural decay of the entry spike.
+
+An update is applied when `|effective_pct − trailing_stop_pct_applied| >= 0.5%` (hardcoded
+noise gate to avoid excessive IB order churn).
+
+**IB live mode — updating the TRAIL order:**
+
+When the trailing stop tightens, the existing TRAIL order is cancelled and a new one placed,
+anchored from the current HWM to preserve locked-in profit:
+
+```python
+trail_order.trailingPercent = new_pct * 100             # e.g. 5.0 for 5%
+trail_order.trailStopPrice  = hwm * (1 - new_pct)       # LONG: anchor initial trigger from HWM
+# SHORT: hwm * (1 + new_pct)
+```
+
+Using both fields is intentional: `trailingPercent` keeps the trail percentage-based going forward;
+`trailStopPrice` ensures IB starts the trigger from the HWM (not from the current lower price),
+so profit already locked in by the HWM is preserved.
+
+When mention decay is active (`t < 1`), `trailing_stop_activation_pct` is set to `0.0` in the
+effective config — the tightened trailing stop is unconditional and does not require the activation
+threshold.
+
+```
+params: mention_decay_threshold         = 0.25  (fraction of peak; below this → maximum tightening)
+        mention_decay_min_hold_hours    = 1.0   (don't fire until held this long)
+        mention_decay_smooth_samples    = 3     (windows to average mention ratio)
+        trailing_stop_min_pct           = 2%    (floor for tightened trailing stop)
+```
+
+**Rule 7 — Hard time stop**
+
+> Unconditional exit after `max_hold_hours`. Social media alpha is ephemeral; positions held too
+> long are driven by fundamentals, not the original catalyst.
+
+```
+condition:  hours_held >= cfg.max_hold_hours
+action:     TIME_STOP close
+params:     max_hold_hours = 48
+```
+
+---
+
+#### Exit Rule Summary
+
+| # | Name | Trigger | IB hardware? | Software? |
+|---|------|---------|:---:|:---:|
+| 1 | Emergency loss | `loss_pct > 1%` AND no ATR stop | — | ✓ |
+| 2 | ATR stop-loss | price crosses `fill ± N×ATR` | ✓ OCA STOP | ✓ mirror |
+| 3 | Take-profit | price reaches `fill × (1+TP%)` | ✓ OCA LIMIT | ✓ mirror |
+| 4 | Trailing stop | price drops `trail_pct%` from HWM | ✓ OCA TRAIL | ✓ mirror |
+| 5 | Sentiment reversal | sentiment crosses threshold | — | ✓ |
+| 6 | Mention decay tightening | tightens Rule 4 trail dynamically | TRAIL update | param update |
+| 7 | Hard time stop | held > `max_hold_hours` | — | ✓ |
+
+Rules 2–4 are mirrored: IB OCA fires if the service is offline; software closes if IB already
+cancelled the OCA (e.g. partial fill). The OCA group name `oca_{entry_id}` is preserved across
+TRAIL order replacements so IB can cancel the other legs correctly.
 
 ### 6c. Circuit Breakers (Portfolio Level)
 
