@@ -30,6 +30,8 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
+from social_trading.monitoring.streamlit.utils.company_info import enrich_tickers
+from social_trading.monitoring.streamlit.utils.table_html import render_table
 
 st.set_page_config(page_title="Positions", page_icon="📂", layout="wide")
 st_autorefresh(interval=5_000, key="positions_refresh")   # 5s — Redis is real-time
@@ -78,6 +80,9 @@ for p in raw_positions:
 
 positions = pd.DataFrame(rows).sort_values("unrealized_pnl", ascending=False)
 
+# Enrich for tooltips and chart hover
+_pos_tooltips = enrich_tickers(positions["ticker"].tolist()) if not positions.empty else {}
+
 # KPI row
 total_unrealized = positions["unrealized_pnl"].sum()
 c1, c2, c3 = st.columns(3)
@@ -89,6 +94,16 @@ c3.metric(
 )
 
 # P&L bar chart
+if not positions.empty:
+    _customdata = [
+        [_pos_tooltips.get(t, t), e, s]
+        for t, e, s in zip(
+            positions["ticker"], positions["entry_price"], positions["shares"]
+        )
+    ]
+else:
+    _customdata = []
+
 fig = px.bar(
     positions,
     x="ticker",
@@ -99,22 +114,24 @@ fig = px.bar(
     title="Unrealized P&L by Position",
     labels={"unrealized_pnl": "P&L (USD)", "ticker": "Ticker"},
 )
-fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+fig.update_traces(
+    texttemplate="%{text:.1f}%",
+    textposition="outside",
+    customdata=_customdata,
+    hovertemplate=(
+        "<b>%{x}</b>  <i>%{customdata[0]}</i><br>"
+        "P&L: $%{y:,.2f}<br>"
+        "Entry: $%{customdata[1]:.2f}  ×  %{customdata[2]} shares<extra></extra>"
+    ),
+)
 fig.update_layout(height=300, margin={"t": 40, "b": 10})
 st.plotly_chart(fig, width='stretch')
 
-# Positions table
-st.dataframe(
+# Positions table — hover over ticker cell for company name
+render_table(
     positions,
-    width='stretch',
-    hide_index=True,
-    column_config={
-        "chart": st.column_config.LinkColumn(
-            "📈",
-            help="Open chart in new tab",
-            display_text="📈",
-        ),
-    },
+    tooltips={"ticker": _pos_tooltips},
+    link_cols={"chart": ("📈", "_blank")},
 )
 
 # ── Per-position close buttons ────────────────────────────────────────────────

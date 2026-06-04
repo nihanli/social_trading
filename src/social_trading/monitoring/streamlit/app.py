@@ -40,6 +40,8 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
+from social_trading.monitoring.streamlit.utils.company_info import enrich_tickers
+from social_trading.monitoring.streamlit.utils.table_html import render_table
 
 st.set_page_config(
     page_title="Social Trading Monitor",
@@ -236,17 +238,11 @@ with col_left:
     if positions.empty:
         st.info("No open positions")
     else:
-        st.dataframe(
+        _pos_tips = enrich_tickers(positions["ticker"].tolist())
+        render_table(
             positions,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "chart": st.column_config.LinkColumn(
-                    "📈",
-                    help="Open chart",
-                    display_text="📈",
-                ),
-            },
+            tooltips={"ticker": _pos_tips},
+            link_cols={"chart": ("📈", "_blank")},
         )
         for _, row in positions.iterrows():
             if st.button(f"Close {row['ticker']}", key=f"close_{row['ticker']}"):
@@ -270,17 +266,16 @@ with col_right:
         LIMIT 20
     """)
     if not signals.empty:
-        st.dataframe(
+        _sig_tips = enrich_tickers(signals["ticker"].unique().tolist())
+        render_table(
             signals,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "chart": st.column_config.LinkColumn(
-                    "📈",
-                    help="Open chart",
-                    display_text="📈",
-                ),
-            },
+            tooltips={"ticker": _sig_tips},
+            link_cols={"chart": ("📈", "_blank")},
+            cell_styles={"phase": {
+                "phase1": "color:#4A90D9;font-weight:bold",
+                "phase2": "color:#2ECC71;font-weight:bold",
+                "legacy": "color:#95A5A6",
+            }},
         )
     else:
         st.info("No signals recorded yet")
@@ -355,17 +350,11 @@ trades = query("""
     LIMIT 30
 """)
 if not trades.empty:
-    st.dataframe(
+    _trade_tips = enrich_tickers(trades["ticker"].unique().tolist())
+    render_table(
         trades,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "chart": st.column_config.LinkColumn(
-                "📈",
-                help="Open chart",
-                display_text="📈",
-            ),
-        },
+        tooltips={"ticker": _trade_tips},
+        link_cols={"chart": ("📈", "_blank")},
     )
 else:
     st.info("No closed trades yet")

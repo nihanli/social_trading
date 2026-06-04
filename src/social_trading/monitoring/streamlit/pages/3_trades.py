@@ -24,6 +24,8 @@ from social_trading.monitoring.streamlit.utils.db import query, localize_datetim
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
+from social_trading.monitoring.streamlit.utils.company_info import enrich_tickers
+from social_trading.monitoring.streamlit.utils.table_html import render_table
 
 st.set_page_config(page_title="Trade Analytics", page_icon="📊", layout="wide")
 st_autorefresh(interval=15_000, key="trades_refresh")
@@ -175,17 +177,11 @@ all_trades = query(f"""
     LIMIT 500
 """)
 if not all_trades.empty:
-    st.dataframe(
+    _trade_names = enrich_tickers(all_trades["ticker"].unique().tolist())
+    render_table(
         all_trades,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "chart": st.column_config.LinkColumn(
-                "📈",
-                help="Open chart",
-                display_text="📈",
-            ),
-        },
+        tooltips={"ticker": _trade_names},
+        link_cols={"chart": ("📈", "_blank")},
     )
     st.caption(f"{len(all_trades)} trades shown (max 500)")
 else:

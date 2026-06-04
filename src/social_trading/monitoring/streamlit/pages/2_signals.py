@@ -28,6 +28,8 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
 )
+from social_trading.monitoring.streamlit.utils.company_info import enrich_tickers
+from social_trading.monitoring.streamlit.utils.table_html import render_table
 
 st.set_page_config(page_title="Signal Feed", page_icon="⚡", layout="wide")
 st_autorefresh(interval=15_000, key="signals_refresh")
@@ -362,26 +364,17 @@ full_signals = query(f"""
 """)
 
 if not full_signals.empty:
-    # Colour-code the phase column via styling
-    def _phase_style(val: str) -> str:
-        return {
-            "phase1": "color: #4A90D9; font-weight: bold",
-            "phase2": "color: #2ECC71; font-weight: bold",
-            "legacy": "color: #95A5A6",
-        }.get(val, "")
+    _sig_names = enrich_tickers(full_signals["ticker"].unique().tolist())
 
-    styled = full_signals.style.map(_phase_style, subset=["phase"])
-    st.dataframe(
-        styled,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "chart": st.column_config.LinkColumn(
-                "📈",
-                help="Open chart in new tab",
-                display_text="📈",
-            ),
-        },
+    render_table(
+        full_signals,
+        tooltips={"ticker": _sig_names},
+        link_cols={"chart": ("📈", "_blank")},
+        cell_styles={"phase": {
+            "phase1": "color:#4A90D9;font-weight:bold",
+            "phase2": "color:#2ECC71;font-weight:bold",
+            "legacy": "color:#95A5A6",
+        }},
     )
     st.caption(f"{len(full_signals)} signals shown (max 300)")
 else:

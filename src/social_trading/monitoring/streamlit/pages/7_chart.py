@@ -26,6 +26,7 @@ from social_trading.monitoring.streamlit.utils.chart_data import (
     fetch_ohlcv,
     TIMEFRAMES,
 )
+from social_trading.monitoring.streamlit.utils.company_info import get_company_info
 
 st.set_page_config(
     page_title="Ticker Chart",
@@ -73,6 +74,16 @@ with ctrl_col3:
 if ticker:
     st.query_params["ticker"] = ticker
     st.query_params["tf"]     = timeframe
+
+# ── Company info header ────────────────────────────────────────────────────────
+_cinfo = get_company_info(ticker)
+if _cinfo["name"]:
+    _label_parts = [f"**{_cinfo['name']}**"]
+    if _cinfo["sector"]:
+        _label_parts.append(f"_{_cinfo['sector']}_")
+    st.markdown("  ·  ".join(_label_parts))
+    if _cinfo["short_summary"]:
+        st.caption(_cinfo["short_summary"])
 
 # ── Fetch OHLCV ────────────────────────────────────────────────────────────────
 if not ticker:
