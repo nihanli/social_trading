@@ -204,11 +204,13 @@ def _write_signals(rows: list[dict]) -> int:
                             INSERT INTO signals
                                 (timestamp, ticker, strategy, direction,
                                  confidence, sentiment_score, mention_zscore,
-                                 quality_score, signal_phase, generated_at)
+                                 quality_score, signal_phase, generated_at,
+                                 momentum, convergence, proactivity)
                             VALUES (%(ts)s, %(ticker)s, %(strategy)s,
                                     %(direction)s, %(confidence)s,
                                     %(sentiment_score)s, %(mention_zscore)s,
-                                    %(quality_score)s, %(signal_phase)s, %(ts)s)
+                                    %(quality_score)s, %(signal_phase)s, %(ts)s,
+                                    %(momentum)s, %(convergence)s, %(proactivity)s)
                             """,
                             {
                                 "ts": r.get("generated_at") or datetime.now(UTC).isoformat(),
@@ -220,6 +222,12 @@ def _write_signals(rows: list[dict]) -> int:
                                 "mention_zscore": _float(r.get("volume_z_score", 0)),
                                 "quality_score": _float(r.get("quality_score", 0)),
                                 "signal_phase": r.get("signal_phase") or None,
+                                # momentum=0 means "no market data" → store NULL to distinguish
+                                # from a genuinely flat price; convergence/proactivity are always
+                                # meaningful numbers so store them as-is (never coerce to NULL).
+                                "momentum": _float(r.get("momentum")) or None,
+                                "convergence": _float(r.get("convergence")),
+                                "proactivity": _float(r.get("proactivity"), default=1.0),
                             },
                         )
                         inserted += cur.rowcount

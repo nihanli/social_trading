@@ -6,6 +6,7 @@ Shows:
   - Signal quality distribution (7 days) split by phase
   - Signal volume per hour (3 days) by direction
   - Phase funnel: phase1 candidates → phase2 signals → approved → executed
+  - Quality score factor breakdown (v, s, p, m, c) for recent signals
   - Full searchable/filterable signal table with phase column
 """
 from __future__ import annotations
@@ -182,6 +183,117 @@ if not funnel_df.empty and funnel_df.iloc[0]["total"] > 0:
 
 st.divider()
 
+# ── Quality score factor breakdown ────────────────────────────────────────────
+st.subheader("Quality Score Factor Breakdown")
+st.caption(
+    "**Quality = w_volume × V + w_sentiment × S + w_proactivity × P "
+    "+ w_momentum × M + w_convergence × C** (each factor normalised to [0, 1], "
+    "then divided by active-weight sum)"
+)
+
+# Pull recent signals with all stored factor columns
+factor_df = query("""
+    SELECT ticker,
+           COALESCE(signal_phase, 'legacy')                    AS phase,
+           direction,
+           ROUND(confidence::numeric, 3)                       AS quality,
+           -- v: vol Z-score normalised to [0,1] (Z=3 → 1.0)
+           ROUND(LEAST(GREATEST(mention_zscore / 3.0, 0), 1)::numeric, 3) AS v_volume,
+           -- s: |sentiment_score| capped at 1
+           ROUND(LEAST(ABS(sentiment_score), 1)::numeric, 3)   AS s_sentiment,
+           -- p: proactivity (1=led price, 0=reactive); NULL for pre-migration rows → show as 1
+           ROUND(COALESCE(proactivity, 1)::numeric, 3)         AS p_proactivity,
+           -- m: |momentum| / 0.10 capped at 1 (NULL → market data unavailable)
+           ROUND(LEAST(ABS(COALESCE(momentum, 0)) / 0.10, 1)::numeric, 3) AS m_momentum,
+           -- c: convergence (fraction × bonus, 0 = single source or no agreement)
+           ROUND(COALESCE(convergence, 0)::numeric, 3)         AS c_convergence,
+           momentum IS NULL                                     AS no_market_data,
+           TO_CHAR(generated_at, 'MM-DD HH24:MI')              AS time
+    FROM signals
+    WHERE generated_at > NOW() - INTERVAL '2 days'
+    ORDER BY generated_at DESC
+    LIMIT 50
+""")
+
+if not factor_df.empty:
+    # ── Average factor contributions chart ───────────────────────────────────
+    factor_cols = ["v_volume", "s_sentiment", "p_proactivity", "m_momentum", "c_convergence"]
+    factor_means = factor_df[factor_cols].mean()
+    factor_labels = {
+        "v_volume":      "V — Volume Z",
+        "s_sentiment":   "S — Sentiment",
+        "p_proactivity": "P — Proactivity",
+        "m_momentum":    "M — Momentum",
+        "c_convergence": "C — Convergence",
+    }
+    factor_means_display = {factor_labels[k]: float(v) for k, v in factor_means.items()}
+
+    import pandas as pd
+    bar_df = pd.DataFrame({
+        "Factor": list(factor_means_display.keys()),
+        "Avg Value (0–1)": list(factor_means_display.values()),
+    })
+    no_mkt = factor_df["no_market_data"].sum() if "no_market_data" in factor_df.columns else 0
+    title_note = f" — ⚠️ {no_mkt}/{len(factor_df)} signals had no market data (M=0)" if no_mkt else ""
+    bar_fig = px.bar(
+        bar_df,
+        x="Factor",
+        y="Avg Value (0–1)",
+        color="Factor",
+        title=f"Average Factor Values — Last 2 Days (up to 50 signals){title_note}",
+        color_discrete_sequence=["#4A90D9", "#2ECC71", "#F39C12", "#E74C3C", "#9B59B6"],
+        text_auto=".2f",
+    )
+    bar_fig.update_layout(
+        height=300,
+        margin={"t": 40, "b": 10},
+        showlegend=False,
+        yaxis={"range": [0, 1.05]},
+    )
+    st.plotly_chart(bar_fig, use_container_width=True)
+
+    # ── Per-signal factor heatmap (most recent 30) ────────────────────────────
+    with st.expander("Per-signal factor heatmap (latest 30)", expanded=False):
+        heatmap_df = factor_df.head(30).copy()
+        heatmap_df["label"] = heatmap_df["ticker"] + " " + heatmap_df["time"]
+        heat_data = heatmap_df.set_index("label")[
+            ["v_volume", "s_sentiment", "p_proactivity", "m_momentum", "c_convergence"]
+        ].rename(columns={
+            "v_volume":      "V Volume",
+            "s_sentiment":   "S Sentiment",
+            "p_proactivity": "P Proactivity",
+            "m_momentum":    "M Momentum",
+            "c_convergence": "C Convergence",
+        })
+        heat_fig = px.imshow(
+            heat_data,
+            color_continuous_scale="Blues",
+            zmin=0, zmax=1,
+            aspect="auto",
+            title="Quality Factor Heatmap (0=low, 1=high)",
+            labels={"color": "Factor value"},
+        )
+        heat_fig.update_layout(height=max(300, 20 * len(heat_data)), margin={"t": 40, "b": 10})
+        st.plotly_chart(heat_fig, use_container_width=True)
+
+    # ── Factor table ──────────────────────────────────────────────────────────
+    with st.expander("Factor detail table", expanded=False):
+        st.dataframe(
+            factor_df.drop(columns=["no_market_data"], errors="ignore").rename(columns={
+                "v_volume":      "V (vol-z)",
+                "s_sentiment":   "S (sentiment)",
+                "p_proactivity": "P (proactivity)",
+                "m_momentum":    "M (momentum)",
+                "c_convergence": "C (convergence)",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+else:
+    st.info("No signal data in the last 2 days")
+
+st.divider()
+
 # ── Phase breakdown over time (daily, 14 days) ────────────────────────────────
 phase_trend = query("""
     SELECT DATE_TRUNC('day', generated_at)::date AS day,
@@ -232,10 +344,13 @@ elif phase_filter != "All":
 
 full_signals = query(f"""
     SELECT ticker, direction,
-           COALESCE(signal_phase, 'legacy')        AS phase,
-           ROUND(confidence::numeric, 3)           AS quality,
-           ROUND(sentiment_score::numeric, 3)      AS sentiment,
-           ROUND(mention_zscore::numeric, 2)       AS vol_z,
+           COALESCE(signal_phase, 'legacy')             AS phase,
+           ROUND(confidence::numeric, 3)                AS quality,
+           ROUND(sentiment_score::numeric, 3)           AS sentiment,
+           ROUND(mention_zscore::numeric, 2)            AS vol_z,
+           ROUND(COALESCE(proactivity, 1)::numeric, 1)      AS proactivity,
+           ROUND(COALESCE(momentum, 0)::numeric, 4)         AS momentum,
+           ROUND(COALESCE(convergence, 0)::numeric, 3)      AS convergence,
            approved, executed,
            TO_CHAR(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS time
     FROM signals

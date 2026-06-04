@@ -138,6 +138,7 @@ class SignalGenerator:
             volume_z_score=round(volume_zscore, 4),
             momentum=round(price_momentum, 4),
             convergence=round(c, 4),
+            proactivity=p,
             source_post_count=stats.post_count,
             generated_at=datetime.now(UTC),
             metadata={

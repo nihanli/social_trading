@@ -119,6 +119,7 @@ def _signal_to_stream_dict(sig: Signal) -> dict[str, str]:
         "volume_z_score": str(sig.volume_z_score),
         "momentum": str(sig.momentum),
         "convergence": str(sig.convergence),
+        "proactivity": str(sig.proactivity),
         "source_post_count": str(sig.source_post_count),
         "generated_at": sig.generated_at.isoformat(),
         "signal_phase": sig.signal_phase or "",

@@ -78,6 +78,7 @@ class Signal(BaseModel):
     volume_z_score: float            # mentions vs 7-day baseline
     momentum: float                  # recent price change
     convergence: float               # fraction of sources agreeing [0, 1]
+    proactivity: float = 1.0         # 1.0 = signal led price; 0.0 = reactive (price moved first)
     source_post_count: int
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = Field(default_factory=dict)

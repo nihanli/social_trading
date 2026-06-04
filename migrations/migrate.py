@@ -35,6 +35,7 @@ def get_connection() -> psycopg2.extensions.connection:
         dbname=os.getenv("DB_NAME", "trading"),
         user=os.getenv("DB_USER", "trader"),
         password=os.getenv("DB_PASSWORD", ""),
+        connect_timeout=10,
     )
 
 
@@ -79,6 +80,11 @@ if __name__ == "__main__":
     try:
         run_migrations()
     except psycopg2.OperationalError as exc:
-        print(f"ERROR: Cannot connect to database — {exc}", file=sys.stderr)
-        print("Is postgres running? Try: make up", file=sys.stderr)
+        msg = str(exc).strip()
+        if "lock timeout" in msg:
+            print(f"ERROR: Table lock timeout — the application is holding a lock on the signals table.", file=sys.stderr)
+            print("Stop the signal service first, then re-run: python migrations/migrate.py", file=sys.stderr)
+        else:
+            print(f"ERROR: Cannot connect to database — {exc}", file=sys.stderr)
+            print("Is postgres running? Try: make up", file=sys.stderr)
         sys.exit(1)
