@@ -863,6 +863,7 @@ async def _reconcile_startup(
     if not hasattr(engine, "get_position_params"):
         return  # Paper engine — no IB to reconcile against
     params = engine.get_position_params()  # type: ignore[union-attr]
+    cfg = await SystemConfig.load(redis)
     try:
         current = await engine.get_positions()
         current_tickers = {p.ticker for p in current}
@@ -929,11 +930,11 @@ async def _reconcile_startup(
 
         if atr > 0 and pos.entry_price > 0:
             if pos.direction == "LONG":
-                stop_loss = round(pos.entry_price - 2.0 * atr, 2)
-                take_profit = round(pos.entry_price + 3.0 * atr, 2)
+                stop_loss = round(pos.entry_price - cfg.atr_multiplier * atr, 2)
+                take_profit = round(pos.entry_price * (1.0 + cfg.take_profit_pct), 2)
             else:
-                stop_loss = round(pos.entry_price + 2.0 * atr, 2)
-                take_profit = round(pos.entry_price - 3.0 * atr, 2)
+                stop_loss = round(pos.entry_price + cfg.atr_multiplier * atr, 2)
+                take_profit = round(pos.entry_price * (1.0 - cfg.take_profit_pct), 2)
             seeded_params: dict = {
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,

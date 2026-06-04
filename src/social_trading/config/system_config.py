@@ -95,6 +95,7 @@ class SystemConfig:
     atr_multiplier: float = 2.0             # stop: entry ± N × ATR
     max_hold_hours: int = 48               # hard time stop
     trailing_stop_pct: float = 0.08        # trailing stop from high-water mark
+    trailing_stop_activation_pct: float = 0.01  # trailing stop only activates once position is this % in profit
     take_profit_pct: float = 0.04          # take profit target
     signal_reversal_threshold: float = -0.20
     mention_decay_threshold: float = 0.25  # exit when smoothed mentions drop to this fraction of peak

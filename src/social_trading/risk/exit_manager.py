@@ -225,16 +225,31 @@ def _breaches_trailing_stop(
     For LONG: trails the maximum price seen since entry.
     For SHORT: trails the minimum price seen since entry.
     HWM of 0.0 means not yet initialised — skip check.
+
+    The trailing stop only activates once the position has moved into profit by
+    at least cfg.trailing_stop_activation_pct (default 1%).  This prevents the
+    trailing stop from acting as an alternative first stop-loss on positions that
+    never moved in the intended direction — the ATR stop handles those.
     """
     hwm = position.high_water_mark
     if hwm == 0.0:
         return False
 
+    entry = position.entry_price
+    if entry <= 0:
+        return False
+
     if position.direction == "LONG":
+        # Only activate once price has risen at least activation_pct above entry
+        if hwm < entry * (1.0 + cfg.trailing_stop_activation_pct):
+            return False
         trailing_stop = hwm * (1.0 - cfg.trailing_stop_pct)
         return current_price <= trailing_stop
 
-    # SHORT: HWM is lowest price seen
+    # SHORT: HWM is the lowest price seen; only activate once price dropped
+    # at least activation_pct below entry
+    if hwm > entry * (1.0 - cfg.trailing_stop_activation_pct):
+        return False
     trailing_stop = hwm * (1.0 + cfg.trailing_stop_pct)
     return current_price >= trailing_stop
 

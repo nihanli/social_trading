@@ -335,6 +335,18 @@ async def run_risk_service(
                 take_profit = sizer.take_profit_price(
                     signal.direction, entry_price, cfg
                 )
+
+                # Guard: stop-loss must be a valid positive price
+                if stop_loss <= 0:
+                    logger.info(
+                        "REJECTED (sl_invalid) %s: entry=%.2f ATR=%.4f → sl=%.2f ≤ 0",
+                        signal.ticker, entry_price, atr, stop_loss,
+                    )
+                    rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="sl_invalid").inc()
+                    await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
+                    continue
+
                 stream_dict = _approved_signal_to_stream_dict(
                     signal, shares, stop_loss, take_profit
                 )

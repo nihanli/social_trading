@@ -71,7 +71,8 @@ class IBKRExecutionEngine:
         self._account = account  # IB account number, e.g. "DU123456" (paper) or "U123456" (live)
         self._paper_prices = paper_prices or {}
         self._prices: dict[str, float] = {}
-        self._hwm: dict[str, float] = {}  # high-water marks for trailing stops
+        self._hwm: dict[str, float] = {}      # high-water marks for trailing stops (LONG: max, SHORT: min)
+        self._hwm_min: dict[str, float] = {}  # separate min tracker for SHORT positions
         # Persisted position params: stop_loss, take_profit, opened_at per ticker.
         # Restored from Redis on restart so exit rules work correctly.
         self._position_params: dict[str, dict] = {}
@@ -101,15 +102,12 @@ class IBKRExecutionEngine:
     def set_price(self, ticker: str, price: float) -> None:
         """Cache latest price and update high-water mark for trailing stop."""
         self._prices[ticker] = price
-        # Ratchet HWM: for LONG track maximum, for SHORT track minimum.
-        # Direction unknown here, so we track both candidates; get_positions()
-        # applies the correct one when building Position objects.
-        prev = self._hwm.get(ticker)
-        if prev is None:
-            self._hwm[ticker] = price
-        else:
-            # Store the maximum seen — get_positions flips for SHORT
-            self._hwm[ticker] = max(prev, price)
+        # Track both max (LONG HWM) and min (SHORT HWM) independently.
+        # get_positions() selects the correct one based on direction.
+        prev_max = self._hwm.get(ticker)
+        self._hwm[ticker] = price if prev_max is None else max(prev_max, price)
+        prev_min = self._hwm_min.get(ticker)
+        self._hwm_min[ticker] = price if prev_min is None else min(prev_min, price)
 
     def get_price(self, ticker: str) -> float | None:
         return self._prices.get(ticker)
@@ -122,6 +120,8 @@ class IBKRExecutionEngine:
         """Restore a persisted HWM value; only applies when not already tracked."""
         if ticker not in self._hwm:
             self._hwm[ticker] = value
+        if ticker not in self._hwm_min:
+            self._hwm_min[ticker] = value
 
     def get_position_params(self) -> dict[str, dict]:
         """Return a snapshot of persisted position params (sl/tp/opened_at)."""
@@ -135,6 +135,7 @@ class IBKRExecutionEngine:
     def forget_position(self, ticker: str) -> None:
         """Remove all in-memory state for a ticker that was closed externally (e.g. IB bracket fill)."""
         self._hwm.pop(ticker, None)
+        self._hwm_min.pop(ticker, None)
         self._position_params.pop(ticker, None)
 
     @property
@@ -314,9 +315,28 @@ class IBKRExecutionEngine:
                     or (signal.direction == "SHORT" and take_profit < fp)
                 )
 
-            # If fill price is known and the pre-computed TP is stale (wrong side
-            # of fill due to spike slippage between signal approval and fill),
-            # recompute TP from the actual fill price so the OCA leg is always placed.
+            # If fill price is known, recompute both SL and TP from the actual fill
+            # to correct for slippage between signal approval and execution.
+            # A stale SL (computed from pre-approval price) can be on the wrong
+            # side of the fill, causing the software exit loop to close immediately.
+            effective_stop_loss = stop_loss
+            if fill_price and not _sl_valid(fill_price):
+                # SL is on the wrong side of fill — recompute from fill using ATR offset
+                # back-calculated from the original SL distance.
+                original_offset = abs(stop_loss - (entry_price or fill_price))
+                if signal.direction == "LONG":
+                    effective_stop_loss = round(fill_price - original_offset, 2)
+                else:
+                    effective_stop_loss = round(fill_price + original_offset, 2)
+                logger.warning(
+                    "[IBKR] SL %.4f stale vs fill %.4f (%s) — recomputed to %.4f",
+                    stop_loss, fill_price, signal.direction, effective_stop_loss,
+                )
+            elif fill_price and _sl_valid(fill_price) and stop_loss != effective_stop_loss:
+                pass  # original SL is still valid relative to fill
+            # If fill_price is None (delayed fill), keep original — will be rechecked
+            # by exit loop once price updates arrive.
+
             effective_take_profit = take_profit
             if fill_price and not _tp_valid(fill_price):
                 if signal.direction == "LONG":
@@ -332,13 +352,24 @@ class IBKRExecutionEngine:
             oca_errors: list[str] = []
             oca_trades = []
 
-            if _sl_valid(fill_price):
+            # Re-check SL validity using effective (possibly recomputed) stop
+            def _sl_effective_valid(fp: float | None) -> bool:
+                if effective_stop_loss <= 0:
+                    return False
+                if fp is None:
+                    return True
+                return (
+                    (signal.direction == "LONG"  and effective_stop_loss < fp)
+                    or (signal.direction == "SHORT" and effective_stop_loss > fp)
+                )
+
+            if _sl_effective_valid(fill_price):
                 try:
-                    stop_order = StopOrder(close_action, quantity, round(stop_loss, 2))
+                    stop_order = StopOrder(close_action, quantity, round(effective_stop_loss, 2))
                     stop_order.ocaGroup   = oca_group
                     stop_order.ocaType    = 1     # cancel sibling on fill
                     stop_order.tif        = "GTC" # persist until triggered or cancelled
-                    stop_order.outsideRth = True  # trigger in after-hours (protective stop)
+                    stop_order.outsideRth = False # regular hours only — premarket/AH prints can be thin
                     stop_order.transmit   = True
                     stop_order.orderRef   = ORDER_REF
                     if self._account:
@@ -347,15 +378,15 @@ class IBKRExecutionEngine:
                     oca_trades.append(sl_trade)
                     logger.info(
                         "[IBKR] OCA stop placed: %s sl=%.4f orderId=%d",
-                        ticker, stop_loss, sl_trade.order.orderId,
+                        ticker, effective_stop_loss, sl_trade.order.orderId,
                     )
                 except Exception as exc:
                     oca_errors.append(f"stop: {exc}")
                     logger.error("[IBKR] OCA stop failed for %s: %s", ticker, exc)
             else:
-                logger.warning(
-                    "[IBKR] stop_loss=%.4f invalid vs fill=%s (%s) — OCA stop skipped",
-                    stop_loss, fill_price, signal.direction,
+                logger.error(
+                    "[IBKR] OCA stop SKIPPED for %s: effective_sl=%.4f invalid vs fill=%s (%s) — position unprotected!",
+                    ticker, effective_stop_loss, fill_price, signal.direction,
                 )
 
             if effective_take_profit > 0:
@@ -411,7 +442,7 @@ class IBKRExecutionEngine:
 
             # Save position params so exit rules work correctly after restart
             self._position_params[ticker] = {
-                "stop_loss": stop_loss,
+                "stop_loss": effective_stop_loss,
                 "take_profit": effective_take_profit,
                 "opened_at": opened_at_dt.isoformat(),
                 "direction": signal.direction,
@@ -502,6 +533,7 @@ class IBKRExecutionEngine:
 
             # Clean up in-memory state so re-entry on same ticker starts fresh
             self._hwm.pop(ticker, None)
+            self._hwm_min.pop(ticker, None)
             self._position_params.pop(ticker, None)
 
             logger.info("[IBKR] CLOSE %s qty=%d reason=%s fill=%.4f",
@@ -553,13 +585,13 @@ class IBKRExecutionEngine:
             if ticker not in self._hwm:
                 current = self._prices.get(ticker, entry_price)
                 self._hwm[ticker] = current
+                self._hwm_min[ticker] = current
 
-            # Apply correct HWM polarity: LONG tracks max, SHORT tracks min
-            raw_hwm = self._hwm.get(ticker, entry_price)
-            if direction == "SHORT":
-                current_price = self._prices.get(ticker, entry_price)
-                raw_hwm = min(raw_hwm, current_price) if raw_hwm != entry_price else current_price
-                self._hwm[ticker] = raw_hwm
+            # Select correct HWM polarity: LONG tracks max, SHORT tracks min
+            if direction == "LONG":
+                raw_hwm = self._hwm.get(ticker, entry_price)
+            else:
+                raw_hwm = self._hwm_min.get(ticker, entry_price)
 
             # Restore persisted position params (sl/tp/opened_at)
             params = self._position_params.get(ticker, {})
