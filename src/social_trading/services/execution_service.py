@@ -157,6 +157,12 @@ async def _write_positions_to_redis(
     """
     Sync open positions to positions:live Redis hash.
     Called each exit-loop cycle so the persistence service and UI see current state.
+
+    Merge strategy: shows the union of (IB cache positions) ∪ (params-known system
+    positions).  If the IB cache is stale and missing a ticker that params says
+    should be open, it is still shown (using params data) so it never silently
+    disappears from the UI.  The reconcile at next startup will clean up any
+    positions that are genuinely closed.
     """
     try:
         positions = await engine.get_positions()
@@ -178,50 +184,79 @@ async def _write_positions_to_redis(
                 )
                 return
 
-        # Only publish positions that this system opened — manual IB positions
-        # are managed elsewhere and must not appear in system UI or be
-        # subject to system exit rules.
+        # Build index of IB positions for O(1) lookup.
+        ib_by_ticker = {pos.ticker: pos for pos in positions}
+
+        # Load all system-managed params from Redis.
         all_params_raw = await redis.hgetall(_POSITION_PARAMS_KEY)
-        system_tickers: set[str] = set()
-        params_by_ticker: dict[str, dict] = {}
+        system_params: dict[str, dict] = {}
         for k, v in all_params_raw.items():
             ticker_key = k.decode() if isinstance(k, bytes) else k
             try:
                 p = json.loads(v.decode() if isinstance(v, bytes) else v)
                 if p.get("source", "system") == "system":
-                    system_tickers.add(ticker_key)
-                    params_by_ticker[ticker_key] = p
+                    system_params[ticker_key] = p
             except Exception:
                 pass
 
+        # Union: all tickers that are either in IB cache OR in params (system).
+        # IB-only tickers (manual) are excluded since they have no params entry.
+        all_system_tickers = set(system_params)
+
+        # Any IB position whose ticker is in system_params is included.
+        # Any system_params ticker NOT in IB cache is included with params data
+        # and flagged so the UI knows the cache may be stale for that ticker.
         pipe = redis.pipeline()
         pipe.delete(_POSITIONS_LIVE_KEY)
-        for pos in positions:
-            if pos.ticker not in system_tickers:
-                logger.debug(
-                    "[POSITIONS] Skipping %s — not a system-managed position",
-                    pos.ticker,
-                )
-                continue
-            current_price = engine.get_price(pos.ticker) or pos.entry_price
-            if pos.direction == "LONG":
-                computed_upnl = (current_price - pos.entry_price) * pos.shares
+        for ticker in all_system_tickers:
+            pos = ib_by_ticker.get(ticker)
+            params = system_params[ticker]
+
+            if pos is not None:
+                # Normal path — IB cache has this position.
+                current_price = engine.get_price(ticker) or pos.entry_price
+                if pos.direction == "LONG":
+                    computed_upnl = (current_price - pos.entry_price) * pos.shares
+                else:
+                    computed_upnl = (pos.entry_price - current_price) * pos.shares
+                unrealized_pnl = pos.unrealized_pnl if pos.unrealized_pnl != 0.0 else computed_upnl
+                pipe.hset(_POSITIONS_LIVE_KEY, ticker, json.dumps({
+                    "ticker": ticker,
+                    "direction": pos.direction,
+                    "shares": pos.shares,
+                    "entry_price": pos.entry_price,
+                    "stop_loss": pos.stop_loss,
+                    "take_profit": pos.take_profit,
+                    "unrealized_pnl": round(unrealized_pnl, 2),
+                    "high_water_mark": pos.high_water_mark,
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+                    "source": "system",
+                }))
             else:
-                computed_upnl = (pos.entry_price - current_price) * pos.shares
-            # Prefer IB's native unrealizedPNL when available (non-zero)
-            unrealized_pnl = pos.unrealized_pnl if pos.unrealized_pnl != 0.0 else computed_upnl
-            pipe.hset(_POSITIONS_LIVE_KEY, pos.ticker, json.dumps({
-                "ticker": pos.ticker,
-                "direction": pos.direction,
-                "shares": pos.shares,
-                "entry_price": pos.entry_price,
-                "stop_loss": pos.stop_loss,
-                "take_profit": pos.take_profit,
-                "unrealized_pnl": round(unrealized_pnl, 2),
-                "high_water_mark": pos.high_water_mark,
-                "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
-                "source": "system",
-            }))
+                # IB cache is missing this ticker — params say it should be open.
+                # Show it with params data so it doesn't silently vanish from the UI.
+                # The periodic reqPositionsAsync() refresh will correct this within
+                # _IB_CACHE_REFRESH_SECS; the next startup reconcile will clean up
+                # any that are genuinely closed.
+                logger.warning(
+                    "[POSITIONS] %s in position:params (source=system) but absent from "
+                    "IB position cache — showing with params data (cache may be stale)",
+                    ticker,
+                )
+                entry_price = float(params.get("stop_loss", 0.0))  # best available
+                pipe.hset(_POSITIONS_LIVE_KEY, ticker, json.dumps({
+                    "ticker": ticker,
+                    "direction": params.get("direction", "LONG"),
+                    "shares": 0,          # unknown until cache refreshes
+                    "entry_price": 0.0,   # unknown until cache refreshes
+                    "stop_loss": float(params.get("stop_loss", 0.0)),
+                    "take_profit": float(params.get("take_profit", 0.0)),
+                    "unrealized_pnl": None,
+                    "high_water_mark": None,
+                    "opened_at": params.get("opened_at"),
+                    "source": "system",
+                    "ib_cache_missing": True,
+                }))
         await pipe.execute()
     except Exception as exc:
         logger.warning("[POSITIONS] Failed to write positions:live: %s", exc)
@@ -467,6 +502,11 @@ async def run_exit_loop(
                 except (ValueError, TypeError):
                     pass
 
+    # Track when the IB position cache was last refreshed so we can force a
+    # reqPositionsAsync() periodically to prevent cache drift.
+    _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
+    _last_ib_cache_refresh: float = 0.0
+
     while True:
         try:
             cfg = await SystemConfig.load(redis)
@@ -478,6 +518,19 @@ async def run_exit_loop(
                 )
                 await asyncio.sleep(cfg.signal_poll_interval_sec)
                 continue
+
+            # ── 1b. Periodic IB position cache refresh ────────────────────────
+            # ib_async caches positions locally and updates them via fill events.
+            # If fills are missed (e.g. during a reconnect window) the cache drifts.
+            # Force reqPositionsAsync() every 5 minutes to stay current.
+            now_ts = asyncio.get_event_loop().time()
+            if hasattr(engine, "_ib") and (now_ts - _last_ib_cache_refresh) > _IB_CACHE_REFRESH_SECS:
+                try:
+                    await engine._ib.reqPositionsAsync()  # type: ignore[union-attr]
+                    _last_ib_cache_refresh = now_ts
+                    logger.debug("[SYNC] IB position cache refreshed")
+                except Exception as exc:
+                    logger.debug("[SYNC] IB position cache refresh failed: %s", exc)
 
             # Fetch VIX once per cycle (shared across all ticker snapshots)
             vix = await market_data.get_vix()
@@ -1013,6 +1066,7 @@ async def _persist_trail_orders_to_redis(
 async def _reconcile_startup(
     redis: aioredis.Redis,
     engine: PaperTradingEngine,
+    mode: str = "paper",
 ) -> None:
     """
     Compare Redis position:params against IB's current positions on startup.
@@ -1031,25 +1085,98 @@ async def _reconcile_startup(
         return  # Paper engine — no IB to reconcile against
     params = engine.get_position_params()  # type: ignore[union-attr]
     cfg = await SystemConfig.load(redis)
+
+    # Retry up to 3 times — IB may be briefly unavailable on startup
+    # (TWS initialising, nightly restart window, etc.)
+    current: list = []
+    _max_attempts = 3
+    _retry_delay = 5.0
+    for _attempt in range(_max_attempts):
+        try:
+            current = await engine.get_positions()
+            break
+        except Exception as exc:
+            if _attempt < _max_attempts - 1:
+                logger.warning(
+                    "[SYNC] IB unavailable (attempt %d/%d): %s — retrying in %.0fs",
+                    _attempt + 1, _max_attempts, exc, _retry_delay,
+                )
+                await asyncio.sleep(_retry_delay)
+            else:
+                logger.error(
+                    "[SYNC] Startup reconciliation aborted after %d attempts — IB unreachable: %s",
+                    _max_attempts, exc,
+                )
+                return
+    current_tickers = {p.ticker for p in current}
+
+    # ── Build fill cache from IB for today's executions (best-effort) ─────────
+    # reqExecutionsAsync() fetches today's executions from IB's server — more
+    # complete than ib.fills() which only holds fills received since connectAsync.
+    # Keyed by (symbol, close_side) → most recent fill price for that symbol.
+    _offline_fills: dict[str, float] = {}
     try:
-        current = await engine.get_positions()
-        current_tickers = {p.ticker for p in current}
+        ib_obj = getattr(engine, "_ib", None)
+        if ib_obj is not None:
+            from ib_async import ExecutionFilter  # noqa: PLC0415
+            executions = await ib_obj.reqExecutionsAsync(ExecutionFilter())
+            for fill in executions:
+                sym = getattr(getattr(fill, "contract", None), "symbol", "")
+                side = getattr(getattr(fill, "execution", None), "side", "")
+                price = getattr(getattr(fill, "execution", None), "price", 0.0)
+                if sym and price:
+                    _offline_fills[f"{sym}:{side}"] = float(price)
     except Exception as exc:
-        logger.warning("[SYNC] Startup reconciliation skipped — IB unavailable: %s", exc)
-        return
+        logger.debug("[SYNC] Could not prefetch today's executions: %s", exc)
 
     # Tickers in persisted params but no longer in IB were closed while offline.
     orphaned = set(params) - current_tickers
     for ticker in orphaned:
+        # Read params before deleting so we can record the close event
+        p = params.get(ticker, {})
+        opened_at = p.get("opened_at", datetime.now(UTC).isoformat())
+        direction = p.get("direction", "unknown")
+        entry_price = float(p.get("entry_price", 0.0))
+        shares = int(p.get("shares", 0))
+        stop_loss = float(p.get("stop_loss", 0.0))
+        take_profit = float(p.get("take_profit", 0.0))
+
+        # Try to get exit price from today's execution history
+        close_side = "SLD" if direction == "LONG" else "BOT"
+        exit_price = _offline_fills.get(f"{ticker}:{close_side}", 0.0)
+
+        # Infer exit reason if we have fill price and known levels
+        exit_reason = "IB_EXTERNAL"
+        if exit_price > 0 and stop_loss > 0 and take_profit > 0:
+            sl_dist = abs(exit_price - stop_loss)
+            tp_dist = abs(exit_price - take_profit)
+            tolerance = exit_price * 0.005
+            if sl_dist <= tolerance or sl_dist < tp_dist * 0.5:
+                exit_reason = "STOP_LOSS"
+            elif tp_dist <= tolerance or tp_dist < sl_dist * 0.5:
+                exit_reason = "TAKE_PROFIT"
+            else:
+                exit_reason = "TRAILING_STOP"
+
         engine.forget_position(ticker)  # type: ignore[union-attr]
         await redis.hdel(_HWM_REDIS_KEY, ticker)
         await redis.hdel(_POSITION_PARAMS_KEY, ticker)
         await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
         logger.warning(
-            "[SYNC] %s: found in persisted state but not in IB — "
-            "likely closed while service was offline; cleaned up",
-            ticker,
+            "[SYNC] %s: closed while offline — reason=%s exit_price=%.4f; cleaned up",
+            ticker, exit_reason, exit_price,
         )
+        await _publish_execution_event(redis, "position_closed", {
+            "ticker": ticker,
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+            "direction": direction,
+            "entry_price": entry_price,
+            "shares": shares,
+            "closed_at": datetime.now(UTC).isoformat(),
+            "opened_at": opened_at,
+            "mode": mode,
+        })
 
     orphaned_in_ib = current_tickers - set(params)
 
@@ -1146,6 +1273,20 @@ async def _reconcile_startup(
                 pos.ticker,
                 json.dumps(seeded_params),
             )
+            # Publish position_opened so persistence_service creates a trades DB row.
+            # Guard with a Redis NX key so repeated restarts don't create duplicate rows.
+            _adoption_flag = f"position:adopted:{pos.ticker}:{seeded_params['opened_at']}"
+            if await redis.set(_adoption_flag, "1", nx=True, ex=86400 * 90):
+                await _publish_execution_event(redis, "position_opened", {
+                    "ticker": pos.ticker,
+                    "direction": pos.direction,
+                    "shares": pos.shares,
+                    "entry_price": pos.entry_price,
+                    "stop_price": stop_loss,
+                    "target_price": take_profit,
+                    "opened_at": seeded_params["opened_at"],
+                    "mode": mode,
+                })
             logger.warning(
                 "[SYNC] %s: prior-session system position — seeded sl=%.2f tp=%.2f from ATR=%.4f oca_group=%r",
                 pos.ticker, stop_loss, take_profit, atr, seeded_params["oca_group"],
@@ -1167,6 +1308,19 @@ async def _reconcile_startup(
                 }
                 engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
                 await redis.hset(_POSITION_PARAMS_KEY, pos.ticker, json.dumps(seeded_params))
+                # Publish position_opened so persistence_service creates a trades DB row.
+                _adoption_flag = f"position:adopted:{pos.ticker}:{seeded_params['opened_at']}"
+                if await redis.set(_adoption_flag, "1", nx=True, ex=86400 * 90):
+                    await _publish_execution_event(redis, "position_opened", {
+                        "ticker": pos.ticker,
+                        "direction": pos.direction,
+                        "shares": pos.shares,
+                        "entry_price": pos.entry_price,
+                        "stop_price": 0.0,
+                        "target_price": 0.0,
+                        "opened_at": seeded_params["opened_at"],
+                        "mode": mode,
+                    })
                 logger.warning(
                     "[SYNC] %s: ATR unavailable but IB bracket is live (oca_group=%r) — "
                     "seeding with stop_loss=0 (IB OCA handles stops; software monitors time/sentiment)",
@@ -1338,12 +1492,20 @@ async def _reconcile_external_closes(
 
     These are positions filled by IB's bracket legs (stop-loss or take-profit
     executed natively) or closed manually in TWS.  Clean up Redis state and log.
+
+    Attempts to infer the actual exit price and reason (STOP_LOSS, TAKE_PROFIT,
+    TRAILING_STOP) from IB fill records for the current session.  Falls back to
+    IB_EXTERNAL when no matching fill is found (e.g. position closed offline).
     """
     externally_closed = prev_open - now_open - just_closed
     for ticker in externally_closed:
         # Read params BEFORE cleanup so we can include them in the close event
         opened_at = datetime.now(UTC).isoformat()
         direction = "unknown"
+        entry_price = 0.0
+        shares = 0
+        stop_loss = 0.0
+        take_profit = 0.0
         params_raw = await redis.hget(_POSITION_PARAMS_KEY, ticker)
         if params_raw:
             try:
@@ -1352,21 +1514,60 @@ async def _reconcile_external_closes(
                 )
                 opened_at = params.get("opened_at", opened_at)
                 direction = params.get("direction", direction)
+                entry_price = float(params.get("entry_price", 0.0))
+                shares = int(params.get("shares", 0))
+                stop_loss = float(params.get("stop_loss", 0.0))
+                take_profit = float(params.get("take_profit", 0.0))
             except Exception:
                 pass
+
+        # ── Infer exit price and reason from IB fills (session fills only) ───
+        exit_price = 0.0
+        exit_reason = "IB_EXTERNAL"
+        try:
+            ib_obj = getattr(engine, "_ib", None)
+            if ib_obj is not None:
+                close_side = "SLD" if direction == "LONG" else "BOT"
+                fills = [
+                    f for f in ib_obj.fills()
+                    if getattr(getattr(f, "contract", None), "symbol", "") == ticker
+                    and getattr(getattr(f, "execution", None), "side", "") == close_side
+                ]
+                if fills:
+                    # Most recent fill for this ticker on the closing side
+                    latest = max(fills, key=lambda f: getattr(f, "time", 0))
+                    exit_price = float(latest.execution.price)
+                    # Classify exit reason by comparing fill price to known levels
+                    if stop_loss > 0 and take_profit > 0:
+                        sl_dist = abs(exit_price - stop_loss)
+                        tp_dist = abs(exit_price - take_profit)
+                        tolerance = exit_price * 0.005  # 0.5% tolerance
+                        if sl_dist <= tolerance or sl_dist < tp_dist * 0.5:
+                            exit_reason = "STOP_LOSS"
+                        elif tp_dist <= tolerance or tp_dist < sl_dist * 0.5:
+                            exit_reason = "TAKE_PROFIT"
+                        else:
+                            exit_reason = "TRAILING_STOP"
+                    else:
+                        exit_reason = "IB_EXTERNAL"
+        except Exception as exc:
+            logger.debug("[SYNC] Could not infer exit details for %s: %s", ticker, exc)
 
         engine.forget_position(ticker)
         await redis.hdel(_HWM_REDIS_KEY, ticker)
         await redis.hdel(_POSITION_PARAMS_KEY, ticker)
-        POSITIONS_CLOSED.labels(reason="IB_EXTERNAL").inc()
+        POSITIONS_CLOSED.labels(reason=exit_reason).inc()
         logger.info(
-            "[SYNC] %s closed externally by IB (bracket fill or manual TWS close)", ticker
+            "[SYNC] %s closed externally by IB: reason=%s exit_price=%.4f",
+            ticker, exit_reason, exit_price,
         )
         await _publish_execution_event(redis, "position_closed", {
             "ticker": ticker,
-            "exit_price": 0.0,
-            "exit_reason": "IB_EXTERNAL",
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
             "direction": direction,
+            "entry_price": entry_price,
+            "shares": shares,
             "closed_at": datetime.now(UTC).isoformat(),
             "opened_at": opened_at,
             "mode": mode,
@@ -1374,7 +1575,7 @@ async def _reconcile_external_closes(
         await redis.lpush("trades:recent", json.dumps({
             "ticker": ticker,
             "direction": direction,
-            "exit_reason": "IB_EXTERNAL",
+            "exit_reason": exit_reason,
             "closed_at": datetime.now(UTC).isoformat(),
         }))
         await redis.ltrim("trades:recent", 0, 999)
@@ -1510,7 +1711,7 @@ async def main(use_ibkr: bool = False) -> None:
     await _load_trail_orders_from_redis(redis, engine)
 
     # Reconcile: clean up Redis state for positions closed while service was offline
-    await _reconcile_startup(redis, engine)
+    await _reconcile_startup(redis, engine, mode=mode)
 
     tasks = [
         asyncio.create_task(

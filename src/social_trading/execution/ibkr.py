@@ -586,11 +586,14 @@ class IBKRExecutionEngine:
             contract = Stock(ticker, "SMART", "USD")
             await self._ib.qualifyContractsAsync(contract)
 
-            # Cancel bracket child orders (stop-loss + take-profit legs).
+            # Cancel only bracket child orders placed by this system (orderRef = ORDER_REF).
             # Must use openTrades() — it exposes both .order and .contract.
             # openOrders() returns Order objects which have no .contract attribute.
+            # Filtering by orderRef avoids cancelling manually-placed hedge orders
+            # or orders from other API clients on the same ticker.
             for trade in self._ib.openTrades():
-                if trade.contract.symbol == ticker:
+                if (trade.contract.symbol == ticker
+                        and getattr(trade.order, "orderRef", "") == ORDER_REF):
                     self._ib.cancelOrder(trade.order)
 
             # Determine close action from existing position

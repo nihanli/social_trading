@@ -499,7 +499,55 @@ def _write_trade_closed(data: dict) -> None:
                     )
                     row = cur.fetchone()
                 if not row:
-                    logger.debug("No open trade found for %s to close", ticker)
+                    # No open trade row found — position was opened before persistence
+                    # was tracking it (adopted from IB, prior session, etc.).
+                    # Insert a synthetic closed record if we have enough data to compute P&L.
+                    synth_entry = _float(data.get("entry_price", 0))
+                    synth_shares = _int(data.get("shares", 0))
+                    synth_dir = data.get("direction", "LONG")
+                    synth_opened_at = data.get("opened_at") or closed_at
+                    synth_pnl: float | None = None
+                    synth_pnl_pct: float | None = None
+                    if exit_price > 0 and synth_entry > 0 and synth_shares > 0:
+                        synth_pnl = (
+                            (exit_price - synth_entry) * synth_shares
+                            if synth_dir == "LONG"
+                            else (synth_entry - exit_price) * synth_shares
+                        )
+                        synth_pnl_pct = synth_pnl / (synth_entry * synth_shares) * 100
+                    stream_id = data.get("stream_event_id", "")
+                    cur.execute(
+                        """
+                        INSERT INTO trades
+                            (ticker, direction, shares, entry_price,
+                             opened_at, closed_at, exit_price, exit_reason,
+                             net_pnl, pnl, pnl_pct, status, mode, stream_event_id)
+                        VALUES
+                            (%(ticker)s, %(direction)s, %(shares)s, %(entry_price)s,
+                             %(opened_at)s, %(closed_at)s, %(exit_price)s, %(exit_reason)s,
+                             %(net_pnl)s, %(pnl)s, %(pnl_pct)s, 'closed', %(mode)s,
+                             %(stream_event_id)s)
+                        ON CONFLICT (stream_event_id) DO NOTHING
+                        """,
+                        {
+                            "ticker": ticker,
+                            "direction": synth_dir,
+                            "shares": synth_shares or None,
+                            "entry_price": synth_entry or None,
+                            "opened_at": synth_opened_at,
+                            "closed_at": closed_at,
+                            "exit_price": exit_price if exit_price > 0 else None,
+                            "exit_reason": exit_reason,
+                            "net_pnl": synth_pnl,
+                            "pnl": synth_pnl,
+                            "pnl_pct": synth_pnl_pct,
+                            "mode": data.get("mode", "paper"),
+                            "stream_event_id": stream_id or None,
+                        },
+                    )
+                    logger.info(
+                        "No open trade found for %s — inserted synthetic closed record", ticker
+                    )
                     return
                 trade_id, entry_price, shares, direction = row
 

@@ -62,15 +62,16 @@ for p in raw_positions:
         hold_hrs = 0.0
     entry = float(p.get("entry_price", 0))
     shares = int(p.get("shares", 0))
-    unreal = float(p.get("unrealized_pnl", 0))
+    unreal = float(p.get("unrealized_pnl") or 0)
     pnl_pct = round(unreal / (entry * shares) * 100, 2) if entry and shares else 0.0
     _t = p.get("ticker", "")
+    cache_missing = p.get("ib_cache_missing", False)
     rows.append({
         "chart":          f"/chart?ticker={_t}&tf=1M",
-        "ticker":         _t,
+        "ticker":         f"⚠ {_t}" if cache_missing else _t,
         "direction":      p.get("direction", ""),
-        "shares":         shares,
-        "entry_price":    round(entry, 2),
+        "shares":         shares if not cache_missing else "?",
+        "entry_price":    round(entry, 2) if not cache_missing else "?",
         "stop_loss":      round(float(p.get("stop_loss", 0)), 2),
         "take_profit":    round(float(p.get("take_profit", 0)), 2),
         "unrealized_pnl": round(unreal, 2),
