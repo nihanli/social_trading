@@ -136,16 +136,20 @@ async def _get_market_snapshot(
     """
     raw = await redis.hgetall(_MARKET_DATA_KEY.format(ticker=ticker))
     if not raw:
+        # No market data available — return zero price so the calling code
+        # rejects the signal via the entry_price <= 0 guard rather than
+        # approving it against fake placeholder values.
+        logger.debug("[RISK] No market data for %s — returning zero price to block signal", ticker)
         return {
-            "last": 100.0,
-            "bid": 99.9,
-            "ask": 100.1,
-            "adv_shares": 1_000_000.0,
-            "adv_usd": 100_000_000.0,
-            "market_cap_usd": 10_000_000_000.0,
-            "atr_14": 2.0,
-            "realised_vol": 0.20,
-            "vix": 15.0,
+            "last": 0.0,
+            "bid": 0.0,
+            "ask": 0.0,
+            "adv_shares": 0.0,
+            "adv_usd": 0.0,
+            "market_cap_usd": 0.0,
+            "atr_14": 0.0,
+            "realised_vol": 0.20,  # conservative default (vol scalar will limit size)
+            "vix": 15.0,           # conservative default (normal regime)
         }
 
     def _f(key: str, default: float) -> float:

@@ -78,6 +78,11 @@ _TIER2_SOURCE_NAMES: frozenset[str] = frozenset({"twitter"})
 # TTL = signal_poll_interval_sec so at most one request is sent per cycle.
 _ENRICHMENT_SENT_KEY = "enrichment:sent:{ticker}"
 
+# Redis key template for deduplicating strategy signals within a cycle.
+# Prevents re-emitting the same signal every poll cycle when the ticker remains
+# above threshold.  TTL = signal_poll_interval_sec (same cadence as enrichment).
+_SIGNAL_DEDUP_KEY = "signal:dedup:{ticker}"
+
 # Fallback reactive threshold (fraction) used when ATR data is unavailable.
 # When ATR is available, the threshold is 1.5 × (atr_14 / last_price) so
 # high-volatility tickers require a proportionally larger move to be flagged
@@ -259,6 +264,13 @@ async def run_evaluate_task(
 
         for ticker in tickers:
             try:
+                # Skip this ticker entirely if a position is already open and
+                # the config requests it — applies to ALL phases (Phase-1 direct,
+                # Phase-2, enrichment requests) so no double-up can occur.
+                if cfg.phase2_skip_open_positions and await _is_open_position(redis, ticker):
+                    logger.debug("SKIP %s — open position (phase2_skip_open_positions=True)", ticker)
+                    continue
+
                 stats = await aggregator.get_stats(ticker)
                 if stats is None:
                     continue
@@ -327,38 +339,13 @@ async def run_evaluate_task(
                             ticker, sig.direction, sig.quality_score,
                         )
                     else:
-                        # Phase 2 threshold not met even though Tier-2 data exists.
-                        # Fall back to Phase 1 if the Phase 1 threshold is satisfied —
-                        # Twitter data provided some signal but not enough for Phase 2
-                        # confidence.  This prevents valid signals from being silently
-                        # dropped when Phase 2 enrichment returns inconclusive data.
-                        sig_p1 = generator.evaluate(
-                            stats, cfg=cfg,
-                            quality_threshold=cfg.signal_phase1_threshold,
-                            volume_zscore=volume_zscore,
-                            price_momentum=price_momentum,
-                            is_reactive=is_reactive,
+                        # Phase-2 threshold not met — suppress signal per design §5a.
+                        # Tier-2 enrichment confirmed the signal is weak; do NOT
+                        # fall back to Phase-1 as that would promote a suppressed ticker.
+                        logger.debug(
+                            "PHASE2 SUPPRESSED %s (score below phase2_threshold=%.2f)",
+                            ticker, cfg.signal_phase2_threshold,
                         )
-                        if sig_p1 is not None:
-                            sig_p1 = sig_p1.model_copy(update={"signal_phase": "phase1"})
-                            batch_signals.append(sig_p1)
-                            phase1_direct += 1
-                            SIGNALS_GENERATED.labels(ticker=ticker, direction=sig_p1.direction).inc()
-                            SIGNAL_QUALITY.observe(sig_p1.quality_score)
-                            SENTIMENT_SCORE.labels(ticker=ticker).set(sig_p1.sentiment_score)
-                            VOLUME_ZSCORE.labels(ticker=ticker).set(sig_p1.volume_z_score)
-                            logger.info(
-                                "PHASE1 SIGNAL (phase2 fallback) %s dir=%s score=%.3f "
-                                "— Tier-2 data present but below phase2 threshold (%.2f)",
-                                ticker, sig_p1.direction, sig_p1.quality_score,
-                                cfg.signal_phase2_threshold,
-                            )
-                        else:
-                            logger.debug(
-                                "PHASE2 BELOW_THRESHOLD %s (need ≥%.2f, phase1 also below %.2f)",
-                                ticker, cfg.signal_phase2_threshold,
-                                cfg.signal_phase1_threshold,
-                            )
 
                 else:
                     # ── Phase 1 (free sources only) ─────────────────────────
@@ -407,26 +394,23 @@ async def run_evaluate_task(
                                 # Request enrichment; signal fires after Phase 2.
                                 phase1_enrichment += 1
                                 if enrichment_budget > 0:
-                                    skip = (
-                                        cfg.phase2_skip_open_positions
-                                        and await _is_open_position(redis, ticker)
+                                    await _request_enrichment(
+                                        redis, ticker, sig.quality_score,
+                                        cfg.signal_poll_interval_sec,
                                     )
-                                    if skip:
-                                        logger.debug(
-                                            "PHASE1 SKIP_ENRICHMENT %s (open position)", ticker
-                                        )
-                                    else:
-                                        await _request_enrichment(
-                                            redis, ticker, sig.quality_score,
-                                            cfg.signal_poll_interval_sec,
-                                        )
-                                        enrichment_budget -= 1
+                                    enrichment_budget -= 1
 
             except Exception as exc:
                 logger.warning("Error evaluating %s: %s", ticker, exc)
 
         if batch_signals:
             for sig in batch_signals:
+                # Dedup: skip if an identical signal was already emitted this cycle.
+                dedup_key = _SIGNAL_DEDUP_KEY.format(ticker=sig.ticker)
+                is_new = await redis.set(dedup_key, "1", ex=cfg.signal_poll_interval_sec, nx=True)
+                if not is_new:
+                    logger.debug("SIGNAL_DEDUP %s — already emitted this cycle, skipping", sig.ticker)
+                    continue
                 await redis.xadd(
                     STREAM_STRATEGY_SIGNALS,
                     _signal_to_stream_dict(sig),

@@ -150,18 +150,22 @@ class BaseDataSource(ABC):
 
         Deduplicates against posts already sent to the stream within the last 24 hours
         so repeated API poll responses do not flood the stream with duplicate entries.
+
+        Order of operations: EXISTS check → XADD → SET NX.
+        Publishing before marking-as-seen means a crash between XADD and SET NX
+        causes a duplicate (benign, handled downstream) rather than a permanent
+        silent drop (data loss).
         """
         if not posts:
             return 0
 
-        # Phase 1: check which post IDs are genuinely new via atomic SET NX
+        # Phase 1: check which post IDs are genuinely new (read-only EXISTS check)
         async with self._redis.pipeline(transaction=False) as pipe:
             for post in posts:
-                pipe.set(_DEDUP_KEY_PREFIX + post.id, "1", nx=True, ex=_DEDUP_TTL_SECS)
-            results = await pipe.execute()
+                pipe.exists(_DEDUP_KEY_PREFIX + post.id)
+            exists_results = await pipe.execute()
 
-        # SET NX returns True when key was newly created (post not seen before)
-        new_posts = [p for p, r in zip(posts, results) if r]
+        new_posts = [p for p, exists in zip(posts, exists_results) if not exists]
         skipped = len(posts) - len(new_posts)
         if skipped:
             logger.debug(
@@ -171,12 +175,19 @@ class BaseDataSource(ABC):
         if not new_posts:
             return 0
 
-        # Phase 2: publish only the new posts
+        # Phase 2: PUBLISH first — ensures at-least-once delivery even on crash.
         maxlen = STREAM_MAXLEN.get(STREAM_RAW_SOCIAL)
         async with self._redis.pipeline(transaction=False) as pipe:
             for post in new_posts:
                 pipe.xadd(STREAM_RAW_SOCIAL, _post_to_stream_dict(post), maxlen=maxlen, approximate=True)
             await pipe.execute()
+
+        # Phase 3: Mark as seen AFTER successful publish.
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for post in new_posts:
+                pipe.set(_DEDUP_KEY_PREFIX + post.id, "1", nx=True, ex=_DEDUP_TTL_SECS)
+            await pipe.execute()
+
         logger.debug("%s published %d new posts", self.name, len(new_posts))
         return len(new_posts)
 

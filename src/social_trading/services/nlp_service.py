@@ -138,35 +138,50 @@ async def run_nlp_service(
             continue
 
         posts: list[SocialPost] = []
-        msg_ids: list[str] = []
+        valid_msg_ids: list[str] = []
+        malformed_msg_ids: list[str] = []
         for msg_id, fields in messages:
             post = _stream_dict_to_post(fields)
             if post is not None:
                 posts.append(post)
-                msg_ids.append(msg_id)
+                valid_msg_ids.append(msg_id)
+            else:
+                # Malformed messages will never parse — ACK immediately to
+                # drain them from the PEL rather than letting them accumulate.
+                malformed_msg_ids.append(msg_id)
+
+        for msg_id in malformed_msg_ids:
+            await bus.ack(STREAM_RAW_SOCIAL, _GROUP, msg_id)
 
         if posts:
-            results = await pipeline.process_batch(posts)
-            for result in results:
-                await redis.xadd(STREAM_SENTIMENT, _result_to_stream_dict(result),
-                                 maxlen=STREAM_MAXLEN.get(STREAM_SENTIMENT), approximate=True)
-                SENTIMENT_LATENCY.observe(result.latency_ms)
-                label = "positive" if result.score > 0 else "negative" if result.score < 0 else "neutral"
-                POSTS_CLASSIFIED.labels(model=result.model, label=label).inc()
+            try:
+                results = await pipeline.process_batch(posts)
+                for result in results:
+                    await redis.xadd(STREAM_SENTIMENT, _result_to_stream_dict(result),
+                                     maxlen=STREAM_MAXLEN.get(STREAM_SENTIMENT), approximate=True)
+                    SENTIMENT_LATENCY.observe(result.latency_ms)
+                    label = "positive" if result.score > 0 else "negative" if result.score < 0 else "neutral"
+                    POSTS_CLASSIFIED.labels(model=result.model, label=label).inc()
 
-            published += len(results)
-            processed += len(posts)
-            filtered = len(posts) - len(results)
-            if filtered > 0:
-                POSTS_FILTERED.labels(reason="pipeline_drop").inc(filtered)
-            logger.debug(
-                "batch: %d posts → %d results (total processed=%d published=%d)",
-                len(posts), len(results), processed, published,
-            )
-
-        # Ack all messages (even filtered ones — they won't be retried)
-        for msg_id in msg_ids:
-            await bus.ack(STREAM_RAW_SOCIAL, _GROUP, msg_id)
+                published += len(results)
+                processed += len(posts)
+                filtered = len(posts) - len(results)
+                if filtered > 0:
+                    POSTS_FILTERED.labels(reason="pipeline_drop").inc(filtered)
+                logger.debug(
+                    "batch: %d posts → %d results (total processed=%d published=%d)",
+                    len(posts), len(results), processed, published,
+                )
+                # Only ACK after all results are successfully published.
+                for msg_id in valid_msg_ids:
+                    await bus.ack(STREAM_RAW_SOCIAL, _GROUP, msg_id)
+            except Exception as exc:
+                # Classifier or publish failure — do NOT ACK so the batch is
+                # redelivered on the next XAUTOCLAIM cycle.
+                logger.error(
+                    "NLP batch processing failed (%d posts) — will retry: %s",
+                    len(posts), exc, exc_info=True,
+                )
 
         if processed % 500 == 0 and processed > 0:
             logger.info(

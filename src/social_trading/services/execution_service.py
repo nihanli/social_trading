@@ -63,6 +63,7 @@ from social_trading.monitoring.metrics import (
 )
 from social_trading.risk.circuit_breaker import CircuitBreaker
 from social_trading.risk.exit_manager import PositionExitManager
+from social_trading.signals.decay import is_expired as _signal_is_expired
 from social_trading.storage.event_bus import TradingEventBus
 
 load_dotenv()
@@ -251,6 +252,22 @@ async def run_trade_loop(
 
     while True:
         try:
+            # Reload config each cycle so UI changes to sizing/TP/trailing params
+            # take effect without a service restart.
+            cfg = await SystemConfig.load(redis)
+
+            # Guard market hours BEFORE consuming from the stream.  If the market
+            # is closed we don't consume anything — messages stay as NEW entries
+            # and are delivered next time the market opens.  This avoids filling
+            # the PEL with signals that cannot be executed until next session.
+            if not _NYSE.is_open():
+                logger.info(
+                    "[EXEC] Market closed — not consuming signals. %s",
+                    _NYSE.status_str(),
+                )
+                await asyncio.sleep(60.0)
+                continue
+
             messages = await bus.consume(
                 STREAM_SELECTED_SIGNALS, _GROUP, _CONSUMER, count=_INGEST_BATCH
             )
@@ -263,6 +280,20 @@ async def run_trade_loop(
                         continue
 
                     signal, quantity, stop_loss, take_profit = parsed
+
+                    # Discard stale signals that sat in the stream too long
+                    # (e.g. market was closed for an extended period).
+                    hours_elapsed = (
+                        datetime.now(UTC) - signal.generated_at
+                    ).total_seconds() / 3600
+                    if _signal_is_expired(hours_elapsed, cfg.signal_age_max_hours):
+                        logger.warning(
+                            "[EXEC] Signal for %s expired (%.1fh old, max %dh) — discarding",
+                            signal.ticker, hours_elapsed, cfg.signal_age_max_hours,
+                        )
+                        skipped += 1
+                        await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                        continue
 
                     # Skip if new positions are halted via UI command
                     if _halt_flag.is_set():
@@ -299,18 +330,6 @@ async def run_trade_loop(
                                 logger.debug("On-demand price fetch for %s: %.4f", signal.ticker, last)
                         except Exception as exc:
                             logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
-
-                    # Skip if market is closed — do NOT ack so the signal
-                    # is redelivered when the market opens next session.
-                    if not _NYSE.is_open():
-                        logger.info(
-                            "[EXEC] Market closed — holding %s signal. %s",
-                            signal.ticker, _NYSE.status_str(),
-                        )
-                        # Sleep briefly to avoid a tight spin when the whole
-                        # batch of pending signals is outside market hours.
-                        await asyncio.sleep(5.0)
-                        break  # re-consume on next loop iteration
 
                     result = await engine.submit_signal(
                         signal=signal,

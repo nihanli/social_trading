@@ -108,6 +108,7 @@ def _write_social_raw(rows: list[dict]) -> int:
             with conn.cursor() as cur:
                 for r in rows:
                     try:
+                        cur.execute("SAVEPOINT row_sp")
                         cur.execute(
                             """
                             INSERT INTO social_raw
@@ -130,10 +131,11 @@ def _write_social_raw(rows: list[dict]) -> int:
                                 "collected_at": r.get("collected_at") or datetime.now(UTC).isoformat(),
                             },
                         )
+                        cur.execute("RELEASE SAVEPOINT row_sp")
                         inserted += cur.rowcount
                     except psycopg2.Error as exc:
                         logger.debug("social_raw insert skip (%s): %s", r.get("id"), exc)
-                        conn.rollback()
+                        cur.execute("ROLLBACK TO SAVEPOINT row_sp")
     finally:
         conn.close()
     return inserted
@@ -159,6 +161,7 @@ def _write_sentiment_scores(rows: list[dict]) -> int:
                         if cur.fetchone() is None:
                             post_id = None
                     try:
+                        cur.execute("SAVEPOINT row_sp")
                         cur.execute(
                             """
                             INSERT INTO sentiment_scores
@@ -179,10 +182,11 @@ def _write_sentiment_scores(rows: list[dict]) -> int:
                                 "scored_at": r.get("classified_at") or datetime.now(UTC).isoformat(),
                             },
                         )
+                        cur.execute("RELEASE SAVEPOINT row_sp")
                         inserted += cur.rowcount
                     except psycopg2.Error as exc:
                         logger.debug("sentiment_scores insert skip: %s", exc)
-                        conn.rollback()
+                        cur.execute("ROLLBACK TO SAVEPOINT row_sp")
     finally:
         conn.close()
     return inserted
@@ -199,6 +203,7 @@ def _write_signals(rows: list[dict]) -> int:
             with conn.cursor() as cur:
                 for r in rows:
                     try:
+                        cur.execute("SAVEPOINT row_sp")
                         cur.execute(
                             """
                             INSERT INTO signals
@@ -230,10 +235,11 @@ def _write_signals(rows: list[dict]) -> int:
                                 "proactivity": _float(r.get("proactivity"), default=1.0),
                             },
                         )
+                        cur.execute("RELEASE SAVEPOINT row_sp")
                         inserted += cur.rowcount
                     except psycopg2.Error as exc:
                         logger.debug("signals insert skip: %s", exc)
-                        conn.rollback()
+                        cur.execute("ROLLBACK TO SAVEPOINT row_sp")
     finally:
         conn.close()
     return inserted
@@ -764,12 +770,14 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
                         )
                     else:
                         logger.debug("Unknown execution event type: %s", event_type)
+                    # ACK only after confirmed DB write — not in the except branch.
+                    await bus.ack(_EXEC_EVENTS_STREAM, _GROUP, msg_id)
                 except Exception as exc:
                     logger.warning(
-                        "Failed to persist execution event %s (%s): %s",
+                        "Failed to persist execution event %s (%s): %s — will retry",
                         event_type, fields.get("ticker", ""), exc,
                     )
-                await bus.ack(_EXEC_EVENTS_STREAM, _GROUP, msg_id)
+                    # Do NOT ACK — message stays in PEL and will be redelivered.
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -34,19 +34,19 @@ def vix_scalar(vix: float, cfg: SystemConfig) -> float:
     Map VIX level to a size multiplier.
 
     Regimes (from cfg):
-        vix >= vix_crisis           → 0.00  (full halt)
-        vix >= vix_high_fear        → 0.25
-        vix >= vix_elevated         → 0.50
-        vix >= vix_slightly_elevated → 0.75
+        vix > vix_crisis            → 0.00  (full halt)
+        vix > vix_high_fear         → 0.25
+        vix > vix_elevated          → 0.50
+        vix > vix_slightly_elevated → 0.75
         otherwise                   → 1.00  (normal)
     """
-    if vix >= cfg.vix_crisis:
+    if vix > cfg.vix_crisis:
         return 0.0
-    if vix >= cfg.vix_high_fear:
+    if vix > cfg.vix_high_fear:
         return 0.25
-    if vix >= cfg.vix_elevated:
+    if vix > cfg.vix_elevated:
         return 0.50
-    if vix >= cfg.vix_slightly_elevated:
+    if vix > cfg.vix_slightly_elevated:
         return 0.75
     return 1.0
 

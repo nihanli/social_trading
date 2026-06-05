@@ -81,8 +81,10 @@ def test_vix_crisis(cfg: SystemConfig) -> None:
 
 
 def test_vix_exact_boundary(cfg: SystemConfig) -> None:
-    # boundary: vix == vix_slightly_elevated → scaled
-    assert vix_scalar(20.0, cfg) == 0.75
+    # vix == threshold uses strict > comparison (design §6e):
+    # exactly at the threshold is still "normal" regime, not the tighter one.
+    assert vix_scalar(20.0, cfg) == 1.0   # exactly at slightly_elevated → normal
+    assert vix_scalar(20.01, cfg) == 0.75  # just above → scaled down
 
 
 # ── vol_scalar ────────────────────────────────────────────────────────────────
