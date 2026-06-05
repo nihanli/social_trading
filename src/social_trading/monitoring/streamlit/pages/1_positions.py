@@ -67,7 +67,7 @@ for p in raw_positions:
     _t = p.get("ticker", "")
     cache_missing = p.get("ib_cache_missing", False)
     rows.append({
-        "chart":          f"/chart?ticker={_t}&tf=1M",
+        "chart":          f"/chart?ticker={_t}&tf=6M",
         "ticker":         f"⚠ {_t}" if cache_missing else _t,
         "direction":      p.get("direction", ""),
         "shares":         shares if not cache_missing else "?",

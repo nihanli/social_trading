@@ -6,7 +6,7 @@ Candlestick OHLCV chart with:
   - Timeframes: 5D (hourly), 1M / 3M / 6M (daily)
   - Signal buy/sell markers overlaid from the DB
   - Social mention volume bar overlay (from sentiment_aggregates)
-  - Launched via URL query param: /chart?ticker=AAPL&tf=1M
+  - Launched via URL query param: /chart?ticker=AAPL&tf=6M
   - Opens in a new browser tab from any page via chart_link helper
 """
 from __future__ import annotations
@@ -38,9 +38,9 @@ st.set_page_config(
 # ── Read URL params ────────────────────────────────────────────────────────────
 params = st.query_params
 url_ticker = params.get("ticker", "").upper().strip()
-url_tf     = params.get("tf", "1M")
+url_tf     = params.get("tf", "6M")
 if url_tf not in TIMEFRAMES:
-    url_tf = "1M"
+    url_tf = "6M"
 
 # ── Controls row ───────────────────────────────────────────────────────────────
 ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2, 3, 2])

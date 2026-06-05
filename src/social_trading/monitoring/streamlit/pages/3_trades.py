@@ -161,7 +161,7 @@ st.subheader("All Closed Trades")
 days = st.selectbox("Show last N days", [7, 30, 90, 365], index=1)
 all_trades = query(f"""
     SELECT ticker,
-           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           '/chart?ticker=' || ticker || '&tf=6M' AS chart,
            direction, shares,
            ROUND(entry_price::numeric, 2) AS entry,
            ROUND(exit_price::numeric, 2)  AS exit,

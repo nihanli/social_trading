@@ -346,7 +346,7 @@ elif phase_filter != "All":
 
 full_signals = query(f"""
     SELECT ticker,
-           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           '/chart?ticker=' || ticker || '&tf=6M' AS chart,
            direction,
            COALESCE(signal_phase, 'legacy')             AS phase,
            ROUND(confidence::numeric, 3)                AS quality,

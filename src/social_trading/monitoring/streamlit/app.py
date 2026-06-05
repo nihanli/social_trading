@@ -226,7 +226,7 @@ with col_left:
     st.subheader("Open Positions")
     positions = query("""
         SELECT ticker,
-               '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+               '/chart?ticker=' || ticker || '&tf=6M' AS chart,
                direction, shares, entry_price,
                ROUND(unrealized_pnl::numeric, 2)      AS unrealized_pnl,
                ROUND((unrealized_pnl /
@@ -253,7 +253,7 @@ with col_right:
     st.subheader("Recent Signals")
     signals = query("""
         SELECT ticker,
-               '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+               '/chart?ticker=' || ticker || '&tf=6M' AS chart,
                direction,
                COALESCE(signal_phase, 'legacy')    AS phase,
                ROUND(confidence::numeric, 2)        AS quality,
@@ -338,7 +338,7 @@ else:
 st.subheader("Recent Closed Trades")
 trades = query("""
     SELECT ticker,
-           '/chart?ticker=' || ticker || '&tf=1M' AS chart,
+           '/chart?ticker=' || ticker || '&tf=6M' AS chart,
            direction, shares, entry_price, exit_price,
            ROUND(net_pnl::numeric, 2) AS net_pnl,
            exit_reason,

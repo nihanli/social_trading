@@ -27,7 +27,7 @@ def chart_link(ticker: str, timeframe: str = "1M") -> str:
         timeframe: Default timeframe to pre-select ("5D", "1M", "3M", "6M")
 
     Returns:
-        HTML string: <a href="/chart?ticker=AAPL&tf=1M" target="_blank">📈 AAPL</a>
+        HTML string: <a href="/chart?ticker=AAPL&tf=6M" target="_blank">📈 AAPL</a>
     """
     url = f"{_CHART_BASE}?ticker={ticker.upper()}&tf={timeframe}"
     return (
