@@ -128,6 +128,15 @@ class IBKRExecutionEngine:
         """Return a snapshot of persisted position params (sl/tp/opened_at)."""
         return dict(self._position_params)
 
+    def get_trail_orders(self) -> dict[str, int]:
+        """Return a snapshot of known trailing stop order IDs."""
+        return dict(self._ts_order_id)
+
+    def seed_trail_order_id(self, ticker: str, order_id: int) -> None:
+        """Restore a persisted trail order ID; only if not already tracked."""
+        if ticker not in self._ts_order_id and order_id:
+            self._ts_order_id[ticker] = order_id
+
     def seed_position_params(self, ticker: str, params: dict) -> None:
         """Restore position params from persistent store; only if not already set."""
         if ticker not in self._position_params:
@@ -476,6 +485,7 @@ class IBKRExecutionEngine:
                 trail_order.orderType       = "TRAIL"
                 trail_order.trailingPercent = trailing_stop_pct * 100  # e.g. 8.0 for 8%
                 trail_order.tif             = "GTC"
+                trail_order.outsideRth      = False  # don't fire on thin after-hours prints
                 trail_order.ocaGroup        = oca_group
                 trail_order.ocaType         = 1
                 trail_order.transmit        = True
@@ -716,9 +726,10 @@ class IBKRExecutionEngine:
                 trail_order.trailStopPrice = round(hwm * (1.0 - new_pct), 2)
             else:
                 trail_order.trailStopPrice = round(hwm * (1.0 + new_pct), 2)
-            trail_order.tif      = "GTC"
-            trail_order.transmit = True
-            trail_order.orderRef = ORDER_REF
+            trail_order.tif         = "GTC"
+            trail_order.outsideRth  = False  # don't fire on thin after-hours prints
+            trail_order.transmit    = True
+            trail_order.orderRef    = ORDER_REF
             if oca_group:
                 trail_order.ocaGroup = oca_group
                 trail_order.ocaType  = 1

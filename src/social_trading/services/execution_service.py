@@ -429,9 +429,24 @@ async def run_exit_loop(
     _position_last_full_snapshot: dict[str, float] = {}
     # Tracks tickers that were open at the end of the previous cycle.
     # Used to detect positions closed externally by IB between cycles.
-    _prev_open_tickers: set[str] = set()
+    # Pre-seeded from startup positions so the first cycle can detect external closures
+    # that happened while the service was offline (Fix 4).
+    try:
+        _initial_positions = await engine.get_positions()
+        _prev_open_tickers: set[str] = {p.ticker for p in _initial_positions}
+    except Exception:
+        _prev_open_tickers = set()
     # Tracks the last trailing_stop_pct applied per ticker (for change detection).
+    # Seeded from persisted position_params so restarts don't abruptly tighten trails.
     _trailing_pct_applied: dict[str, float] = {}
+    if hasattr(engine, "get_position_params"):
+        for ticker, params in engine.get_position_params().items():  # type: ignore[union-attr]
+            applied = params.get("trailing_stop_pct_applied")
+            if applied is not None:
+                try:
+                    _trailing_pct_applied[ticker] = float(applied)
+                except (ValueError, TypeError):
+                    pass
 
     while True:
         try:
@@ -558,16 +573,6 @@ async def run_exit_loop(
                 effective_pct = _effective_trailing_pct(mention_ratio, hours_held, cfg)
                 last_applied = _trailing_pct_applied.get(pos.ticker, cfg.trailing_stop_pct)
 
-                if abs(effective_pct - last_applied) >= 0.005:  # 0.5% noise gate
-                    if hasattr(engine, "update_trailing_stop"):
-                        await engine.update_trailing_stop(pos.ticker, effective_pct)
-                    _trailing_pct_applied[pos.ticker] = effective_pct
-                    logger.info(
-                        "[TRAIL] %s tightened trailing stop %.1f%% → %.1f%% "
-                        "(mention_ratio=%.2f)",
-                        pos.ticker, last_applied * 100, effective_pct * 100, mention_ratio,
-                    )
-
                 # Build effective cfg with tightened trailing stop for exit manager.
                 # When decaying, also clear the activation gate so the tightened
                 # trail fires unconditionally without requiring a profit threshold.
@@ -614,6 +619,20 @@ async def run_exit_loop(
                         if pos.direction == "LONG"
                         else (pos.entry_price - current_price) * pos.shares,
                     )
+                else:
+                    # Position is holding — update IB TRAIL order if tightening changed.
+                    # Done AFTER exit evaluation to avoid placing a TRAIL order that
+                    # would immediately fire and create a duplicate market order alongside
+                    # close_position().
+                    if abs(effective_pct - last_applied) >= 0.005:  # 0.5% noise gate
+                        if hasattr(engine, "update_trailing_stop"):
+                            await engine.update_trailing_stop(pos.ticker, effective_pct)
+                        _trailing_pct_applied[pos.ticker] = effective_pct
+                        logger.info(
+                            "[TRAIL] %s tightened trailing stop %.1f%% → %.1f%% "
+                            "(mention_ratio=%.2f)",
+                            pos.ticker, last_applied * 100, effective_pct * 100, mention_ratio,
+                        )
 
             # ── 4. Reconcile external IB closes ──────────────────────────────
             # Tickers that were open last cycle but are now gone (and we didn't
@@ -637,6 +656,7 @@ async def run_exit_loop(
             # ── 5. Persist state + metrics ────────────────────────────────────
             await _persist_hwm_to_redis(redis, engine)
             await _persist_position_params_to_redis(redis, engine)
+            await _persist_trail_orders_to_redis(redis, engine)
             await _write_account_state(redis, engine)
 
             state = await engine.get_account_state()
@@ -845,6 +865,7 @@ async def _write_market_snapshot_and_get_price(
 
 _HWM_REDIS_KEY = "hwm:all"
 _POSITION_PARAMS_KEY = "position:params"
+_TRAIL_ORDERS_KEY = "position:trail_orders"
 _EXEC_EVENTS_STREAM = "execution:events"
 _POSITIONS_LIVE_KEY = "positions:live"
 
@@ -927,6 +948,49 @@ async def _persist_position_params_to_redis(
         logger.warning("[PARAMS] Failed to persist to Redis: %s", exc)
 
 
+async def _load_trail_orders_from_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """
+    Seed engine TRAIL order IDs from Redis so update_trailing_stop() can cancel
+    the correct order after a service restart without accumulating duplicates.
+    """
+    if not hasattr(engine, "seed_trail_order_id"):
+        return
+    try:
+        raw = await redis.hgetall(_TRAIL_ORDERS_KEY)
+        if not raw:
+            return
+        for field, value in raw.items():
+            ticker = field.decode() if isinstance(field, bytes) else field
+            try:
+                order_id = int(value.decode() if isinstance(value, bytes) else value)
+                engine.seed_trail_order_id(ticker, order_id)  # type: ignore[union-attr]
+            except (ValueError, AttributeError):
+                continue
+        logger.info("[TRAIL] Loaded %d trail order IDs from Redis", len(raw))
+    except Exception as exc:
+        logger.warning("[TRAIL] Failed to load trail order IDs from Redis: %s", exc)
+
+
+async def _persist_trail_orders_to_redis(
+    redis: aioredis.Redis,
+    engine: PaperTradingEngine,
+) -> None:
+    """Persist TRAIL order IDs so they survive service restarts."""
+    if not hasattr(engine, "get_trail_orders"):
+        return
+    try:
+        trail_orders = engine.get_trail_orders()  # type: ignore[union-attr]
+        if not trail_orders:
+            return
+        mapping = {ticker: str(oid) for ticker, oid in trail_orders.items()}
+        await redis.hset(_TRAIL_ORDERS_KEY, mapping=mapping)
+    except Exception as exc:
+        logger.warning("[TRAIL] Failed to persist trail order IDs to Redis: %s", exc)
+
+
 async def _reconcile_startup(
     redis: aioredis.Redis,
     engine: PaperTradingEngine,
@@ -961,6 +1025,7 @@ async def _reconcile_startup(
         engine.forget_position(ticker)  # type: ignore[union-attr]
         await redis.hdel(_HWM_REDIS_KEY, ticker)
         await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
         logger.warning(
             "[SYNC] %s: found in persisted state but not in IB — "
             "likely closed while service was offline; cleaned up",
@@ -968,23 +1033,49 @@ async def _reconcile_startup(
         )
 
     orphaned_in_ib = current_tickers - set(params)
-    if not orphaned_in_ib:
-        return
 
-    # Determine which orphaned IB positions were opened by this system vs.
-    # manually via TWS.  We check open orders (GTC bracket legs remain open
-    # until filled) for ORDER_REF = "social_trading".
+    # ── Scan all open IB orders once ─────────────────────────────────────────
+    # Collect:
+    #   system_tickers — positions opened by this system (have ORDER_REF)
+    #   oca_groups     — OCA group name per ticker (Fix 3)
+    #   trail_order_ids — TRAIL order ID per ticker (Fix 1 IB fallback)
     system_tickers: set[str] = set()
+    oca_groups: dict[str, str] = {}
+    trail_order_ids: dict[str, int] = {}
     try:
         from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
         open_trades = engine._ib.openTrades()  # type: ignore[union-attr]
         for trade in open_trades:
-            sym = trade.contract.symbol if hasattr(trade, "contract") else ""
-            ref = trade.order.orderRef if hasattr(trade, "order") else ""
-            if sym in orphaned_in_ib and ref == ORDER_REF:
+            sym = getattr(getattr(trade, "contract", None), "symbol", "")
+            ord_obj = getattr(trade, "order", None)
+            ref = getattr(ord_obj, "orderRef", "")
+            ot = getattr(ord_obj, "orderType", "")
+            oid = getattr(ord_obj, "orderId", 0)
+            ocg = getattr(ord_obj, "ocaGroup", "")
+            if not sym or ref != ORDER_REF:
+                continue
+            # System-managed marker — applies to orphaned positions only
+            if sym in orphaned_in_ib:
                 system_tickers.add(sym)
+            # OCA group recovery — applies to any current system position
+            if sym in current_tickers and ocg:
+                oca_groups.setdefault(sym, ocg)
+            # TRAIL order ID recovery for Fix 1 (covers ALL current positions)
+            if sym in current_tickers and ot == "TRAIL" and oid:
+                trail_order_ids[sym] = oid
     except Exception as exc:
         logger.debug("[SYNC] Could not check open orders for orderRef: %s", exc)
+
+    # Fix 1: Recover TRAIL order IDs from IB for ALL current system positions.
+    # _ts_order_id is in-memory only; this seeds it for positions whose Redis key
+    # was already loaded and for newly adopted ones discovered below.
+    if hasattr(engine, "seed_trail_order_id"):
+        for sym, oid in trail_order_ids.items():
+            engine.seed_trail_order_id(sym, oid)  # type: ignore[union-attr]
+            logger.info("[SYNC] %s: recovered TRAIL order ID %d from IB open trades", sym, oid)
+
+    if not orphaned_in_ib:
+        return
 
     for pos in current:
         if pos.ticker not in orphaned_in_ib:
@@ -1025,6 +1116,10 @@ async def _reconcile_startup(
                 "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
                 "direction": pos.direction,
                 "source": "system",
+                # Fix 3: seed OCA group and initial trail pct so update_trailing_stop()
+                # links replacement TRAIL orders into the correct OCA bracket.
+                "oca_group": oca_groups.get(pos.ticker, ""),
+                "trailing_stop_pct_applied": cfg.trailing_stop_pct,
             }
             engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
             await redis.hset(
@@ -1033,21 +1128,42 @@ async def _reconcile_startup(
                 json.dumps(seeded_params),
             )
             logger.warning(
-                "[SYNC] %s: prior-session system position — seeded sl=%.2f tp=%.2f from ATR=%.4f",
-                pos.ticker, stop_loss, take_profit, atr,
+                "[SYNC] %s: prior-session system position — seeded sl=%.2f tp=%.2f from ATR=%.4f oca_group=%r",
+                pos.ticker, stop_loss, take_profit, atr, seeded_params["oca_group"],
             )
         else:
-            # ATR unavailable — cannot compute a safe stop, so close immediately
-            # rather than let the position run unprotected.
-            logger.error(
-                "[SYNC] %s: prior-session system position with no ATR available — "
-                "closing to avoid running unprotected (cancel any remaining OCA orders in TWS)",
-                pos.ticker,
-            )
-            try:
-                await engine.close_position(pos.ticker, reason="NO_STOP_ON_RESTART")  # type: ignore[union-attr]
-            except Exception as exc:
-                logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
+            # Fix 2: Before closing, check whether IB still has live bracket orders
+            # protecting this position.  If yes, let IB handle stops and defer to the
+            # software exit loop for time/sentiment rules only (don't close prematurely).
+            has_bracket = pos.ticker in oca_groups or pos.ticker in trail_order_ids
+            if has_bracket:
+                seeded_params = {
+                    "stop_loss": 0.0,   # 0.0 = IB handles stop; software defers
+                    "take_profit": 0.0,
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
+                    "direction": pos.direction,
+                    "source": "system",
+                    "oca_group": oca_groups.get(pos.ticker, ""),
+                    "trailing_stop_pct_applied": cfg.trailing_stop_pct,
+                }
+                engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
+                await redis.hset(_POSITION_PARAMS_KEY, pos.ticker, json.dumps(seeded_params))
+                logger.warning(
+                    "[SYNC] %s: ATR unavailable but IB bracket is live (oca_group=%r) — "
+                    "seeding with stop_loss=0 (IB OCA handles stops; software monitors time/sentiment)",
+                    pos.ticker, seeded_params["oca_group"],
+                )
+            else:
+                # Truly unprotected (no ATR, no IB bracket) — close immediately.
+                logger.error(
+                    "[SYNC] %s: prior-session system position with no ATR and no IB bracket — "
+                    "closing to avoid running unprotected",
+                    pos.ticker,
+                )
+                try:
+                    await engine.close_position(pos.ticker, reason="NO_STOP_ON_RESTART")  # type: ignore[union-attr]
+                except Exception as exc:
+                    logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
 
 async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
@@ -1372,6 +1488,7 @@ async def main(use_ibkr: bool = False) -> None:
     # Restore HWM and position params from Redis so trailing stops survive restarts
     await _load_hwm_from_redis(redis, engine)
     await _load_position_params_from_redis(redis, engine)
+    await _load_trail_orders_from_redis(redis, engine)
 
     # Reconcile: clean up Redis state for positions closed while service was offline
     await _reconcile_startup(redis, engine)
