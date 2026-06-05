@@ -540,6 +540,8 @@ class IBKRExecutionEngine:
                 "source": "system",
                 "trailing_stop_pct_applied": trailing_stop_pct,
                 "oca_group": oca_group,
+                "entry_price": fill_price or 0.0,
+                "shares": quantity,
             }
             return OrderResult(
                 order_id=str(entry_id),

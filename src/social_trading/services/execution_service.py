@@ -243,12 +243,13 @@ async def _write_positions_to_redis(
                     "IB position cache — showing with params data (cache may be stale)",
                     ticker,
                 )
-                entry_price = float(params.get("stop_loss", 0.0))  # best available
+                entry_price = float(params.get("entry_price", 0.0))
+                shares = int(params.get("shares", 0))
                 pipe.hset(_POSITIONS_LIVE_KEY, ticker, json.dumps({
                     "ticker": ticker,
                     "direction": params.get("direction", "LONG"),
-                    "shares": 0,          # unknown until cache refreshes
-                    "entry_price": 0.0,   # unknown until cache refreshes
+                    "shares": shares,
+                    "entry_price": entry_price,
                     "stop_loss": float(params.get("stop_loss", 0.0)),
                     "take_profit": float(params.get("take_profit", 0.0)),
                     "unrealized_pnl": None,
@@ -399,6 +400,21 @@ async def run_trade_loop(
                                 "high_water_mark": fill_px,
                                 "opened_at": result.submitted_at.isoformat(),
                                 "source": "system",
+                            }))
+                            # Also write to position:params immediately so that
+                            # _write_positions_to_redis includes this ticker in
+                            # system_params on the very next exit-loop cycle.
+                            # Without this, the exit loop's pipe.delete(positions:live)
+                            # + rebuild would drop the new position before
+                            # _persist_position_params_to_redis has a chance to run.
+                            await redis.hset(_POSITION_PARAMS_KEY, signal.ticker, json.dumps({
+                                "stop_loss": stop_loss,
+                                "take_profit": take_profit,
+                                "opened_at": result.submitted_at.isoformat(),
+                                "direction": signal.direction,
+                                "source": "system",
+                                "entry_price": fill_px,
+                                "shares": quantity,
                             }))
                         except Exception as _write_exc:
                             logger.warning(
@@ -1110,14 +1126,18 @@ async def _reconcile_startup(
                 return
     current_tickers = {p.ticker for p in current}
 
-    # ── Build fill cache from IB for today's executions (best-effort) ─────────
-    # reqExecutionsAsync() fetches today's executions from IB's server — more
-    # complete than ib.fills() which only holds fills received since connectAsync.
-    # Keyed by (symbol, close_side) → most recent fill price for that symbol.
-    _offline_fills: dict[str, float] = {}
+    # ── Build fill + order-type cache from IB for today's executions ────────
+    # reqExecutionsAsync() fetches today's executions from IB's server (more
+    # complete than ib.fills() for same-day offline gaps).
+    # reqCompletedOrdersAsync() fetches filled/cancelled orders from the current
+    # TWS session — may include recently filled bracket legs.
+    # Both keyed by symbol → (exit_price, exit_reason).
+    _offline_exit: dict[str, tuple[float, str]] = {}
     try:
         ib_obj = getattr(engine, "_ib", None)
         if ib_obj is not None:
+            # Step 1: collect fill prices from today's server-side executions
+            _fill_prices: dict[str, float] = {}
             from ib_async import ExecutionFilter  # noqa: PLC0415
             executions = await ib_obj.reqExecutionsAsync(ExecutionFilter())
             for fill in executions:
@@ -1125,7 +1145,34 @@ async def _reconcile_startup(
                 side = getattr(getattr(fill, "execution", None), "side", "")
                 price = getattr(getattr(fill, "execution", None), "price", 0.0)
                 if sym and price:
-                    _offline_fills[f"{sym}:{side}"] = float(price)
+                    _fill_prices[f"{sym}:{side}"] = float(price)
+
+            # Step 2: classify by completed order type (most accurate)
+            try:
+                completed = await ib_obj.reqCompletedOrdersAsync(apiOnly=False)
+                for order_state in completed:
+                    sym = getattr(getattr(order_state, "contract", None), "symbol", "")
+                    ref = getattr(getattr(order_state, "order", None), "orderRef", "")
+                    ot = getattr(getattr(order_state, "order", None), "orderType", "")
+                    status = getattr(getattr(order_state, "orderStatus", None), "status", "")
+                    if ref != "social_trading" or status != "Filled" or not sym:
+                        continue
+                    avg_fill = getattr(getattr(order_state, "orderStatus", None), "avgFillPrice", 0.0)
+                    if ot in ("STP", "STP LMT"):
+                        _offline_exit[sym] = (float(avg_fill), "STOP_LOSS")
+                    elif ot == "LMT":
+                        _offline_exit[sym] = (float(avg_fill), "TAKE_PROFIT")
+                    elif ot == "TRAIL":
+                        _offline_exit[sym] = (float(avg_fill), "TRAILING_STOP")
+            except Exception as exc:
+                logger.debug("[SYNC] reqCompletedOrders unavailable: %s", exc)
+
+            # Step 3: for symbols not classified by order type, use fill price
+            # from executions but don't guess exit reason beyond SL/TP
+            for key, price in _fill_prices.items():
+                sym, side = key.split(":", 1)
+                if sym not in _offline_exit and price > 0:
+                    _offline_exit[sym] = (price, "")  # price known, reason unknown
     except Exception as exc:
         logger.debug("[SYNC] Could not prefetch today's executions: %s", exc)
 
@@ -1141,22 +1188,23 @@ async def _reconcile_startup(
         stop_loss = float(p.get("stop_loss", 0.0))
         take_profit = float(p.get("take_profit", 0.0))
 
-        # Try to get exit price from today's execution history
-        close_side = "SLD" if direction == "LONG" else "BOT"
-        exit_price = _offline_fills.get(f"{ticker}:{close_side}", 0.0)
-
-        # Infer exit reason if we have fill price and known levels
-        exit_reason = "IB_EXTERNAL"
-        if exit_price > 0 and stop_loss > 0 and take_profit > 0:
-            sl_dist = abs(exit_price - stop_loss)
-            tp_dist = abs(exit_price - take_profit)
-            tolerance = exit_price * 0.005
-            if sl_dist <= tolerance or sl_dist < tp_dist * 0.5:
-                exit_reason = "STOP_LOSS"
-            elif tp_dist <= tolerance or tp_dist < sl_dist * 0.5:
-                exit_reason = "TAKE_PROFIT"
+        # Try to get exit price + reason from IB records
+        exit_price, exit_reason = _offline_exit.get(ticker, (0.0, "IB_EXTERNAL"))
+        if not exit_reason:
+            # Have fill price but no order-type classification.
+            # Only classify against ATR SL / TP — don't guess TRAILING_STOP.
+            if exit_price > 0 and stop_loss > 0 and take_profit > 0:
+                sl_dist = abs(exit_price - stop_loss)
+                tp_dist = abs(exit_price - take_profit)
+                tolerance = exit_price * 0.005
+                if sl_dist <= tolerance or sl_dist <= tp_dist:
+                    exit_reason = "STOP_LOSS"
+                elif tp_dist <= tolerance or tp_dist < sl_dist:
+                    exit_reason = "TAKE_PROFIT"
+                else:
+                    exit_reason = "IB_EXTERNAL"
             else:
-                exit_reason = "TRAILING_STOP"
+                exit_reason = "IB_EXTERNAL"
 
         engine.forget_position(ticker)  # type: ignore[union-attr]
         await redis.hdel(_HWM_REDIS_KEY, ticker)
@@ -1521,35 +1569,71 @@ async def _reconcile_external_closes(
             except Exception:
                 pass
 
-        # ── Infer exit price and reason from IB fills (session fills only) ───
+        # ── Infer exit price and reason from IB order/fill records ────────────
+        # Primary: find the filled OCA order for this ticker — its orderType is
+        # definitive (STP/STP LMT → STOP_LOSS, LMT → TAKE_PROFIT, TRAIL → TRAILING_STOP).
+        # Fallback: match closing-side fills by price vs known ATR SL/TP levels.
+        # Both methods only cover current-session data.
         exit_price = 0.0
         exit_reason = "IB_EXTERNAL"
         try:
             ib_obj = getattr(engine, "_ib", None)
             if ib_obj is not None:
                 close_side = "SLD" if direction == "LONG" else "BOT"
-                fills = [
-                    f for f in ib_obj.fills()
-                    if getattr(getattr(f, "contract", None), "symbol", "") == ticker
-                    and getattr(getattr(f, "execution", None), "side", "") == close_side
-                ]
-                if fills:
-                    # Most recent fill for this ticker on the closing side
-                    latest = max(fills, key=lambda f: getattr(f, "time", 0))
-                    exit_price = float(latest.execution.price)
-                    # Classify exit reason by comparing fill price to known levels
-                    if stop_loss > 0 and take_profit > 0:
-                        sl_dist = abs(exit_price - stop_loss)
-                        tp_dist = abs(exit_price - take_profit)
-                        tolerance = exit_price * 0.005  # 0.5% tolerance
-                        if sl_dist <= tolerance or sl_dist < tp_dist * 0.5:
-                            exit_reason = "STOP_LOSS"
-                        elif tp_dist <= tolerance or tp_dist < sl_dist * 0.5:
-                            exit_reason = "TAKE_PROFIT"
-                        else:
-                            exit_reason = "TRAILING_STOP"
+
+                # ── Method 1: OCA order type (most accurate) ──────────────────
+                # ib.trades() includes all orders this session: open, filled,
+                # cancelled, inactive.  When an OCA leg fills, the other legs
+                # become Inactive/Cancelled.  The filled leg has our orderRef.
+                _oca_classified = False
+                for trade in ib_obj.trades():
+                    sym = getattr(getattr(trade, "contract", None), "symbol", "")
+                    if sym != ticker:
+                        continue
+                    ref = getattr(getattr(trade, "order", None), "orderRef", "")
+                    if ref != "social_trading":
+                        continue
+                    status = getattr(getattr(trade, "orderStatus", None), "status", "")
+                    if status != "Filled":
+                        continue
+                    ot = getattr(getattr(trade, "order", None), "orderType", "")
+                    trade_fills = getattr(trade, "fills", [])
+                    if trade_fills:
+                        exit_price = float(trade_fills[-1].execution.price)
+                    if ot in ("STP", "STP LMT"):
+                        exit_reason = "STOP_LOSS"
+                    elif ot == "LMT":
+                        exit_reason = "TAKE_PROFIT"
+                    elif ot == "TRAIL":
+                        exit_reason = "TRAILING_STOP"
                     else:
-                        exit_reason = "IB_EXTERNAL"
+                        continue  # not a bracket leg — skip
+                    _oca_classified = True
+                    break
+
+                # ── Method 2: fill-price vs ATR SL/TP levels (fallback) ───────
+                if not _oca_classified:
+                    fills = [
+                        f for f in ib_obj.fills()
+                        if getattr(getattr(f, "contract", None), "symbol", "") == ticker
+                        and getattr(getattr(f, "execution", None), "side", "") == close_side
+                    ]
+                    if fills:
+                        latest = max(fills, key=lambda f: getattr(f, "time", 0))
+                        exit_price = float(latest.execution.price)
+                        # Only classify against ATR SL / TP — avoid TRAILING_STOP
+                        # as a catch-all since the trail level is not stored in params.
+                        if stop_loss > 0 and take_profit > 0:
+                            sl_dist = abs(exit_price - stop_loss)
+                            tp_dist = abs(exit_price - take_profit)
+                            tolerance = exit_price * 0.005  # 0.5%
+                            if sl_dist <= tolerance or sl_dist <= tp_dist:
+                                exit_reason = "STOP_LOSS"
+                            elif tp_dist <= tolerance or tp_dist < sl_dist:
+                                exit_reason = "TAKE_PROFIT"
+                            # else: stays IB_EXTERNAL — don't guess TRAILING_STOP
+                        else:
+                            exit_reason = "IB_EXTERNAL"
         except Exception as exc:
             logger.debug("[SYNC] Could not infer exit details for %s: %s", ticker, exc)
 
