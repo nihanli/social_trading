@@ -31,12 +31,144 @@ st.set_page_config(page_title="Optimization", page_icon="🔬", layout="wide")
 st.title("Parameter Optimization")
 st.caption("Analyze past trading sessions to improve configuration settings.")
 
-tab_history, tab_sensitivity, tab_suggest, tab_grid = st.tabs([
-    "Run History",
-    "Sensitivity Analysis",
-    "Auto-Suggestions",
-    "Grid Search",
-])
+# ── Manual snapshot trigger ───────────────────────────────────────────────────
+from social_trading.monitoring.streamlit.utils.db import get_connection  # noqa: E402
+from social_trading.monitoring.streamlit.utils.redis_ctrl import load_config  # noqa: E402
+
+with st.expander("💾 Force Save Today's Snapshot", expanded=False):
+    st.caption(
+        "The execution service writes a snapshot automatically after market close. "
+        "Use this button if the service was stopped before the EOD window fired."
+    )
+    snap_mode = st.radio("Mode", ["paper", "live"], horizontal=True, key="snap_mode")
+    if st.button("Save Snapshot Now"):
+        try:
+            import os, json as _json, hashlib  # noqa: E401
+            from datetime import datetime, timezone
+            from dataclasses import asdict
+
+            # Load current config from Redis (sync helper used by all Streamlit pages)
+            cfg_obj = load_config()
+
+            # Compute today's metrics from DB
+            conn = get_connection()
+            today = datetime.now(timezone.utc).date().isoformat()
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*), SUM(net_pnl),
+                           SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END),
+                           AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600),
+                           SUM(CASE WHEN exit_reason='TAKE_PROFIT'        THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason='TIME_STOP'          THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason='STOP_LOSS'          THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason='TRAILING_STOP'      THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason='SENTIMENT_REVERSAL' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason='MENTION_DECAY'      THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN exit_reason NOT IN (
+                               'TAKE_PROFIT','TIME_STOP','STOP_LOSS',
+                               'TRAILING_STOP','SENTIMENT_REVERSAL','MENTION_DECAY'
+                           ) THEN 1 ELSE 0 END),
+                           STDDEV(net_pnl)
+                    FROM trades
+                    WHERE closed_at::date = %s AND mode = %s AND exit_price IS NOT NULL
+                """, (today, snap_mode))
+                r = cur.fetchone()
+                total_trades = int(r[0] or 0)
+                total_pnl    = float(r[1] or 0)
+                win_count    = int(r[2] or 0)
+                avg_hold_hrs = float(r[3] or 0)
+                pnl_std      = float(r[11] or 0)
+                win_rate     = win_count / total_trades if total_trades else None
+                sharpe       = (total_pnl / total_trades / pnl_std * (252**0.5)) if total_trades and pnl_std else None
+
+                # P&L list for max drawdown
+                cur.execute("SELECT net_pnl FROM trades WHERE closed_at::date=%s AND mode=%s AND exit_price IS NOT NULL ORDER BY closed_at", (today, snap_mode))
+                pnls = [float(x[0]) for x in cur.fetchall() if x[0] is not None]
+                peak = max_dd = 0.0
+                cum = 0.0
+                for p in pnls:
+                    cum += p; peak = max(peak, cum)
+                    max_dd = max(max_dd, (peak - cum) / (abs(peak) + 1e-9))
+                pf_val = None
+                gw = sum(p for p in pnls if p > 0); gl = sum(abs(p) for p in pnls if p < 0)
+                if gl > 0: pf_val = round(gw / gl, 4)
+
+                cur.execute("""
+                    SELECT COUNT(*), SUM(CASE WHEN executed THEN 1 ELSE 0 END),
+                           AVG(quality_score), AVG(mention_zscore)
+                    FROM signals WHERE generated_at::date=%s
+                """, (today,))
+                s = cur.fetchone()
+
+                # Write to config_runs
+                cfg_json = _json.dumps(asdict(cfg_obj))
+                cfg_hash = hashlib.md5(cfg_json.encode()).hexdigest()[:16]
+
+                def _clamp(v, lo, hi, decimals):
+                    if v is None: return None
+                    return round(max(lo, min(hi, v)), decimals)
+
+                db_win_rate    = _clamp(win_rate,       0,    1,    4)
+                db_sharpe      = _clamp(sharpe,        -999, 999,   4)
+                db_max_dd      = _clamp(max_dd,         0,    1,    4)
+                db_hold_hrs    = _clamp(avg_hold_hrs,   0, 9999,    2)
+                db_pf          = _clamp(pf_val,         0, 9999,    4)
+                db_avg_qual    = _clamp(float(s[2]) if s[2] else None, 0, 9, 4)
+                db_avg_zscore  = _clamp(float(s[3]) if s[3] else None, -9999, 9999, 2)
+
+                vals = (
+                    snap_mode, cfg_json, cfg_hash,
+                    round(total_pnl, 2), total_trades, win_count, db_win_rate,
+                    db_sharpe, db_max_dd, db_hold_hrs, db_pf,
+                    int(r[4] or 0), int(r[5] or 0), int(r[6] or 0),
+                    int(r[7] or 0), int(r[8] or 0), int(r[9] or 0), int(r[10] or 0),
+                    int(s[0] or 0), int(s[1] or 0), db_avg_qual, db_avg_zscore,
+                )
+                cur.execute("""
+                    INSERT INTO config_runs (
+                        run_date, mode, config_snapshot, config_hash,
+                        total_pnl, total_trades, win_count, win_rate,
+                        sharpe_ratio, max_drawdown, avg_hold_hours, profit_factor,
+                        exits_take_profit, exits_time_stop, exits_atr_stop,
+                        exits_trailing_stop, exits_sentiment_reversal, exits_mention_decay,
+                        exits_manual, signals_generated, signals_executed,
+                        avg_signal_quality, avg_mention_zscore
+                    ) VALUES (
+                        CURRENT_DATE, %s, %s::jsonb, %s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                    )
+                    ON CONFLICT (run_date, mode) DO UPDATE SET
+                        config_snapshot=EXCLUDED.config_snapshot,
+                        config_hash=EXCLUDED.config_hash,
+                        total_pnl=EXCLUDED.total_pnl,
+                        total_trades=EXCLUDED.total_trades,
+                        win_count=EXCLUDED.win_count,
+                        win_rate=EXCLUDED.win_rate,
+                        sharpe_ratio=EXCLUDED.sharpe_ratio,
+                        max_drawdown=EXCLUDED.max_drawdown,
+                        avg_hold_hours=EXCLUDED.avg_hold_hours,
+                        profit_factor=EXCLUDED.profit_factor,
+                        exits_take_profit=EXCLUDED.exits_take_profit,
+                        exits_time_stop=EXCLUDED.exits_time_stop,
+                        exits_atr_stop=EXCLUDED.exits_atr_stop,
+                        exits_trailing_stop=EXCLUDED.exits_trailing_stop,
+                        exits_sentiment_reversal=EXCLUDED.exits_sentiment_reversal,
+                        exits_mention_decay=EXCLUDED.exits_mention_decay,
+                        exits_manual=EXCLUDED.exits_manual,
+                        signals_generated=EXCLUDED.signals_generated,
+                        signals_executed=EXCLUDED.signals_executed,
+                        avg_signal_quality=EXCLUDED.avg_signal_quality,
+                        avg_mention_zscore=EXCLUDED.avg_mention_zscore
+                """, vals)
+            conn.close()
+            st.success(f"✅ Snapshot saved for {today} ({snap_mode}): {total_trades} trades, P&L ${total_pnl:+,.2f}")
+            st.rerun()
+        except Exception as _snap_exc:
+            st.error(f"Failed: {_snap_exc}")
+
+st.divider()
+
 
 # ── Shared data — all config runs ─────────────────────────────────────────────
 runs_df = query("""
@@ -66,10 +198,21 @@ perf_cols = [
     "exits_trailing_stop", "exits_sentiment_reversal", "exits_mention_decay",
     "signals_generated", "signals_executed", "avg_signal_quality",
 ]
-analysis_df = pd.concat(
-    [runs_df[perf_cols].reset_index(drop=True), cfg_cols.reset_index(drop=True)],
-    axis=1,
-)
+if _no_data:
+    analysis_df = pd.DataFrame(columns=perf_cols)
+else:
+    available_perf_cols = [c for c in perf_cols if c in runs_df.columns]
+    analysis_df = pd.concat(
+        [runs_df[available_perf_cols].reset_index(drop=True), cfg_cols.reset_index(drop=True)],
+        axis=1,
+    )
+
+tab_history, tab_sensitivity, tab_suggest, tab_grid = st.tabs([
+    "Run History",
+    "Sensitivity Analysis",
+    "Auto-Suggestions",
+    "Grid Search",
+])
 
 # ════════════════════════════════════════════════════════════════
 # TAB 1 — RUN HISTORY
@@ -432,5 +575,3 @@ with tab_grid:
                 else:
                     st.success("Settings applied to Redis config. Services will pick up within ~1 minute.")
                     del st.session_state["grid_results"]
-
-    mode_filter = st.radio("Mode", ["All", "paper", "live"], horizontal=True, key="hist_mode")

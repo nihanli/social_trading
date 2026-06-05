@@ -762,14 +762,15 @@ async def run_exit_loop(
                 POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
             # ── 6. EOD snapshot ───────────────────────────────────────────────
-            # Save session metrics ~5 minutes after NYSE close (16:05 ET).
-            # Use a Redis key to ensure we only write once per calendar day.
+            # Save session metrics once per day after NYSE close (≥ 16:00 ET).
+            # Guard with a Redis key so restarts don't duplicate the write.
+            # Window: market closed AND hour ≥ 20 UTC (≥ 16:00 ET / 15:00 CT)
+            # — deliberately wide so we don't miss it even if the loop was slow.
             _eod_key = f"eod_snapshot_done:{datetime.now(UTC).date().isoformat()}:{mode}"
             if not _NYSE.is_open() and not await redis.exists(_eod_key):
                 now_dt = datetime.now(UTC)
-                # Only trigger in the 16:05–17:00 ET window (not pre-market)
-                ny_hour = (now_dt.hour - 4) % 24  # rough ET offset
-                if 20 <= now_dt.hour <= 21:  # 16:00–17:00 ET = 20:00–21:00 UTC
+                # Avoid pre-market false trigger: only after 20:00 UTC (16:00 ET)
+                if now_dt.hour >= 20:
                     await _save_eod_snapshot(cfg, mode)
                     await redis.setex(_eod_key, 86400, "1")  # expire after 24h
 
@@ -1524,7 +1525,7 @@ async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
             total_pnl,
         )
     except Exception as exc:
-        logger.error("[EOD] Failed to save session snapshot: %s", exc)
+        logger.error("[EOD] Failed to save session snapshot: %s", exc, exc_info=True)
 
 
 async def _reconcile_external_closes(
@@ -1832,7 +1833,7 @@ async def main(use_ibkr: bool = False) -> None:
             cfg_final = await SystemConfig.load(redis)
             await _save_eod_snapshot(cfg_final, mode)
         except Exception as exc:
-            logger.error("[EOD] Shutdown snapshot failed: %s", exc)
+            logger.error("[EOD] Shutdown snapshot failed: %s", exc, exc_info=True)
         await redis.aclose()
 
 
