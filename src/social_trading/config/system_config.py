@@ -268,19 +268,31 @@ class SystemConfig:
                 avg_signal_quality  = EXCLUDED.avg_signal_quality,
                 avg_mention_zscore  = EXCLUDED.avg_mention_zscore
         """
+        def _clamp(v, lo, hi, decimals):
+            if v is None:
+                return None
+            return round(max(lo, min(hi, float(v))), decimals)
+
         params = {
             "mode": mode,
             "config_snapshot": config_json,
             "config_hash": self.config_hash(),
+            "total_pnl":      metrics.get("total_pnl"),
+            "total_trades":   metrics.get("total_trades"),
+            "win_count":      metrics.get("win_count"),
+            "win_rate":       _clamp(metrics.get("win_rate"),          0,    1,    4),
+            "sharpe_ratio":   _clamp(metrics.get("sharpe_ratio"),   -999,  999,   4),
+            "max_drawdown":   _clamp(metrics.get("max_drawdown"),      0,    1,    4),
+            "avg_hold_hours": _clamp(metrics.get("avg_hold_hours"),    0, 9999,    2),
+            "profit_factor":  _clamp(metrics.get("profit_factor"),     0, 9999,    4),
             **{k: metrics.get(k) for k in [
-                "total_pnl", "total_trades", "win_count", "win_rate",
-                "sharpe_ratio", "max_drawdown", "avg_hold_hours", "profit_factor",
                 "exits_take_profit", "exits_time_stop", "exits_atr_stop",
                 "exits_trailing_stop", "exits_sentiment_reversal",
                 "exits_mention_decay", "exits_manual",
                 "signals_generated", "signals_executed",
-                "avg_signal_quality", "avg_mention_zscore",
             ]},
+            "avg_signal_quality": _clamp(metrics.get("avg_signal_quality"), 0,    9, 4),
+            "avg_mention_zscore": _clamp(metrics.get("avg_mention_zscore"), -9999, 9999, 2),
         }
         with conn, conn.cursor() as cur:
             cur.execute(sql, params)

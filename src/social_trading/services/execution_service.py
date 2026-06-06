@@ -1486,8 +1486,8 @@ async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
                     AVG(quality_score)                                      AS avg_quality,
                     AVG(mention_zscore)                                     AS avg_zscore
                 FROM signals
-                WHERE created_at::date = %(today)s AND mode = %(mode)s
-            """, {"today": today, "mode": mode})
+                WHERE generated_at::date = %(today)s
+            """, {"today": today})
             sig_row = cur.fetchone()
             sig_generated = int(sig_row[0] or 0)
             sig_executed  = int(sig_row[1] or 0)
