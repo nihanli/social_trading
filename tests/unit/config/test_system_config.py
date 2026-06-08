@@ -49,12 +49,26 @@ async def test_vix_crisis_must_exceed_high_fear(cfg: SystemConfig) -> None:
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 async def test_save_and_reload_round_trips(redis) -> None:
-    cfg = SystemConfig(signal_phase1_threshold=0.45, max_hold_hours=24)
+    cfg = SystemConfig(signal_phase1_threshold=0.45, max_hold_trading_days=5)
     await cfg.save(redis)
 
     loaded = await SystemConfig.load(redis)
     assert loaded.signal_phase1_threshold == 0.45
-    assert loaded.max_hold_hours == 24
+    assert loaded.max_hold_trading_days == 5
+
+
+async def test_load_migrates_legacy_max_hold_hours(redis) -> None:
+    """Old configs with max_hold_hours should be migrated on load."""
+    import json
+    from dataclasses import asdict
+    legacy = asdict(SystemConfig())
+    legacy.pop("max_hold_trading_days", None)
+    legacy["max_hold_hours"] = 48  # old field: 48h → ceil(48/6.5) = 8 days
+    await redis.set(SystemConfig.REDIS_KEY, json.dumps(legacy))
+
+    loaded = await SystemConfig.load(redis)
+    import math
+    assert loaded.max_hold_trading_days == math.ceil(48 / 6.5)
 
 
 async def test_load_returns_defaults_when_nothing_saved(redis) -> None:

@@ -757,13 +757,12 @@ with tab_risk:
         )
 
     with col_ex2:
-        cfg.max_hold_hours = st.number_input(
-            "Max hold time (hours)", 4, 120, int(cfg.max_hold_hours), 4,
+        cfg.max_hold_trading_days = st.number_input(
+            "Max hold time (trading days)", 1, 20, int(cfg.max_hold_trading_days), 1,
             help=(
                 "Hard time-based exit: a position is closed after it has been open for "
-                "this many hours regardless of PnL. Prevents indefinite holding of stale "
-                "social-momentum trades that were never stopped out or taken profit. "
-                "Default: 48 h."
+                "this many NYSE trading days (excludes weekends and market holidays). "
+                "Prevents indefinite holding of stale social-momentum trades. Default: 3 days."
             ),
         )
         cfg.signal_reversal_threshold = st.slider(

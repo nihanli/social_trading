@@ -113,6 +113,28 @@ class MarketHours:
         except Exception:
             return False
 
+    def trading_days_between(self, start: datetime, end: datetime) -> int:
+        """
+        Count completed NYSE trading days between *start* and *end*.
+
+        Returns the number of session dates strictly between start.date() and
+        end.date() (i.e. sessions_in_range minus the opening day itself).
+        Same-day open → 0.  Start after end → 0.
+
+        Degrades safely: returns 0 with a warning on any calendar error.
+        """
+        try:
+            start_date = pd.Timestamp(start.date())
+            end_date   = pd.Timestamp(end.date())
+            if end_date <= start_date:
+                return 0
+            sessions = self._cal.sessions_in_range(start_date, end_date)
+            # Subtract 1 so that opening and checking on the same session = 0 days held
+            return max(0, len(sessions) - 1)
+        except Exception as exc:
+            logger.warning("[MarketHours] trading_days_between failed (%s) — returning 0", exc)
+            return 0
+
     def status_str(self, dt: datetime | None = None) -> str:
         """Human-readable status string for logging/UI."""
         if self.is_open(dt):

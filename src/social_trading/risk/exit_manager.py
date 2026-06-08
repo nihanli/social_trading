@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from social_trading.config.system_config import SystemConfig
+from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Position
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class PositionExitManager:
         pnl = _unrealised_pnl(position, current_price)
         entry_cost = position.cost_basis
         hours_held = (now - position.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
+        trading_days_held = _NYSE.trading_days_between(position.opened_at, now)
 
         # ── 1. Emergency single-trade loss ────────────────────────────────────
         # Only activate when there is no valid ATR-based stop_loss already set.
@@ -155,11 +157,11 @@ class PositionExitManager:
                 )
 
         # ── 6. Hard time stop ─────────────────────────────────────────────────
-        if hours_held >= cfg.max_hold_hours:
+        if trading_days_held >= cfg.max_hold_trading_days:
             return ExitDecision(
                 should_exit=True,
                 reason="TIME_STOP",
-                detail=f"Held {hours_held:.1f}h >= max {cfg.max_hold_hours}h",
+                detail=f"Held {trading_days_held} trading days >= max {cfg.max_hold_trading_days}",
             )
 
         return _HOLD

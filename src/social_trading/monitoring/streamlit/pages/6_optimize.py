@@ -354,7 +354,7 @@ with tab_suggest:
                 if pd.notna(avg_ts) and avg_ts / avg_total > 0.5:
                     suggestions.append({
                         "symptom": f"Time stop dominates exits ({avg_ts / avg_total:.0%})",
-                        "suggestion": "Signals decay before target — reduce take_profit_pct or max_hold_hours",
+                        "suggestion": "Signals decay before target — reduce take_profit_pct or max_hold_trading_days",
                         "parameter": "take_profit_pct",
                         "current": cfg_now.take_profit_pct,
                         "recommended": round(max(cfg_now.take_profit_pct * 0.8, 0.01), 3),

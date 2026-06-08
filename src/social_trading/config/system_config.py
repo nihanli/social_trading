@@ -93,7 +93,7 @@ class SystemConfig:
 
     # ── Exit Rules ────────────────────────────────────────────────────────────
     atr_multiplier: float = 2.0             # stop: entry ± N × ATR
-    max_hold_hours: int = 48               # hard time stop
+    max_hold_trading_days: int = 3          # hard time stop in NYSE trading days
     trailing_stop_pct: float = 0.08        # trailing stop from high-water mark
     trailing_stop_activation_pct: float = 0.01  # trailing stop only activates once position is this % in profit
     trailing_stop_min_pct: float = 0.02    # floor for ATR stop distance and tightened trailing stop (mention decay)
@@ -159,6 +159,11 @@ class SystemConfig:
                         coerced[k] = v
                 except (ValueError, TypeError):
                     pass  # skip malformed values; field keeps its default
+            # Backward-compat: migrate old max_hold_hours → max_hold_trading_days
+            if "max_hold_hours" in stored and "max_hold_trading_days" not in stored:
+                old_hours = int(float(stored["max_hold_hours"]))
+                import math
+                coerced["max_hold_trading_days"] = max(1, math.ceil(old_hours / 6.5))
             return cls(**coerced)
         return cls()
 
@@ -193,8 +198,8 @@ class SystemConfig:
         if self.vix_crisis <= self.vix_high_fear:
             errors.append("vix_crisis must be > vix_high_fear")
 
-        if self.max_hold_hours < 1:
-            errors.append("max_hold_hours must be >= 1")
+        if self.max_hold_trading_days < 1:
+            errors.append("max_hold_trading_days must be >= 1")
 
         return errors
 

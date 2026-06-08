@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from unittest.mock import patch
+
 import pytest
 
 from social_trading.config.system_config import SystemConfig
@@ -25,7 +27,7 @@ def cfg() -> SystemConfig:
         atr_multiplier=2.0,
         take_profit_pct=0.04,
         trailing_stop_pct=0.08,
-        max_hold_hours=48,
+        max_hold_trading_days=3,
         loss_limit_single_trade=0.01,
         signal_reversal_threshold=-0.20,
         mention_decay_threshold=0.25,
@@ -309,7 +311,7 @@ def test_mention_decay_tightens_trailing_stop_exit(
         trailing_stop_pct=0.02,        # tightened by mention decay
         trailing_stop_activation_pct=0.0,  # activation cleared when decaying
         take_profit_pct=0.04,
-        max_hold_hours=48,
+        max_hold_trading_days=3,
         loss_limit_single_trade=0.01,
         signal_reversal_threshold=-0.20,
     )
@@ -335,17 +337,21 @@ def test_no_mention_decay_hard_exit(
 # ── TIME_STOP ─────────────────────────────────────────────────────────────────
 
 def test_time_stop(manager: PositionExitManager, cfg: SystemConfig) -> None:
-    pos = make_long(hours_ago=50)  # 50h > max_hold_hours=48
+    pos = make_long(hours_ago=1)
     now = datetime.now(UTC)
-    decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
+    # Mock calendar: 4 trading days held (> max 3)
+    with patch("social_trading.risk.exit_manager._NYSE.trading_days_between", return_value=4):
+        decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
     assert decision.should_exit is True
     assert decision.reason == "TIME_STOP"
 
 
 def test_time_stop_not_triggered(manager: PositionExitManager, cfg: SystemConfig) -> None:
-    pos = make_long(hours_ago=24)  # 24h < 48h max
+    pos = make_long(hours_ago=1)
     now = datetime.now(UTC)
-    decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
+    # Mock calendar: 2 trading days held (< max 3)
+    with patch("social_trading.risk.exit_manager._NYSE.trading_days_between", return_value=2):
+        decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
     assert decision.should_exit is False
 
 
