@@ -118,7 +118,7 @@ class MarketDataProvider(Protocol):
 class ExecutionEngine(Protocol):
     """
     Abstracts order submission and position management.
-    Implementations: PaperTradingEngine (tests/dev), IBKRExecutionEngine (live).
+    Implementations: IBKRExecutionEngine.
     """
 
     async def submit_signal(

@@ -66,6 +66,16 @@ with st.sidebar:
     mode_color = "🟢" if state["mode"] == "live" else "🟡"
     st.markdown(f"**Mode:** {mode_color} {state['mode'].upper()}")
 
+    ib_raw = state.get("ib_connected")
+    if state["mode"] == "live":
+        if ib_raw is None:
+            ib_icon, ib_label = "⚪", "Unknown (service offline)"
+        elif ib_raw == "1":
+            ib_icon, ib_label = "🟢", "Connected"
+        else:
+            ib_icon, ib_label = "🔴", "Disconnected"
+        st.markdown(f"**IB Status:** {ib_icon} {ib_label}")
+
     cb_color = {
         "NORMAL": "🟢",
         "REDUCED_50": "🟠",

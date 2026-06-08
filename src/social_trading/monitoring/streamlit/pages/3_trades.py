@@ -32,7 +32,8 @@ st_autorefresh(interval=15_000, key="trades_refresh")
 sidebar_refresh_countdown()
 st.title("Trade Analytics")
 
-mode = st.radio("Trading Mode", ["paper", "live"], horizontal=True)
+mode = "live"
+st.caption("Trading Mode: live")
 
 # ── Performance KPIs ──────────────────────────────────────────────────────────
 stats = query(f"""

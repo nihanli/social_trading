@@ -1,12 +1,12 @@
 """
-Execution Service — submits approved signals and manages open positions.
+Execution Service — submits approved signals and manages open positions via IBKR.
 
 Three concurrent loops:
 
   trade_loop:   Consumes selected_signals (consumer group "execution").
                 For each approved signal:
                   - Skip if halted or position already open for that ticker
-                  - Submit to ExecutionEngine (paper or IBKR)
+                  - Submit to the execution engine
                   - Persist trade to Redis (and optionally PostgreSQL)
 
   exit_loop:    Every cfg.signal_poll_interval_sec (default 60s):
@@ -20,16 +20,11 @@ Three concurrent loops:
   command_listener:  Subscribes to Redis pub/sub "trading:commands".
                      Handles UI commands: HALT_NEW, RESUME, CLOSE_ALL, CLOSE_TICKER.
 
-The ExecutionEngine is injected — swap PaperTradingEngine for IBKRExecutionEngine
-with no code changes in this file.
-
 Run:
-    python -m social_trading.services.execution_service            # paper mode
-    python -m social_trading.services.execution_service --ibkr     # live (requires TWS/IB Gateway)
+    python -m social_trading.services.execution_service     # requires TWS/IB Gateway
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import dataclasses
 import json
@@ -46,8 +41,7 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS
 from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Signal
-from social_trading.execution.paper import PaperTradingEngine
-from social_trading.core.protocols import MarketDataProvider
+from social_trading.core.protocols import ExecutionEngine, MarketDataProvider
 from social_trading.ingest.base import MENTION_HISTORY_TIER1_SOURCES
 from social_trading.market_data.composite import FallbackMarketData
 from social_trading.market_data.yfinance import YFinanceMarketData
@@ -72,8 +66,8 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-# Warning 10167 ("not subscribed, showing delayed data") is expected for paper
-# accounts; suppress ib_async wrapper noise to WARNING level.
+# Warning 10167 ("not subscribed, showing delayed data") can occur when market
+# data subscriptions are unavailable; suppress ib_async wrapper noise to WARNING level.
 logging.getLogger("ib_async.wrapper").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -118,7 +112,7 @@ def _stream_dict_to_approved(fields: dict) -> tuple[Signal, int, float, float] |
 
 async def _write_account_state(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Write account state to Redis hash 'account:state' for risk service."""
     state = await engine.get_account_state()
@@ -152,7 +146,7 @@ async def _publish_execution_event(
 
 async def _write_positions_to_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """
     Sync open positions to positions:live Redis hash.
@@ -268,10 +262,10 @@ async def _write_positions_to_redis(
 
 async def run_trade_loop(
     bus: TradingEventBus,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
     redis: aioredis.Redis,
     market_data: MarketDataProvider | None = None,
-    mode: str = "paper",
+    mode: str = "live",
     cfg: SystemConfig | None = None,
 ) -> None:
     """
@@ -474,12 +468,12 @@ async def run_trade_loop(
 
 
 async def run_exit_loop(
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
     exit_manager: PositionExitManager,
     market_data: MarketDataProvider,
     breaker: CircuitBreaker,
     redis: aioredis.Redis,
-    mode: str = "paper",
+    mode: str = "live",
 ) -> None:
     """
     Every poll_interval seconds:
@@ -523,17 +517,41 @@ async def run_exit_loop(
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
 
+    # Reconnect backoff: only attempt reconnect once every 5 minutes to avoid
+    # hammering TWS during a prolonged outage.
+    _RECONNECT_INTERVAL_SECS = 300
+    _last_reconnect_attempt: float = 0.0
+
     while True:
         try:
             cfg = await SystemConfig.load(redis)
 
             # ── 1. Connection guard ───────────────────────────────────────────
-            if not await engine.health_check():
-                logger.warning(
-                    "[SYNC] Engine not connected — skipping position evaluation this cycle"
-                )
-                await asyncio.sleep(cfg.signal_poll_interval_sec)
-                continue
+            _connected = await engine.health_check()
+            # Only publish IB status when running the IBKR engine.
+            if hasattr(engine, "_ib"):
+                await redis.setex("ib:connected", 90, "1" if _connected else "0")
+
+            if not _connected:
+                now_ts = asyncio.get_event_loop().time()
+                if hasattr(engine, "reconnect") and (now_ts - _last_reconnect_attempt) >= _RECONNECT_INTERVAL_SECS:
+                    _last_reconnect_attempt = now_ts
+                    logger.info("[SYNC] IB disconnected — attempting reconnect…")
+                    reconnected = await engine.reconnect()  # type: ignore[union-attr]
+                    if reconnected:
+                        logger.info("[SYNC] IB reconnected — resuming position evaluation")
+                        _last_ib_cache_refresh = now_ts  # mark cache as fresh
+                        await redis.setex("ib:connected", 90, "1")  # confirm reconnected immediately
+                        # fall through to normal cycle                    else:
+                        logger.warning("[SYNC] IB reconnect failed — will retry in %ds", _RECONNECT_INTERVAL_SECS)
+                        await asyncio.sleep(cfg.signal_poll_interval_sec)
+                        continue
+                else:
+                    logger.warning(
+                        "[SYNC] Engine not connected — skipping position evaluation this cycle"
+                    )
+                    await asyncio.sleep(cfg.signal_poll_interval_sec)
+                    continue
 
             # ── 1b. Periodic IB position cache refresh ────────────────────────
             # ib_async caches positions locally and updates them via fill events.
@@ -962,7 +980,7 @@ _POSITIONS_LIVE_KEY = "positions:live"
 
 async def _load_hwm_from_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Seed engine HWM from Redis at startup so trailing stops survive restarts."""
     try:
@@ -983,7 +1001,7 @@ async def _load_hwm_from_redis(
 
 async def _persist_hwm_to_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Persist engine HWM dict to Redis so trailing stops survive restarts."""
     try:
@@ -998,12 +1016,10 @@ async def _persist_hwm_to_redis(
 
 async def _load_position_params_from_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Restore position params (sl/tp/opened_at) from Redis so exit rules work after restart."""
     import json as _json  # noqa: PLC0415
-    if not hasattr(engine, "seed_position_params"):
-        return  # PaperTradingEngine doesn't need this (state is in-memory)
     try:
         raw = await redis.hgetall(_POSITION_PARAMS_KEY)
         if not raw:
@@ -1022,12 +1038,10 @@ async def _load_position_params_from_redis(
 
 async def _persist_position_params_to_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Persist position params (sl/tp/opened_at) to Redis so exit rules survive restarts."""
     import json as _json  # noqa: PLC0415
-    if not hasattr(engine, "get_position_params"):
-        return  # PaperTradingEngine doesn't need this
     try:
         params = engine.get_position_params()  # type: ignore[union-attr]
         if not params:
@@ -1040,7 +1054,7 @@ async def _persist_position_params_to_redis(
 
 async def _load_trail_orders_from_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """
     Seed engine TRAIL order IDs from Redis so update_trailing_stop() can cancel
@@ -1066,7 +1080,7 @@ async def _load_trail_orders_from_redis(
 
 async def _persist_trail_orders_to_redis(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
 ) -> None:
     """Persist TRAIL order IDs so they survive service restarts."""
     if not hasattr(engine, "get_trail_orders"):
@@ -1083,8 +1097,8 @@ async def _persist_trail_orders_to_redis(
 
 async def _reconcile_startup(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
-    mode: str = "paper",
+    engine: ExecutionEngine,
+    mode: str = "live",
 ) -> None:
     """
     Compare Redis position:params against IB's current positions on startup.
@@ -1099,8 +1113,6 @@ async def _reconcile_startup(
     Both are adopted into the exit loop — manual positions are labelled so the
     UI can display them differently.
     """
-    if not hasattr(engine, "get_position_params"):
-        return  # Paper engine — no IB to reconcile against
     params = engine.get_position_params()  # type: ignore[union-attr]
     cfg = await SystemConfig.load(redis)
 
@@ -1604,11 +1616,11 @@ async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
 
 async def _reconcile_external_closes(
     redis: aioredis.Redis,
-    engine: PaperTradingEngine,
+    engine: ExecutionEngine,
     prev_open: set[str],
     now_open: set[str],
     just_closed: set[str],
-    mode: str = "paper",
+    mode: str = "live",
 ) -> None:
     """
     Detect tickers that disappeared from IB positions without this service closing them.
@@ -1742,7 +1754,7 @@ async def _reconcile_external_closes(
 
 # ── UI command listener ────────────────────────────────────────────────────────
 
-async def run_command_listener(engine: PaperTradingEngine, redis: aioredis.Redis) -> None:
+async def run_command_listener(engine: ExecutionEngine, redis: aioredis.Redis) -> None:
     """
     Subscribe to the Redis pub/sub channel "trading:commands" and honour
     control messages published by the Streamlit UI.
@@ -1809,7 +1821,7 @@ async def run_command_listener(engine: PaperTradingEngine, redis: aioredis.Redis
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-async def main(use_ibkr: bool = False) -> None:
+async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
 
@@ -1819,49 +1831,43 @@ async def main(use_ibkr: bool = False) -> None:
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())
 
     # ── Build engine ──────────────────────────────────────────────────────────
-    if use_ibkr:
-        try:
-            from ib_async import IB  # noqa: PLC0415
+    try:
+        from ib_async import IB  # noqa: PLC0415
 
-            from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
-            from social_trading.market_data.ibkr import IBKRMarketData  # noqa: PLC0415
-            ib = IB()
-            port = int(os.getenv("IBKR_PORT", "7497"))  # default paper
-            client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
-            ib_account = os.getenv("IBKR_ACCOUNT", "").strip()
-            if ib_account.upper().startswith("DFQ"):
-                raise ValueError(
-                    f"IBKR_ACCOUNT={ib_account!r} is a Financial Advisor master account. "
-                    "This app only supports individual user accounts. "
-                    "Set IBKR_ACCOUNT to one of the sub-accounts (e.g. DUQ…)."
-                )
-            await ib.connectAsync("127.0.0.1", port, clientId=client_id)
-            # Explicitly load all existing positions into the ib_async local cache.
-            # ib_async does NOT auto-request positions on connect, so without this
-            # call any positions opened by a previous session would be invisible to
-            # ib.positions() and therefore absent from positions:live.
-            await ib.reqPositionsAsync()
-            engine: PaperTradingEngine = IBKRExecutionEngine(ib=ib, account=ib_account)  # type: ignore[assignment]
-            # Use IB for real-time prices; yfinance as fallback for any gaps
-            market_data: MarketDataProvider = FallbackMarketData(  # type: ignore[assignment]
-                primary=IBKRMarketData(ib=ib),     # IB: real-time quotes, ATR, OHLCV
-                secondary=YFinanceMarketData(),    # fallback: missing subscriptions / off-hours
+        from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
+        from social_trading.market_data.ibkr import IBKRMarketData  # noqa: PLC0415
+        ib = IB()
+        port = int(os.getenv("IBKR_PORT", "7497"))
+        client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
+        ib_account = os.getenv("IBKR_ACCOUNT", "").strip()
+        if ib_account.upper().startswith("DFQ"):
+            raise ValueError(
+                f"IBKR_ACCOUNT={ib_account!r} is a Financial Advisor master account. "
+                "This app only supports individual user accounts. "
+                "Set IBKR_ACCOUNT to one of the sub-accounts (e.g. DUQ…)."
             )
-            logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary, yfinance fallback)", port, client_id, ib_account or "(auto)")
-        except Exception as exc:
-            logger.error("IBKR connection failed: %s — falling back to paper mode", exc)
-            engine = PaperTradingEngine(initial_cash=100_000.0)
-            market_data: MarketDataProvider = YFinanceMarketData()  # type: ignore[assignment]
-    else:
-        initial_cash = float(os.getenv("PAPER_INITIAL_CASH", "100000"))
-        engine = PaperTradingEngine(initial_cash=initial_cash)
-        market_data: MarketDataProvider = YFinanceMarketData()  # type: ignore[assignment]
-        logger.info("Paper trading mode — initial cash $%.2f", initial_cash)
+        await ib.connectAsync("127.0.0.1", port, clientId=client_id)
+        # Explicitly load all existing positions into the ib_async local cache.
+        # ib_async does NOT auto-request positions on connect, so without this
+        # call any positions opened by a previous session would be invisible to
+        # ib.positions() and therefore absent from positions:live.
+        await ib.reqPositionsAsync()
+        engine: ExecutionEngine = IBKRExecutionEngine(ib=ib, account=ib_account, host="127.0.0.1", port=port, client_id=client_id)  # type: ignore[assignment]
+        # Use IB for real-time prices; yfinance as fallback for any gaps
+        market_data: MarketDataProvider = FallbackMarketData(  # type: ignore[assignment]
+            primary=IBKRMarketData(ib=ib),     # IB: real-time quotes, ATR, OHLCV
+            secondary=YFinanceMarketData(),    # fallback: missing subscriptions / off-hours
+        )
+        logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary, yfinance fallback)", port, client_id, ib_account or "(auto)")
+    except Exception as exc:
+        message = f"IBKR connection failed; execution service requires Interactive Brokers: {exc}"
+        logger.error(message)
+        raise RuntimeError(message) from exc
     exit_manager = PositionExitManager()
     breaker = CircuitBreaker(redis)
     bus = TradingEventBus(redis)
 
-    mode = "live" if use_ibkr else "paper"
+    mode = "live"
     await redis.set("trading:mode", mode)
 
     # Restore HWM and position params from Redis so trailing stops survive restarts
@@ -1915,10 +1921,7 @@ async def main(use_ibkr: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Execution service")
-    parser.add_argument("--ibkr", action="store_true", help="Use IBKR live engine")
-    args = parser.parse_args()
     try:
-        asyncio.run(main(use_ibkr=args.ibkr))
+        asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)

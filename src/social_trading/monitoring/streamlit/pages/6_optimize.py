@@ -40,7 +40,8 @@ with st.expander("💾 Force Save Today's Snapshot", expanded=False):
         "The execution service writes a snapshot automatically after market close. "
         "Use this button if the service was stopped before the EOD window fired."
     )
-    snap_mode = st.radio("Mode", ["paper", "live"], horizontal=True, key="snap_mode")
+    snap_mode = "live"
+    st.caption("Mode: live")
     if st.button("Save Snapshot Now"):
         try:
             import os, json as _json, hashlib  # noqa: E401
@@ -226,7 +227,7 @@ with tab_history:
     else:
         st.subheader("All Recorded Sessions")
 
-        mode_filter = st.radio("Mode", ["All", "paper", "live"], horizontal=True, key="hist_mode")
+        mode_filter = st.radio("Mode", ["All", "live"], horizontal=True, key="hist_mode")
         df = analysis_df if mode_filter == "All" else analysis_df[analysis_df["mode"] == mode_filter]
 
         if df.empty:
@@ -322,7 +323,7 @@ with tab_suggest:
         st.caption("Rule-based analysis of the last N sessions. Design §17c.")
 
         n_sessions = st.slider("Sessions to analyse", 5, 50, 10, key="suggest_n")
-        mode_s = st.radio("Mode", ["paper", "live", "All"], horizontal=True, key="suggest_mode")
+        mode_s = st.radio("Mode", ["live", "All"], horizontal=True, key="suggest_mode")
 
         sub = analysis_df if mode_s == "All" else analysis_df[analysis_df["mode"] == mode_s]
         recent = sub.sort_values("run_date", ascending=False).head(n_sessions)
@@ -393,7 +394,7 @@ with tab_suggest:
                         "suggestion": "Strategy not working — halt live trading and review all parameters",
                         "parameter": "N/A (manual review required)",
                         "current": "—",
-                        "recommended": "Switch to paper mode",
+                        "recommended": "Pause live trading and review settings",
                         "severity": "critical",
                     })
 
@@ -436,7 +437,7 @@ with tab_grid:
 
     col_gf1, col_gf2 = st.columns(2)
     days_grid = col_gf1.slider("Use last N days of trades", 7, 90, 30, key="grid_days")
-    grid_mode = col_gf2.radio("Mode", ["paper", "live", "All"], horizontal=True, key="grid_mode")
+    grid_mode = col_gf2.radio("Mode", ["live", "All"], horizontal=True, key="grid_mode")
 
     mode_clause = "" if grid_mode == "All" else f"AND mode = '{grid_mode}'"
     trades_df = query(f"""

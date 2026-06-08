@@ -66,6 +66,9 @@ class IBKRExecutionEngine:
         ib: Any,
         account: str = "",
         paper_prices: dict[str, float] | None = None,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 10,
     ) -> None:
         self._ib = ib
         self._account = account  # IB account number, e.g. "DU123456" (paper) or "U123456" (live)
@@ -77,6 +80,11 @@ class IBKRExecutionEngine:
         # Persisted position params: stop_loss, take_profit, opened_at per ticker.
         # Restored from Redis on restart so exit rules work correctly.
         self._position_params: dict[str, dict] = {}
+
+        # Connection params stored for reconnect attempts
+        self._host = host
+        self._port = port
+        self._client_id = client_id
 
         # Subscribe to ib_async's connectedEvent so the position cache is
         # automatically reseeded after TWS auto-restart or any reconnect.
@@ -98,8 +106,30 @@ class IBKRExecutionEngine:
         except Exception as exc:
             logger.warning("[IBKR] Failed to reseed position cache after reconnect: %s", exc)
 
-    # ── Price cache (mirrors PaperTradingEngine interface) ────────────────────
+    async def reconnect(self) -> bool:
+        """
+        Attempt to re-establish the IB/TWS connection using stored connection params.
 
+        Called by the exit loop when health_check() fails and the reconnect
+        backoff window has elapsed.  Returns True on success, False on failure.
+        """
+        try:
+            if self._ib.isConnected():
+                return True
+            logger.info(
+                "[IBKR] Attempting reconnect to %s:%d (clientId=%d)…",
+                self._host, self._port, self._client_id,
+            )
+            await self._ib.connectAsync(self._host, self._port, clientId=self._client_id)
+            await self._ib.reqPositionsAsync()
+            count = len([p for p in self._ib.positions() if p.position != 0])
+            logger.info("[IBKR] Reconnected — %d open position(s) in cache", count)
+            return True
+        except Exception as exc:
+            logger.warning("[IBKR] Reconnect failed: %s", exc)
+            return False
+
+    
     def set_price(self, ticker: str, price: float) -> None:
         """Cache latest price and update high-water mark for trailing stop."""
         self._prices[ticker] = price
@@ -189,7 +219,7 @@ class IBKRExecutionEngine:
               OCA orders are a server-side failsafe if the service goes offline.
         """
         if not _IB_AVAILABLE:
-            raise RuntimeError("ib_async is not installed — use PaperTradingEngine for testing")
+            raise RuntimeError("ib_async is not installed")
 
         from ib_async import LimitOrder, MarketOrder, OrderStatus, Stock, StopOrder  # noqa: PLC0415
 

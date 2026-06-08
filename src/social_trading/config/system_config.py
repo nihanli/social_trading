@@ -212,7 +212,7 @@ class SystemConfig:
     async def save_run_snapshot(
         self,
         metrics: dict,
-        mode: str = "paper",
+        mode: str = "live",
     ) -> None:
         """
         Save EOD config + session metrics to config_runs table.

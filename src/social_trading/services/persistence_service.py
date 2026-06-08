@@ -444,7 +444,7 @@ def _write_trade_opened(data: dict) -> None:
                         "stop_price": _float(data.get("stop_loss", 0)) or None,
                         "target_price": _float(data.get("take_profit", 0)) or None,
                         "opened_at": data.get("opened_at") or datetime.now(UTC).isoformat(),
-                        "mode": data.get("mode", "paper"),
+                        "mode": data.get("mode", "live"),
                         "stream_event_id": data.get("stream_event_id"),
                         "signal_generated_at": data.get("signal_generated_at") or None,
                     },
@@ -541,7 +541,7 @@ def _write_trade_closed(data: dict) -> None:
                             "net_pnl": synth_pnl,
                             "pnl": synth_pnl,
                             "pnl_pct": synth_pnl_pct,
-                            "mode": data.get("mode", "paper"),
+                            "mode": data.get("mode", "live"),
                             "stream_event_id": stream_id or None,
                         },
                     )
@@ -872,7 +872,7 @@ async def run_positions_sync_task(redis: aioredis.Redis) -> None:
                     nlv_raw = account.get(b"net_liquidation", account.get("net_liquidation", b"0"))
                     nlv = _float(nlv_raw.decode() if isinstance(nlv_raw, bytes) else nlv_raw)
                     mode_raw = await redis.get("trading:mode")
-                    mode = (mode_raw.decode() if isinstance(mode_raw, bytes) else (mode_raw or "paper"))
+                    mode = (mode_raw.decode() if isinstance(mode_raw, bytes) else (mode_raw or "live"))
                     # Only write when equity has changed meaningfully
                     if nlv > 0 and abs(nlv - last_equity) > 0.01:
                         await _run_db(_insert_account_equity, nlv, mode)

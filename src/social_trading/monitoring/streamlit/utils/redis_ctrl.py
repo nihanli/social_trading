@@ -70,7 +70,9 @@ def get_system_state() -> dict:
         "drawdown":        _af("drawdown_pct"),
         "net_liquidation": _af("net_liquidation", 100_000),
         "vix":             float(r.get("market:vix") or 0.0),
-        "mode":            r.get("trading:mode") or "paper",
+        "mode":            r.get("trading:mode") or "live",
+        # "1" = connected, "0" = disconnected, None = service not running
+        "ib_connected":    r.get("ib:connected"),
     }
 
 

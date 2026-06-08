@@ -12,7 +12,7 @@ Pipeline (design §6):
 
 Market data (price, VIX, ATR, ADV) is read from Redis hash keys written by
 the market_data service (Phase 5).  Until Phase 5 is implemented, sensible
-defaults are used so the risk service is fully operational in paper mode.
+defaults are used so the risk service remains operational before Phase 5 is implemented.
 
 Circuit breaker state is polled every cfg.signal_poll_interval_sec seconds
 (same cadence as signal evaluation) and persisted in Redis key "circuit:state".
@@ -132,7 +132,7 @@ async def _get_market_snapshot(
 ) -> dict:
     """
     Read market data hash written by Phase 5 market_data service.
-    Returns sensible defaults if key not present (paper mode / pre-Phase 5).
+    Returns sensible defaults if key not present (pre-Phase 5).
     """
     raw = await redis.hgetall(_MARKET_DATA_KEY.format(ticker=ticker))
     if not raw:
