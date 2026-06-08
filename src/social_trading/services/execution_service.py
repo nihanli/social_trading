@@ -667,7 +667,23 @@ async def run_exit_loop(
             now = datetime.now(UTC)
             just_closed: set[str] = set()
 
-            for pos in open_positions:
+            # ── 3a. Naked position check ──────────────────────────────────────
+            # Detect positions with no live server-side STP/TRAIL orders.
+            # Attempt reattach; fall back to immediate close if that fails.
+            # Tickers handled here are excluded from this cycle's exit evaluation
+            # to avoid race conditions with just-placed orders.
+            naked_closed, naked_reattached = await _check_naked_positions(
+                redis, engine, open_positions, system_params, cfg, mode,
+            )
+            if naked_closed:
+                just_closed.update(naked_closed)
+                await _write_positions_to_redis(redis, engine)
+            handled_this_cycle = naked_closed | naked_reattached
+            open_positions_for_eval = [
+                p for p in open_positions if p.ticker not in handled_this_cycle
+            ]
+
+            for pos in open_positions_for_eval:
                 current_price = engine.get_price(pos.ticker) or pos.entry_price
                 sentiment, mention_ratio = await _get_sentiment_context(redis, pos.ticker, cfg=cfg)
 
@@ -740,6 +756,8 @@ async def run_exit_loop(
             # ── 4. Reconcile external IB closes ──────────────────────────────
             # Tickers that were open last cycle but are now gone (and we didn't
             # close them) were filled by IB's bracket legs or closed in TWS.
+            # Use the full open_positions list (including naked-handled ones) so
+            # external closes are tracked regardless of how the position ended.
             now_open_tickers = {p.ticker for p in open_positions} - just_closed
             if _prev_open_tickers:
                 externally_closed = _prev_open_tickers - now_open_tickers - just_closed
@@ -1092,6 +1110,198 @@ async def _persist_trail_orders_to_redis(
         logger.warning("[TRAIL] Failed to persist trail order IDs to Redis: %s", exc)
 
 
+async def _check_naked_positions(
+    redis: aioredis.Redis,
+    engine: ExecutionEngine,
+    open_positions: list,
+    system_params: dict,
+    cfg: "SystemConfig",
+    mode: str,
+) -> tuple[set[str], set[str]]:
+    """
+    Detect system-tracked positions that have no live server-side OCA protective
+    orders in IB (a "naked" position — open in IB with no stop/trail bracket).
+
+    For each naked position:
+      1. Reconstruct stop_loss / take_profit from entry_price + ATR if missing.
+      2. Attempt to reattach OCA orders (STP, LMT, TRAIL) via
+         engine.reattach_oca_orders().
+      3. If reattach fails (or params are completely missing), close the position
+         immediately to avoid running unprotected.
+
+    Returns:
+        (just_closed, just_reattached) — both sets should be excluded from
+        exit rule evaluation for the remainder of this cycle.
+    """
+    just_closed: set[str] = set()
+    just_reattached: set[str] = set()
+
+    # Only applicable to live IBKR engine with active connection
+    if not hasattr(engine, "_ib") or not hasattr(engine, "reattach_oca_orders"):
+        return just_closed, just_reattached
+    ib = engine._ib  # type: ignore[union-attr]
+    if not ib.isConnected():
+        return just_closed, just_reattached
+
+    # ── Build set of tickers with live *protective* OCA orders ───────────────
+    # A ticker is "protected" only if IB has at least one active STP/TRAIL order
+    # placed by this system (orderRef == ORDER_REF).  A bare LMT (TP-only) is not
+    # a protective order — it cannot prevent unlimited loss.
+    _protective_order_types = {"STP", "STP LMT", "TRAIL"}
+    _done_statuses = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+    protected_tickers: set[str] = set()
+    try:
+        from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
+        for trade in ib.openTrades():
+            sym = getattr(getattr(trade, "contract", None), "symbol", "")
+            ord_obj = getattr(trade, "order", None)
+            ref = getattr(ord_obj, "orderRef", "")
+            ot = getattr(ord_obj, "orderType", "")
+            status = getattr(getattr(trade, "orderStatus", None), "status", "")
+            if not sym or ref != ORDER_REF:
+                continue
+            if status in _done_statuses:
+                continue
+            if ot in _protective_order_types:
+                protected_tickers.add(sym)
+    except Exception as exc:
+        logger.warning("[NAKED] Could not inspect IB open trades: %s — skipping check", exc)
+        return just_closed, just_reattached  # cannot safely assess
+
+    naked = [p for p in open_positions if p.ticker not in protected_tickers]
+    if not naked:
+        return just_closed, just_reattached
+
+    for pos in naked:
+        ticker = pos.ticker
+        params = system_params.get(ticker, {})
+        current_price = engine.get_price(ticker) or pos.entry_price  # type: ignore[union-attr]
+        entry_price = float(params.get("entry_price", 0.0)) or pos.entry_price
+        stop_loss = float(params.get("stop_loss", 0.0))
+        take_profit = float(params.get("take_profit", 0.0))
+        direction = params.get("direction", pos.direction)
+        quantity = int(params.get("shares", pos.shares)) or pos.shares
+
+        logger.warning(
+            "[NAKED] %s: no server-side protective orders — "
+            "sl=%.4f tp=%.4f entry=%.4f current=%.4f",
+            ticker, stop_loss, take_profit, entry_price, current_price,
+        )
+
+        # ── Reconstruct SL/TP from entry_price + ATR when persisted levels missing ──
+        # Always use entry_price as anchor (not current_price) to preserve the
+        # original risk envelope intended at order time.
+        if (stop_loss <= 0 or take_profit <= 0) and entry_price > 0:
+            atr = 0.0
+            try:
+                mkt_raw = await redis.hgetall(f"market_data:{ticker}")
+                atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
+                if atr_val:
+                    atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
+            except Exception:
+                pass
+            if atr > 0:
+                if stop_loss <= 0:
+                    stop_loss = round(
+                        entry_price - cfg.atr_multiplier * atr
+                        if direction == "LONG"
+                        else entry_price + cfg.atr_multiplier * atr,
+                        2,
+                    )
+                    logger.info(
+                        "[NAKED] %s: reconstructed sl=%.4f from entry=%.4f ATR=%.4f",
+                        ticker, stop_loss, entry_price, atr,
+                    )
+                if take_profit <= 0:
+                    take_profit = round(
+                        entry_price * (1.0 + cfg.take_profit_pct)
+                        if direction == "LONG"
+                        else entry_price * (1.0 - cfg.take_profit_pct),
+                        2,
+                    )
+                    logger.info(
+                        "[NAKED] %s: reconstructed tp=%.4f from entry=%.4f",
+                        ticker, take_profit, entry_price,
+                    )
+
+        # If we have absolutely no usable params AND no entry price to reconstruct
+        # from, close immediately — cannot define any risk envelope.
+        if entry_price <= 0 and stop_loss <= 0 and take_profit <= 0:
+            logger.error(
+                "[NAKED] %s: no entry_price and no SL/TP — closing for safety",
+                ticker,
+            )
+            try:
+                await engine.close_position(ticker, reason="NAKED_NO_PARAMS")  # type: ignore[union-attr]
+                just_closed.add(ticker)
+                await _publish_execution_event(redis, "position_closed", {
+                    "ticker": ticker,
+                    "exit_price": current_price,
+                    "exit_reason": "NAKED_NO_PARAMS",
+                    "shares": quantity,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "closed_at": datetime.now(UTC).isoformat(),
+                    "opened_at": params.get("opened_at", ""),
+                    "mode": mode,
+                })
+                await redis.hdel(_HWM_REDIS_KEY, ticker)
+                await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+            except Exception as exc:
+                logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
+            continue
+
+        # ── Attempt reattach ──────────────────────────────────────────────────
+        try:
+            success = await engine.reattach_oca_orders(  # type: ignore[union-attr]
+                ticker=ticker,
+                direction=direction,
+                quantity=quantity,
+                current_price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trailing_stop_pct=cfg.trailing_stop_pct,
+            )
+        except Exception as exc:
+            logger.error("[NAKED] %s: reattach raised exception: %s", ticker, exc)
+            success = False
+
+        if success:
+            # Update in-memory params with possibly-reconstructed SL/TP so the
+            # exit loop and step-5 persistence see the corrected values.
+            if hasattr(engine, "_position_params") and ticker in engine._position_params:  # type: ignore[union-attr]
+                engine._position_params[ticker]["stop_loss"] = stop_loss  # type: ignore[union-attr]
+                engine._position_params[ticker]["take_profit"] = take_profit  # type: ignore[union-attr]
+            just_reattached.add(ticker)
+            logger.warning(
+                "[NAKED] %s: OCA bracket reattached — sl=%.4f tp=%.4f", ticker, stop_loss, take_profit,
+            )
+        else:
+            logger.error(
+                "[NAKED] %s: reattach failed — closing to avoid unprotected position", ticker,
+            )
+            try:
+                await engine.close_position(ticker, reason="NAKED_REATTACH_FAILED")  # type: ignore[union-attr]
+                just_closed.add(ticker)
+                await _publish_execution_event(redis, "position_closed", {
+                    "ticker": ticker,
+                    "exit_price": current_price,
+                    "exit_reason": "NAKED_REATTACH_FAILED",
+                    "shares": quantity,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "closed_at": datetime.now(UTC).isoformat(),
+                    "opened_at": params.get("opened_at", ""),
+                    "mode": mode,
+                })
+                await redis.hdel(_HWM_REDIS_KEY, ticker)
+                await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+            except Exception as exc:
+                logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
+
+    return just_closed, just_reattached
+
+
 async def _reconcile_startup(
     redis: aioredis.Redis,
     engine: ExecutionEngine,
@@ -1144,6 +1354,10 @@ async def _reconcile_startup(
     # TWS session — may include recently filled bracket legs.
     # Both keyed by symbol → (exit_price, exit_reason).
     _offline_exit: dict[str, tuple[float, str]] = {}
+    # Tickers where this system placed an entry (MKT) order, confirmed via
+    # reqCompletedOrdersAsync.  Used to reclassify orphaned positions that
+    # have no remaining open orders (e.g. OCA failed) but were system-opened.
+    _system_entry_tickers: set[str] = set()
     try:
         ib_obj = getattr(engine, "_ib", None)
         if ib_obj is not None:
@@ -1175,6 +1389,11 @@ async def _reconcile_startup(
                         _offline_exit[sym] = (float(avg_fill), "TAKE_PROFIT")
                     elif ot == "TRAIL":
                         _offline_exit[sym] = (float(avg_fill), "TRAILING_STOP")
+                    elif ot == "MKT":
+                        # Entry market order placed by this system — remember the symbol
+                        # so orphaned positions with no open orders are not misclassified
+                        # as manual when OCA failed and left no remaining open orders.
+                        _system_entry_tickers.add(sym)
             except Exception as exc:
                 logger.debug("[SYNC] reqCompletedOrders unavailable: %s", exc)
 
@@ -1279,6 +1498,18 @@ async def _reconcile_startup(
             engine.seed_trail_order_id(sym, oid)  # type: ignore[union-attr]
             logger.info("[SYNC] %s: recovered TRAIL order ID %d from IB open trades", sym, oid)
 
+    # Fix 4: Reclassify orphaned positions that were opened by this system but have
+    # no remaining open orders (e.g. OCA placement failed).  openTrades() alone can't
+    # detect these; reqCompletedOrdersAsync() MKT fills with ORDER_REF confirm origin.
+    newly_confirmed = (_system_entry_tickers & orphaned_in_ib) - system_tickers
+    if newly_confirmed:
+        system_tickers |= newly_confirmed
+        logger.info(
+            "[SYNC] Reclassified %s as system-managed via completed MKT entry fills "
+            "(had no open orders — likely OCA failure)",
+            newly_confirmed,
+        )
+
     if not orphaned_in_ib:
         return
 
@@ -1321,6 +1552,8 @@ async def _reconcile_startup(
                 "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
                 "direction": pos.direction,
                 "source": "system",
+                "entry_price": pos.entry_price,
+                "shares": pos.shares,
                 # Fix 3: seed OCA group and initial trail pct so update_trailing_stop()
                 # links replacement TRAIL orders into the correct OCA bracket.
                 "oca_group": oca_groups.get(pos.ticker, ""),
@@ -1362,6 +1595,8 @@ async def _reconcile_startup(
                     "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
                     "direction": pos.direction,
                     "source": "system",
+                    "entry_price": pos.entry_price,
+                    "shares": pos.shares,
                     "oca_group": oca_groups.get(pos.ticker, ""),
                     "trailing_stop_pct_applied": cfg.trailing_stop_pct,
                 }

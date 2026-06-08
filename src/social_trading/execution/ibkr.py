@@ -544,21 +544,19 @@ class IBKRExecutionEngine:
                         ticker, t.order.orderId, t.orderStatus.status,
                     )
 
-            # ── 4. If OCA raised a Python exception, close immediately ────────
+            # ── 4. Handle OCA failures ─────────────────────────────────────────
+            # OCA orders are a server-side failsafe. If they fail the software
+            # exit loop (ATR stop / trailing stop / TP) is still active and will
+            # manage the position. Attempting emergency close here is risky —
+            # if the close also fails, the position is left open AND untracked.
+            # Instead: seed params and return "submitted" so the trade loop
+            # records the open. Log prominently so the user is aware.
             if oca_errors:
                 logger.error(
-                    "[IBKR] OCA submission failed (%s), closing position: %s",
-                    oca_errors, ticker,
-                )
-                await self.close_position(ticker, reason="OCA_FAILED")
-                return OrderResult(
-                    order_id=str(entry_id),
-                    ticker=ticker,
-                    direction=signal.direction,
-                    quantity=quantity,
-                    fill_price=fill_price,
-                    status="rejected",
-                    error=f"OCA failed, position closed: {oca_errors}",
+                    "[IBKR] OCA placement failed for %s (%s) — "
+                    "position is open WITHOUT server-side bracket. "
+                    "Software exit loop will manage exits.",
+                    ticker, oca_errors,
                 )
 
             # Save position params so exit rules work correctly after restart
@@ -787,6 +785,166 @@ class IBKRExecutionEngine:
         except Exception as exc:
             logger.error("[IBKR] update_trailing_stop failed for %s: %s", ticker, exc)
             return False
+
+    async def reattach_oca_orders(
+        self,
+        ticker: str,
+        direction: str,
+        quantity: int,
+        current_price: float,
+        stop_loss: float,
+        take_profit: float,
+        trailing_stop_pct: float = 0.08,
+    ) -> bool:
+        """
+        Place OCA stop/limit/trail orders for an existing open position that has no
+        server-side bracket (naked position).
+
+        Called by the exit loop when a position is detected as unprotected.
+        Returns True if at least one *protective* leg (STP or TRAIL) was confirmed
+        active/submitted by IB. Returns False on total failure — caller should then
+        close the position.
+
+        `current_price` is used only to validate SL/TP direction; SL and TP must
+        already be reconstructed from entry_price + ATR by the caller.
+        """
+        if not _IB_AVAILABLE:
+            return False
+
+        from ib_async import LimitOrder, Order as _IbOrder, Stock, StopOrder  # noqa: PLC0415
+
+        close_action = "SELL" if direction == "LONG" else "BUY"
+        new_oca_group = f"oca_reattach_{str(uuid.uuid4())[:8]}"
+
+        try:
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+        except Exception as exc:
+            logger.error("[IBKR] reattach_oca: could not qualify contract for %s: %s", ticker, exc)
+            return False
+
+        placed_legs: list = []
+
+        # ── Stop loss leg ─────────────────────────────────────────────────────
+        sl_valid = (
+            stop_loss > 0
+            and (
+                (direction == "LONG"  and stop_loss < current_price)
+                or (direction == "SHORT" and stop_loss > current_price)
+            )
+        )
+        if sl_valid:
+            try:
+                stop_order = StopOrder(close_action, quantity, round(stop_loss, 2))
+                stop_order.ocaGroup   = new_oca_group
+                stop_order.ocaType    = 1
+                stop_order.tif        = "GTC"
+                stop_order.outsideRth = False
+                stop_order.transmit   = True
+                stop_order.orderRef   = ORDER_REF
+                if self._account:
+                    stop_order.account = self._account
+                sl_trade = self._ib.placeOrder(contract, stop_order)
+                placed_legs.append(("STP", sl_trade))
+                logger.info(
+                    "[IBKR] reattach OCA stop: %s sl=%.4f orderId=%d",
+                    ticker, stop_loss, sl_trade.order.orderId,
+                )
+            except Exception as exc:
+                logger.error("[IBKR] reattach OCA stop failed for %s: %s", ticker, exc)
+        else:
+            logger.warning(
+                "[IBKR] reattach: SL=%.4f invalid vs current=%.4f (%s) — stop leg skipped",
+                stop_loss, current_price, direction,
+            )
+
+        # ── Take profit leg ───────────────────────────────────────────────────
+        tp_valid = (
+            take_profit > 0
+            and (
+                (direction == "LONG"  and take_profit > current_price)
+                or (direction == "SHORT" and take_profit < current_price)
+            )
+        )
+        if tp_valid:
+            try:
+                limit_order = LimitOrder(close_action, quantity, round(take_profit, 2))
+                limit_order.ocaGroup = new_oca_group
+                limit_order.ocaType  = 1
+                limit_order.tif      = "GTC"
+                limit_order.transmit = True
+                limit_order.orderRef = ORDER_REF
+                if self._account:
+                    limit_order.account = self._account
+                tp_trade = self._ib.placeOrder(contract, limit_order)
+                placed_legs.append(("LMT", tp_trade))
+                logger.info(
+                    "[IBKR] reattach OCA limit: %s tp=%.4f orderId=%d",
+                    ticker, take_profit, tp_trade.order.orderId,
+                )
+            except Exception as exc:
+                logger.error("[IBKR] reattach OCA limit failed for %s: %s", ticker, exc)
+
+        # ── Trailing stop leg (always attempted — primary protection fallback) ──
+        if trailing_stop_pct > 0:
+            try:
+                trail_order = _IbOrder()
+                trail_order.action          = close_action
+                trail_order.totalQuantity   = quantity
+                trail_order.orderType       = "TRAIL"
+                trail_order.trailingPercent = trailing_stop_pct * 100
+                trail_order.tif             = "GTC"
+                trail_order.outsideRth      = False
+                trail_order.ocaGroup        = new_oca_group
+                trail_order.ocaType         = 1
+                trail_order.transmit        = True
+                trail_order.orderRef        = ORDER_REF
+                if self._account:
+                    trail_order.account = self._account
+                ts_trade = self._ib.placeOrder(contract, trail_order)
+                placed_legs.append(("TRAIL", ts_trade))
+                self._ts_order_id[ticker] = ts_trade.order.orderId
+                logger.info(
+                    "[IBKR] reattach OCA trail: %s trail_pct=%.1f%% orderId=%d",
+                    ticker, trailing_stop_pct * 100, ts_trade.order.orderId,
+                )
+            except Exception as exc:
+                logger.error("[IBKR] reattach OCA trail failed for %s: %s", ticker, exc)
+
+        if not placed_legs:
+            logger.error("[IBKR] reattach_oca: no legs placed at all for %s", ticker)
+            return False
+
+        # ── Wait for IB order acknowledgement ─────────────────────────────────
+        # Allow IB time to process and return order status so we can detect
+        # immediate rejects (Inactive/Cancelled) before declaring success.
+        await asyncio.sleep(1.0)
+
+        _done_states = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+        active_legs = [
+            (leg_type, t) for leg_type, t in placed_legs
+            if getattr(t.orderStatus, "status", "") not in _done_states
+        ]
+
+        # Require at least one *protective* leg (stop or trail) confirmed active
+        has_protective = any(leg_type in ("STP", "TRAIL") for leg_type, _ in active_legs)
+
+        if has_protective:
+            if ticker in self._position_params:
+                self._position_params[ticker]["oca_group"] = new_oca_group
+            logger.warning(
+                "[IBKR] reattach OCA succeeded for %s — oca_group=%s legs=%s",
+                ticker, new_oca_group,
+                [t for t, _ in active_legs],
+            )
+            return True
+
+        logger.error(
+            "[IBKR] reattach OCA: no protective leg confirmed active for %s "
+            "(active=%s, placed=%s)",
+            ticker, [t for t, _ in active_legs], [t for t, _ in placed_legs],
+        )
+        return False
 
     async def get_positions(self) -> list[Position]:
         """Return open positions from IBKR as Position objects.

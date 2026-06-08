@@ -290,6 +290,39 @@ def _mark_signal_executed(ticker: str, generated_at: str) -> None:
         conn.close()
 
 
+def _mark_latest_signal_executed(ticker: str, within_hours: int = 48) -> bool:
+    """
+    Best-effort: mark the most recent approved-but-unexecuted signal for `ticker`
+    as executed. Used when we have an open position (adopted from IB or prior session)
+    but no precise signal_generated_at timestamp.
+
+    Returns True if a row was updated, False otherwise.
+    """
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET    executed = TRUE,
+                           approved = TRUE
+                    WHERE  id = (
+                        SELECT id FROM signals
+                        WHERE  ticker = %s
+                          AND  executed = FALSE
+                          AND  generated_at >= NOW() - (%s || ' hours')::interval
+                        ORDER  BY generated_at DESC
+                        LIMIT  1
+                    )
+                    """,
+                    (ticker, str(within_hours)),
+                )
+                return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def _aggregate_sentiment() -> int:
     """
     Roll up sentiment_scores into 15-minute sentiment_aggregates buckets.
@@ -441,8 +474,10 @@ def _write_trade_opened(data: dict) -> None:
                         "direction": data.get("direction", "LONG"),
                         "shares": _int(data.get("shares", 0)),
                         "entry_price": _float(data.get("entry_price", 0)),
-                        "stop_price": _float(data.get("stop_loss", 0)) or None,
-                        "target_price": _float(data.get("take_profit", 0)) or None,
+                        # Accept both naming conventions: trade loop uses stop_loss/take_profit;
+                        # reconcile/adoption events use stop_price/target_price.
+                        "stop_price": _float(data.get("stop_loss") or data.get("stop_price", 0)) or None,
+                        "target_price": _float(data.get("take_profit") or data.get("target_price", 0)) or None,
                         "opened_at": data.get("opened_at") or datetime.now(UTC).isoformat(),
                         "mode": data.get("mode", "live"),
                         "stream_event_id": data.get("stream_event_id"),
@@ -796,12 +831,29 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
                 try:
                     if event_type == "position_opened":
                         await _run_db(_write_trade_opened, fields)
-                        # Also mark the originating signal as executed
+                        # Mark the originating signal as executed.
+                        # If signal_generated_at is present (normal trade loop path), use it
+                        # for an exact match.  For adopted/reconciled positions that lack a
+                        # timestamp, fall back to marking the most recent approved-but-unexecuted
+                        # signal for the ticker (within the last 48 h) as a best effort.
                         signal_ts = fields.get("signal_generated_at", "")
                         ticker = fields.get("ticker", "")
-                        if ticker and signal_ts:
+                        if ticker:
                             try:
-                                await _run_db(_mark_signal_executed, ticker, signal_ts)
+                                if signal_ts:
+                                    await _run_db(_mark_signal_executed, ticker, signal_ts)
+                                else:
+                                    updated = await _run_db(_mark_latest_signal_executed, ticker)
+                                    if updated:
+                                        logger.info(
+                                            "[EXEC_EVENTS] Marked latest signal executed for adopted position %s",
+                                            ticker,
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "[EXEC_EVENTS] No unexecuted signal found for adopted position %s",
+                                            ticker,
+                                        )
                             except Exception as exc:
                                 logger.warning(
                                     "Failed to mark signal executed (%s): %s", ticker, exc
