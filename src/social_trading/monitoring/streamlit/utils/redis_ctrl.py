@@ -73,6 +73,7 @@ def get_system_state() -> dict:
         "mode":            r.get("trading:mode") or "live",
         # "1" = connected, "0" = disconnected, None = service not running
         "ib_connected":    r.get("ib:connected"),
+        "svc_alive":       r.get("service:heartbeat") is not None,
     }
 
 

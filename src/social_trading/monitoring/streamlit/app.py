@@ -68,8 +68,8 @@ with st.sidebar:
 
     ib_raw = state.get("ib_connected")
     if state["mode"] == "live":
-        if ib_raw is None:
-            ib_icon, ib_label = "⚪", "Unknown (service offline)"
+        if not state.get("svc_alive"):
+            ib_icon, ib_label = "⚪", "Service offline"
         elif ib_raw == "1":
             ib_icon, ib_label = "🟢", "Connected"
         else:

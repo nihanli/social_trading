@@ -528,9 +528,6 @@ async def run_exit_loop(
 
             # ── 1. Connection guard ───────────────────────────────────────────
             _connected = await engine.health_check()
-            # Only publish IB status when running the IBKR engine.
-            if hasattr(engine, "_ib"):
-                await redis.setex("ib:connected", 90, "1" if _connected else "0")
 
             if not _connected:
                 now_ts = asyncio.get_event_loop().time()
@@ -541,8 +538,8 @@ async def run_exit_loop(
                     if reconnected:
                         logger.info("[SYNC] IB reconnected — resuming position evaluation")
                         _last_ib_cache_refresh = now_ts  # mark cache as fresh
-                        await redis.setex("ib:connected", 90, "1")  # confirm reconnected immediately
-                        # fall through to normal cycle                    else:
+                        # fall through to normal cycle
+                    else:
                         logger.warning("[SYNC] IB reconnect failed — will retry in %ds", _RECONNECT_INTERVAL_SECS)
                         await asyncio.sleep(cfg.signal_poll_interval_sec)
                         continue
@@ -1821,6 +1818,31 @@ async def run_command_listener(engine: ExecutionEngine, redis: aioredis.Redis) -
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+async def _run_heartbeat(engine: ExecutionEngine, redis: aioredis.Redis) -> None:
+    """
+    Lightweight heartbeat task: runs every 10 seconds, writes two Redis keys:
+      service:heartbeat  (TTL=30s) — presence means the service is alive
+      ib:connected       (TTL=30s) — "1" connected, "0" disconnected
+
+    Keeping this in a dedicated task (instead of the 60s exit loop) means
+    the UI always gets a fresh status regardless of how long exit-loop cycles take.
+    If the service dies, both keys expire within 30 seconds and the UI shows
+    "Service offline" / "Unknown" immediately.
+    """
+    _HB_TTL = 30
+    _HB_INTERVAL = 10
+    while True:
+        try:
+            connected = await engine.health_check()
+            await redis.setex("service:heartbeat", _HB_TTL, "1")
+            await redis.setex("ib:connected", _HB_TTL, "1" if connected else "0")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[HEARTBEAT] Error: %s", exc)
+        await asyncio.sleep(_HB_INTERVAL)
+
+
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis = aioredis.from_url(redis_url, decode_responses=False)
@@ -1882,6 +1904,10 @@ async def main() -> None:
     await _prune_old_data()
 
     tasks = [
+        asyncio.create_task(
+            _run_heartbeat(engine, redis),
+            name="exec:heartbeat",
+        ),
         asyncio.create_task(
             run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg),
             name="exec:trade",
