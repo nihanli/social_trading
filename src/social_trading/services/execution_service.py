@@ -772,6 +772,7 @@ async def run_exit_loop(
                 # Avoid pre-market false trigger: only after 20:00 UTC (16:00 ET)
                 if now_dt.hour >= 20:
                     await _save_eod_snapshot(cfg, mode)
+                    await _prune_old_data()
                     await redis.setex(_eod_key, 86400, "1")  # expire after 24h
 
         except asyncio.CancelledError:
@@ -1388,6 +1389,79 @@ async def _reconcile_startup(
                     logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
 
+async def _prune_old_data() -> None:
+    """
+    Delete aged-out rows from high-volume tables.
+    Retention policy:
+      social_raw / sentiment_scores  — 14 days
+      sentiment_aggregates / signals — 30 days  (signals linked to trades are kept)
+      market_data                    — 180 days
+      account_equity                 — 365 days
+    trades / positions / config_runs are never pruned.
+    """
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME", "trading"),
+            user=os.getenv("DB_USER", "trader"),
+            password=os.getenv("DB_PASSWORD", ""),
+        )
+        with conn, conn.cursor() as cur:
+            # sentiment_scores must be deleted BEFORE social_raw (FK constraint)
+            cur.execute("""
+                DELETE FROM sentiment_scores
+                WHERE scored_at < NOW() - INTERVAL '14 days'
+            """)
+            del_sent = cur.rowcount
+
+            cur.execute("""
+                DELETE FROM social_raw
+                WHERE created_at < NOW() - INTERVAL '14 days'
+            """)
+            del_raw = cur.rowcount
+
+            cur.execute("""
+                DELETE FROM sentiment_aggregates
+                WHERE window_start < NOW() - INTERVAL '30 days'
+            """)
+            del_agg = cur.rowcount
+
+            # Keep signals that are referenced by any trade row
+            cur.execute("""
+                DELETE FROM signals
+                WHERE generated_at < NOW() - INTERVAL '30 days'
+                  AND id NOT IN (
+                      SELECT signal_id FROM trades
+                      WHERE signal_id IS NOT NULL
+                  )
+            """)
+            del_sig = cur.rowcount
+
+            cur.execute("""
+                DELETE FROM market_data
+                WHERE timestamp < NOW() - INTERVAL '180 days'
+            """)
+            del_md = cur.rowcount
+
+            cur.execute("""
+                DELETE FROM account_equity
+                WHERE timestamp < NOW() - INTERVAL '365 days'
+            """)
+            del_eq = cur.rowcount
+
+        conn.close()
+        logger.info(
+            "[PRUNE] Done — social_raw: %d, sentiment_scores: %d, "
+            "sentiment_aggregates: %d, signals: %d, market_data: %d, account_equity: %d",
+            del_raw, del_sent, del_agg, del_sig, del_md, del_eq,
+        )
+    except Exception as exc:
+        logger.error("[PRUNE] Failed: %s", exc, exc_info=True)
+
+
 async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
     """
     Compute today's session metrics from the DB and write one config_runs row.
@@ -1797,6 +1871,9 @@ async def main(use_ibkr: bool = False) -> None:
 
     # Reconcile: clean up Redis state for positions closed while service was offline
     await _reconcile_startup(redis, engine, mode=mode)
+
+    # Prune aged-out DB rows once at startup
+    await _prune_old_data()
 
     tasks = [
         asyncio.create_task(
