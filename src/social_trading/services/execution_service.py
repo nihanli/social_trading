@@ -114,8 +114,21 @@ async def _write_account_state(
     redis: aioredis.Redis,
     engine: ExecutionEngine,
 ) -> None:
-    """Write account state to Redis hash 'account:state' for risk service."""
+    """Write account state to Redis hash 'account:state' for risk service.
+
+    Skips the write when net_liquidation is 0 (IB hasn't yet pushed account
+    data — e.g. just after reconnect or during a brief disconnect).  Preserving
+    the last known-good value prevents the risk service from computing a $0
+    position size and rejecting every signal.
+    """
     state = await engine.get_account_state()
+    if state.net_liquidation <= 0:
+        logger.warning(
+            "[EXEC] Skipping account:state write — net_liquidation=%.2f "
+            "(IB account data not yet available)",
+            state.net_liquidation,
+        )
+        return
     await redis.hset("account:state", mapping={
         "net_liquidation": str(state.net_liquidation),
         "cash": str(state.cash),
@@ -2158,6 +2171,43 @@ async def main() -> None:
 
     # Prune aged-out DB rows once at startup
     await _prune_old_data()
+
+    # Warm up market data for all active watchlist tickers so the risk service
+    # has prices/ATR from startup rather than waiting for the slow per-ticker
+    # cadence in the exit loop.  We fire-and-forget this in a background task
+    # so it does not block service start.
+    async def _warmup_market_data() -> None:
+        try:
+            wl_raw = await redis.zrange("watchlist:active", 0, -1)
+            wl_tickers: list[str] = [
+                t.decode() if isinstance(t, bytes) else t for t in wl_raw
+            ]
+            if not wl_tickers:
+                return
+            logger.info(
+                "[EXEC] Warming up market data for %d watchlist tickers…", len(wl_tickers)
+            )
+            count = 0
+            for ticker in wl_tickers:
+                try:
+                    snap = await _write_market_snapshot_and_get_price(
+                        redis, ticker, market_data
+                    )
+                    if snap is not None:
+                        count += 1
+                except Exception as exc:
+                    logger.debug("[EXEC] Warmup failed for %s: %s", ticker, exc)
+                await asyncio.sleep(0.1)  # gentle rate-limit for yfinance
+            logger.info("[EXEC] Market data warmup complete: %d/%d tickers populated", count, len(wl_tickers))
+        except Exception as exc:
+            logger.warning("[EXEC] Market data warmup error: %s", exc)
+
+    asyncio.create_task(_warmup_market_data(), name="exec:market_warmup")
+
+    # Write account state immediately at startup so the risk service has a
+    # valid NLV before the first exit loop cycle.  This also refreshes any
+    # stale 0.0 value left over from a previous disconnect.
+    await _write_account_state(redis, engine)
 
     tasks = [
         asyncio.create_task(

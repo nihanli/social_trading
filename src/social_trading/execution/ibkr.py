@@ -98,13 +98,32 @@ class IBKRExecutionEngine:
         asyncio.ensure_future(self._reseed_positions())
 
     async def _reseed_positions(self) -> None:
-        """Request all positions from IB to repopulate the local ib_async cache."""
+        """Request positions and account data from IB to repopulate the local ib_async cache."""
         try:
             await self._ib.reqPositionsAsync()
             count = len([p for p in self._ib.positions() if p.position != 0])
             logger.info("[IBKR] Position cache reseeded after reconnect — %d open position(s)", count)
         except Exception as exc:
             logger.warning("[IBKR] Failed to reseed position cache after reconnect: %s", exc)
+
+        # Re-subscribe to account updates so accountValues() is populated.
+        # ib_async subscribes automatically on initial connect but the subscription
+        # is not automatically renewed after a reconnect — without this call,
+        # accountValues() stays empty → NLV=0 → risk service rejects every signal.
+        try:
+            account = self._account or ""
+            await self._ib.reqAccountUpdatesAsync(account=account)
+            nlv = next(
+                (float(av.value) for av in self._ib.accountValues()
+                 if av.tag == "NetLiquidation" and av.currency in ("USD", "BASE")),
+                0.0,
+            )
+            logger.info(
+                "[IBKR] Account data reseeded after reconnect — NLV=%.2f (account=%r)",
+                nlv, account or "(all)",
+            )
+        except Exception as exc:
+            logger.warning("[IBKR] Failed to reseed account data after reconnect: %s", exc)
 
     async def reconnect(self) -> bool:
         """
