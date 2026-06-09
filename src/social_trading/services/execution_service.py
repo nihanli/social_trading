@@ -758,8 +758,17 @@ async def run_exit_loop(
             # close them) were filled by IB's bracket legs or closed in TWS.
             # Use the full open_positions list (including naked-handled ones) so
             # external closes are tracked regardless of how the position ended.
+            #
+            # IMPORTANT: only run this when IB is connected.  If the IB cache
+            # returned 0 positions due to a disconnect / TWS restart, all
+            # previously open tickers would look "externally closed" and their
+            # params would be wiped — leaving positions permanently untracked
+            # even after reconnection.
+            _ib_connected = (
+                hasattr(engine, "_ib") and engine._ib.isConnected()  # type: ignore[union-attr]
+            )
             now_open_tickers = {p.ticker for p in open_positions} - just_closed
-            if _prev_open_tickers:
+            if _prev_open_tickers and _ib_connected:
                 externally_closed = _prev_open_tickers - now_open_tickers - just_closed
                 await _reconcile_external_closes(
                     redis, engine,
@@ -772,7 +781,16 @@ async def run_exit_loop(
                 # so the UI reflects the change without waiting for the next cycle.
                 if externally_closed:
                     await _write_positions_to_redis(redis, engine)
-            _prev_open_tickers = now_open_tickers
+            elif _prev_open_tickers and not _ib_connected:
+                logger.warning(
+                    "[EXIT] IB disconnected — skipping external-close reconcile "
+                    "to avoid wiping %d position param(s)",
+                    len(_prev_open_tickers),
+                )
+            # Only advance _prev_open_tickers when IB is connected so we don't
+            # lose track of open positions during a disconnect window.
+            if _ib_connected:
+                _prev_open_tickers = now_open_tickers
 
             # ── 5. Persist state + metrics ────────────────────────────────────
             await _persist_hwm_to_redis(redis, engine)
