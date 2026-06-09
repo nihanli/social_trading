@@ -112,6 +112,11 @@ class IBKRExecutionEngine:
 
         Called by the exit loop when health_check() fails and the reconnect
         backoff window has elapsed.  Returns True on success, False on failure.
+
+        Always calls disconnect() first to clear any stale half-open socket state
+        in ib_async before attempting connectAsync().  Without this, connectAsync
+        may silently fail or block when the underlying TCP socket is in a broken
+        but not fully closed state.
         """
         try:
             if self._ib.isConnected():
@@ -120,6 +125,15 @@ class IBKRExecutionEngine:
                 "[IBKR] Attempting reconnect to %s:%d (clientId=%d)…",
                 self._host, self._port, self._client_id,
             )
+            # Always disconnect first to flush ib_async's internal socket/stream
+            # state.  Calling connectAsync on a half-open connection raises or silently
+            # fails — a clean disconnect ensures the next connect starts fresh.
+            try:
+                self._ib.disconnect()
+                await asyncio.sleep(0.5)  # brief pause to let the socket close
+            except Exception:
+                pass  # disconnect may raise if already fully disconnected — ignore
+
             await self._ib.connectAsync(self._host, self._port, clientId=self._client_id)
             await self._ib.reqPositionsAsync()
             count = len([p for p in self._ib.positions() if p.position != 0])

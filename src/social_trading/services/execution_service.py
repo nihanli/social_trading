@@ -517,9 +517,9 @@ async def run_exit_loop(
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
 
-    # Reconnect backoff: only attempt reconnect once every 5 minutes to avoid
+    # Reconnect backoff: only attempt reconnect once every 60 seconds to avoid
     # hammering TWS during a prolonged outage.
-    _RECONNECT_INTERVAL_SECS = 300
+    _RECONNECT_INTERVAL_SECS = 60
     _last_reconnect_attempt: float = 0.0
 
     while True:
@@ -544,8 +544,11 @@ async def run_exit_loop(
                         await asyncio.sleep(cfg.signal_poll_interval_sec)
                         continue
                 else:
+                    secs_until_retry = max(0, _RECONNECT_INTERVAL_SECS - int(now_ts - _last_reconnect_attempt))
                     logger.warning(
-                        "[SYNC] Engine not connected — skipping position evaluation this cycle"
+                        "[SYNC] Engine not connected — skipping position evaluation "
+                        "(next reconnect attempt in %ds)",
+                        secs_until_retry,
                     )
                     await asyncio.sleep(cfg.signal_poll_interval_sec)
                     continue
