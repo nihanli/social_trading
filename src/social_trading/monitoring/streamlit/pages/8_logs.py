@@ -18,7 +18,7 @@ Features
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 import redis
 import streamlit as st
@@ -136,7 +136,7 @@ def _render_service(svc: str) -> None:
             continue
         ts_ms = fields.get("ts", "0")
         try:
-            ts_dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+            ts_dt = datetime.fromtimestamp(int(ts_ms) / 1000)  # local time
             ts_str = ts_dt.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
         except Exception:
             ts_str = ts_ms

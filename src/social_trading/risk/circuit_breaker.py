@@ -153,6 +153,17 @@ class CircuitBreaker:
 
         nlv = account.net_liquidation or 1.0
 
+        # Skip all threshold checks when NLV is zero or missing — the account
+        # data hasn't been populated yet (e.g. IB just reconnected) and any
+        # drawdown or P&L calculation against a 0 NLV would be meaningless or
+        # wildly wrong.  Return current state unchanged.
+        if account.net_liquidation <= 0:
+            logger.debug(
+                "CircuitBreaker: skipping threshold checks — NLV=%.2f (account data not yet available)",
+                account.net_liquidation,
+            )
+            return ps.to_status()
+
         # ── Check drawdown → FULL_HALT ────────────────────────────────────────
         if account.drawdown_pct > cfg.drawdown_halt:
             reason = (

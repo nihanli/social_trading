@@ -34,10 +34,28 @@ class FallbackMarketData:
 
     async def get_quote(self, ticker: str) -> dict[str, Any]:
         try:
-            return await self._primary.get_quote(ticker)
+            result = await self._primary.get_quote(ticker)
         except Exception as exc:
             logger.debug("IB get_quote failed for %s (%s) — using yfinance", ticker, exc)
             return await self._secondary.get_quote(ticker)
+
+        # IB returns real-time price/bid/ask but typically cannot provide
+        # avg_volume_30d or market_cap without a paid data subscription
+        # (avVolume returns nan/0 with error 10089).  Enrich with yfinance
+        # for those fields so the liquidity gate always has valid ADV data.
+        if not result.get("avg_volume_30d") or not result.get("market_cap"):
+            try:
+                yfq = await self._secondary.get_quote(ticker)
+                if not result.get("avg_volume_30d") and yfq.get("avg_volume_30d"):
+                    result["avg_volume_30d"] = yfq["avg_volume_30d"]
+                if not result.get("market_cap") and yfq.get("market_cap"):
+                    result["market_cap"] = yfq["market_cap"]
+            except Exception as exc:
+                logger.debug(
+                    "yfinance enrichment for %s failed (%s) — ADV/mktcap may be missing",
+                    ticker, exc,
+                )
+        return result
 
     async def get_ohlcv(
         self,

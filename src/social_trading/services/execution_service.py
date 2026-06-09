@@ -2146,6 +2146,18 @@ async def main() -> None:
         # call any positions opened by a previous session would be invisible to
         # ib.positions() and therefore absent from positions:live.
         await ib.reqPositionsAsync()
+        # Explicitly request account updates so accountValues() is populated
+        # before the engine starts.  connectAsync() fires connectedEvent before
+        # IBKRExecutionEngine registers its _on_ib_reconnect handler, meaning the
+        # automatic reqAccountUpdatesAsync() in _reseed_positions() is skipped on
+        # initial startup.  Without this call, accountValues() returns [] for the
+        # first several seconds → NLV=0 → circuit breaker fires spurious FULL_HALT.
+        await ib.reqAccountUpdatesAsync(account=ib_account or "")
+        logger.info("[IBKR] Account data loaded — NLV=%.2f", next(
+            (float(av.value) for av in ib.accountValues()
+             if av.tag == "NetLiquidation" and av.currency in ("USD", "BASE")),
+            0.0,
+        ))
         engine: ExecutionEngine = IBKRExecutionEngine(ib=ib, account=ib_account, host="127.0.0.1", port=port, client_id=client_id)  # type: ignore[assignment]
         # Use IB for real-time prices; yfinance as fallback for any gaps
         market_data: MarketDataProvider = FallbackMarketData(  # type: ignore[assignment]

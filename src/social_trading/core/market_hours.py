@@ -57,6 +57,9 @@ class MarketHours:
         Return True if the exchange is currently open (or open at *dt*).
 
         Handles holidays, early closes, and weekends automatically.
+        Falls back to a simple time-of-day/weekday heuristic when the
+        calendar library throws (e.g. transient initialisation error) rather
+        than unconditionally assuming closed which would block all trading.
 
         Args:
             dt: Timezone-aware datetime to check.  Defaults to ``datetime.now(UTC)``.
@@ -65,8 +68,19 @@ class MarketHours:
         try:
             return bool(self._cal.is_open_at_time(ts))
         except Exception as exc:
-            logger.warning("[MarketHours] is_open check failed (%s) — assuming closed", exc)
-            return False
+            # Fallback: approximate NYSE hours Mon–Fri 9:30–16:00 ET.
+            # Better than "assuming closed" which would incorrectly halt trading.
+            now_et = (dt or datetime.now(_UTC)).astimezone(_ET)
+            weekday = now_et.weekday()  # 0=Mon … 4=Fri
+            open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            fallback = (weekday < 5) and (open_time <= now_et < close_time)
+            logger.warning(
+                "[MarketHours] is_open check failed (%s) — using time-based fallback: %s",
+                exc,
+                "OPEN" if fallback else "CLOSED",
+            )
+            return fallback
 
     def next_open(self, dt: datetime | None = None) -> datetime:
         """Return the next session open as a UTC-aware datetime."""

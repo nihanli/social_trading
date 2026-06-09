@@ -162,11 +162,19 @@ class TestStatusStr:
 
 class TestErrorResilience:
     def test_is_open_returns_false_on_calendar_error(self, mh):
-        """If exchange_calendars raises, is_open returns False (safe default)."""
-        dt = _dt("2026-05-28T16:00:00+00:00")
+        """On calendar error during market hours, time-based fallback returns True.
+        On calendar error outside market hours, time-based fallback returns False."""
+        # 16:00 UTC = 12:00 PM ET Thursday — inside market hours → fallback True
+        dt_open = _dt("2026-05-28T16:00:00+00:00")
         with patch.object(mh, "_cal", create=True) as mock_cal:
             mock_cal.is_open_at_time.side_effect = RuntimeError("network error")
-            assert mh.is_open(dt) is False
+            assert mh.is_open(dt_open) is True  # time-based fallback: OPEN
+
+        # 23:00 UTC = 7:00 PM ET Thursday — outside market hours → fallback False
+        dt_closed = _dt("2026-05-28T23:00:00+00:00")
+        with patch.object(mh, "_cal", create=True) as mock_cal:
+            mock_cal.is_open_at_time.side_effect = RuntimeError("network error")
+            assert mh.is_open(dt_closed) is False  # time-based fallback: CLOSED
 
     def test_module_singleton_is_importable(self):
         from social_trading.core.market_hours import NYSE
