@@ -26,7 +26,13 @@ from social_trading.monitoring.streamlit.utils.chart_data import (
     fetch_ohlcv,
     TIMEFRAMES,
 )
-from social_trading.monitoring.streamlit.utils.company_info import get_company_info
+from social_trading.monitoring.streamlit.utils.company_info import (
+    get_company_info,
+    fmt_market_cap,
+    fmt_volume,
+    fmt_pct,
+    fmt_float,
+)
 
 st.set_page_config(
     page_title="Ticker Chart",
@@ -299,3 +305,60 @@ if show_signals and not signals_df.empty:
             width='stretch',
             hide_index=True,
         )
+
+# ── Company fundamentals ───────────────────────────────────────────────────────
+_ci = get_company_info(ticker)
+
+_has_fundamentals = any(
+    _ci.get(k) is not None
+    for k in ("market_cap", "trailing_pe", "forward_pe", "beta",
+              "dividend_yield", "price_to_book", "ev_to_ebitda",
+              "profit_margin", "revenue_growth", "analyst_target")
+)
+
+if _has_fundamentals:
+    st.divider()
+
+    # Header row with industry / exchange context
+    _header_parts: list[str] = []
+    if _ci.get("industry"):
+        _header_parts.append(_ci["industry"])
+    if _ci.get("exchange"):
+        _header_parts.append(_ci["exchange"])
+    if _ci.get("employees"):
+        _header_parts.append(f"{_ci['employees']:,} employees")
+    st.caption("  ·  ".join(_header_parts) if _header_parts else "Company fundamentals")
+
+    # ── Row 1: valuation ──────────────────────────────────────────────────────
+    _v1, _v2, _v3, _v4, _v5 = st.columns(5)
+    _v1.metric("Market Cap",    fmt_market_cap(_ci.get("market_cap")))
+    _v2.metric("P/E (TTM)",     fmt_float(_ci.get("trailing_pe"), 1))
+    _v3.metric("P/E (Forward)", fmt_float(_ci.get("forward_pe"), 1))
+    _v4.metric("P/B Ratio",     fmt_float(_ci.get("price_to_book"), 2))
+    _v5.metric("EV/EBITDA",     fmt_float(_ci.get("ev_to_ebitda"), 1))
+
+    # ── Row 2: performance & risk ─────────────────────────────────────────────
+    _r1, _r2, _r3, _r4, _r5 = st.columns(5)
+    _r1.metric("Beta",          fmt_float(_ci.get("beta"), 2))
+    _r2.metric("Dividend Yield",fmt_pct(_ci.get("dividend_yield")))
+    _r3.metric("Profit Margin", fmt_pct(_ci.get("profit_margin")))
+    _r4.metric("Revenue Growth",fmt_pct(_ci.get("revenue_growth")))
+    _r5.metric("EPS Growth",    fmt_pct(_ci.get("earnings_growth")))
+
+    # ── Row 3: price context ──────────────────────────────────────────────────
+    _p1, _p2, _p3, _p4, _p5 = st.columns(5)
+    _p1.metric("52W High",      f"${_ci['fifty_two_week_high']:.2f}" if _ci.get("fifty_two_week_high") else "—")
+    _p2.metric("52W Low",       f"${_ci['fifty_two_week_low']:.2f}"  if _ci.get("fifty_two_week_low")  else "—")
+    _p3.metric("Avg Volume",    fmt_volume(_ci.get("average_volume")))
+    _p4.metric("Analyst Target",f"${_ci['analyst_target']:.2f}"      if _ci.get("analyst_target")      else "—")
+    # 52W position — where current price sits in the 52-week range
+    _hi = _ci.get("fifty_two_week_high")
+    _lo = _ci.get("fifty_two_week_low")
+    _last = last_bar["Close"]
+    if _hi and _lo and _hi > _lo:
+        _pos_pct = (_last - _lo) / (_hi - _lo) * 100
+        _p5.metric("52W Position", f"{_pos_pct:.0f}%",
+                   help="Where the current price sits in the 52-week High/Low range (100% = at 52W high)")
+    else:
+        _p5.metric("52W Position", "—")
+
