@@ -69,6 +69,9 @@ logging.basicConfig(
 # Warning 10167 ("not subscribed, showing delayed data") can occur when market
 # data subscriptions are unavailable; suppress ib_async wrapper noise to WARNING level.
 logging.getLogger("ib_async.wrapper").setLevel(logging.WARNING)
+_redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+from social_trading.monitoring.log_handler import RedisLogHandler  # noqa: E402
+logging.getLogger().addHandler(RedisLogHandler("execution", _redis_url))
 logger = logging.getLogger(__name__)
 
 _GROUP = "execution"

@@ -64,6 +64,9 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+_redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+from social_trading.monitoring.log_handler import RedisLogHandler  # noqa: E402
+logging.getLogger().addHandler(RedisLogHandler("ingest", _redis_url))
 logger = logging.getLogger(__name__)
 
 # Hard cap on how long an enrichment request may sit in the queue before it is
