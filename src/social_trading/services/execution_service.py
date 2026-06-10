@@ -538,6 +538,10 @@ async def run_exit_loop(
     _RECONNECT_INTERVAL_SECS = 60
     _last_reconnect_attempt: float = 0.0
 
+    # Record loop startup time so naked-position check can apply a grace period
+    # while IB openOrder callbacks are still arriving after connect.
+    _loop_start_ts: float = asyncio.get_event_loop().time()
+
     while True:
         try:
             cfg = await SystemConfig.load(redis)
@@ -554,6 +558,7 @@ async def run_exit_loop(
                     if reconnected:
                         logger.info("[SYNC] IB reconnected — resuming position evaluation")
                         _last_ib_cache_refresh = now_ts  # mark cache as fresh
+                        _loop_start_ts = now_ts  # reset grace period for naked check
                         # fall through to normal cycle
                     else:
                         logger.warning("[SYNC] IB reconnect failed — will retry in %ds", _RECONNECT_INTERVAL_SECS)
@@ -693,6 +698,7 @@ async def run_exit_loop(
             # to avoid race conditions with just-placed orders.
             naked_closed, naked_reattached = await _check_naked_positions(
                 redis, engine, open_positions, system_params, cfg, mode,
+                startup_ts=_loop_start_ts,
             )
             if naked_closed:
                 just_closed.update(naked_closed)
@@ -1173,6 +1179,8 @@ async def _check_naked_positions(
     system_params: dict,
     cfg: "SystemConfig",
     mode: str,
+    *,
+    startup_ts: float = 0.0,
 ) -> tuple[set[str], set[str]]:
     """
     Detect system-tracked positions that have no live server-side OCA protective
@@ -1198,6 +1206,14 @@ async def _check_naked_positions(
     ib = engine._ib  # type: ignore[union-attr]
     if not ib.isConnected():
         return just_closed, just_reattached
+
+    # Grace period after startup/reconnect: IB pushes openOrder callbacks
+    # asynchronously.  If the exit loop fires within 30s of startup, openTrades()
+    # may be incomplete — positions would look naked even though brackets are live.
+    # We still run the check but skip reattach for positions that have a known
+    # oca_group in their persisted params (proof that OCA was already placed).
+    _STARTUP_GRACE_SECS = 30.0
+    _in_grace = (startup_ts > 0) and ((asyncio.get_event_loop().time() - startup_ts) < _STARTUP_GRACE_SECS)
 
     # ── Build set of tickers with live *protective* OCA orders ───────────────
     # A ticker is "protected" only if IB has at least one active STP/TRAIL order
@@ -1237,6 +1253,19 @@ async def _check_naked_positions(
         take_profit = float(params.get("take_profit", 0.0))
         direction = params.get("direction", pos.direction)
         quantity = int(params.get("shares", pos.shares)) or pos.shares
+        known_oca_group = params.get("oca_group", "")
+
+        # During the startup grace window, IB's openTrades() cache may be
+        # incomplete (openOrder callbacks still arriving).  If this position
+        # has a known OCA group from persisted params, the bracket was placed
+        # in a prior session — skip reattach and let the next cycle confirm.
+        if _in_grace and known_oca_group:
+            logger.debug(
+                "[NAKED] %s: startup grace period — skipping reattach "
+                "(oca_group=%r already placed; openTrades cache may be incomplete)",
+                ticker, known_oca_group,
+            )
+            continue
 
         logger.warning(
             "[NAKED] %s: no server-side protective orders — "
@@ -1545,6 +1574,44 @@ async def _reconcile_startup(
                 trail_order_ids[sym] = oid
     except Exception as exc:
         logger.debug("[SYNC] Could not check open orders for orderRef: %s", exc)
+
+    # ── Orphaned pending entry orders ─────────────────────────────────────────
+    # An entry MKT order placed by this system may still be working in IB even
+    # though the service restarted with no matching position or params (the order
+    # was submitted just before a crash/disconnect and we never saw the fill).
+    # These orphaned entry orders must be cancelled: if left alive in IB, a fill
+    # would open an unprotected position that is invisible to our exit loop.
+    try:
+        from social_trading.execution.ibkr import ORDER_REF as _ORDER_REF  # noqa: PLC0415
+        tracked_tickers = current_tickers | set(params)
+        _pending_entry_statuses = {"PendingSubmit", "PreSubmitted", "Submitted"}
+        for trade in (getattr(engine, "_ib", None) or object()).openTrades():  # type: ignore[union-attr]
+            sym = getattr(getattr(trade, "contract", None), "symbol", "")
+            ord_obj = getattr(trade, "order", None)
+            os_obj = getattr(trade, "orderStatus", None)
+            ref = getattr(ord_obj, "orderRef", "")
+            ot = getattr(ord_obj, "orderType", "")
+            status = getattr(os_obj, "status", "")
+            action = getattr(ord_obj, "action", "")
+            if not sym or ref != _ORDER_REF:
+                continue
+            # Pending entry order: MKT BUY or SELL not linked to any tracked position
+            if (
+                ot == "MKT"
+                and action in ("BUY", "SELL")
+                and status in _pending_entry_statuses
+                and sym not in tracked_tickers
+            ):
+                logger.warning(
+                    "[SYNC] %s: orphaned pending entry order (orderId=%d status=%s) — cancelling",
+                    sym, getattr(ord_obj, "orderId", 0), status,
+                )
+                try:
+                    engine._ib.cancelOrder(ord_obj)  # type: ignore[union-attr]
+                except Exception as _ce:
+                    logger.warning("[SYNC] Failed to cancel orphaned entry for %s: %s", sym, _ce)
+    except Exception as exc:
+        logger.debug("[SYNC] Could not check for orphaned pending entries: %s", exc)
 
     # Fix 1: Recover TRAIL order IDs from IB for ALL current system positions.
     # _ts_order_id is in-memory only; this seeds it for positions whose Redis key
@@ -2140,54 +2207,97 @@ async def main() -> None:
 
     start_metrics_server(port=int(os.getenv("METRICS_PORT", "8000")))
 
+    # Demote known benign IB wrapper errors that are handled by our fallback
+    # logic — keeps logs clean without losing genuinely unexpected errors.
+    import logging as _logging  # noqa: PLC0415
+    class _IBBenignFilter(_logging.Filter):
+        def filter(self, record: _logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            # Error 162 = HMDS no data — handled by yfinance fallback in composite.py
+            if "Error 162" in msg and "Historical Market Data Service" in msg:
+                record.levelno = _logging.DEBUG
+                record.levelname = "DEBUG"
+            # Error 10167 = delayed data warning — expected for non-subscribed tickers
+            if "Error 10167" in msg:
+                record.levelno = _logging.DEBUG
+                record.levelname = "DEBUG"
+            return True
+    _logging.getLogger("ib_async.wrapper").addFilter(_IBBenignFilter())
+
     cfg = await SystemConfig.load(redis)
     logger.info("SystemConfig loaded (hash=%s)", cfg.config_hash())
 
     # ── Build engine ──────────────────────────────────────────────────────────
-    try:
-        from ib_async import IB  # noqa: PLC0415
+    # Retry IB connection indefinitely rather than crashing — allows the service
+    # to start before TWS / IB Gateway is running.  The UI shows "IB Disconnected"
+    # while waiting; once connected, normal startup proceeds.
+    _IB_RETRY_SECS = 30
+    from ib_async import IB  # noqa: PLC0415
+    from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
+    from social_trading.market_data.ibkr import IBKRMarketData  # noqa: PLC0415
 
-        from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
-        from social_trading.market_data.ibkr import IBKRMarketData  # noqa: PLC0415
-        ib = IB()
-        port = int(os.getenv("IBKR_PORT", "7497"))
-        client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
-        ib_account = os.getenv("IBKR_ACCOUNT", "").strip()
-        if ib_account.upper().startswith("DFQ"):
-            raise ValueError(
-                f"IBKR_ACCOUNT={ib_account!r} is a Financial Advisor master account. "
-                "This app only supports individual user accounts. "
-                "Set IBKR_ACCOUNT to one of the sub-accounts (e.g. DUQ…)."
-            )
-        await ib.connectAsync("127.0.0.1", port, clientId=client_id)
-        # Explicitly load all existing positions into the ib_async local cache.
-        # ib_async does NOT auto-request positions on connect, so without this
-        # call any positions opened by a previous session would be invisible to
-        # ib.positions() and therefore absent from positions:live.
-        await ib.reqPositionsAsync()
-        # Explicitly request account updates so accountValues() is populated
-        # before the engine starts.  connectAsync() fires connectedEvent before
-        # IBKRExecutionEngine registers its _on_ib_reconnect handler, meaning the
-        # automatic reqAccountUpdatesAsync() in _reseed_positions() is skipped on
-        # initial startup.  Without this call, accountValues() returns [] for the
-        # first several seconds → NLV=0 → circuit breaker fires spurious FULL_HALT.
-        await ib.reqAccountUpdatesAsync(account=ib_account or "")
-        logger.info("[IBKR] Account data loaded — NLV=%.2f", next(
-            (float(av.value) for av in ib.accountValues()
-             if av.tag == "NetLiquidation" and av.currency in ("USD", "BASE")),
-            0.0,
-        ))
-        engine: ExecutionEngine = IBKRExecutionEngine(ib=ib, account=ib_account, host="127.0.0.1", port=port, client_id=client_id)  # type: ignore[assignment]
-        # Use IB for real-time prices; yfinance as fallback for any gaps
-        market_data: MarketDataProvider = FallbackMarketData(  # type: ignore[assignment]
-            primary=IBKRMarketData(ib=ib),     # IB: real-time quotes, ATR, OHLCV
-            secondary=YFinanceMarketData(),    # fallback: missing subscriptions / off-hours
+    port = int(os.getenv("IBKR_PORT", "7497"))
+    client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
+    ib_account = os.getenv("IBKR_ACCOUNT", "").strip()
+    if ib_account.upper().startswith("DFQ"):
+        raise ValueError(
+            f"IBKR_ACCOUNT={ib_account!r} is a Financial Advisor master account. "
+            "This app only supports individual user accounts. "
+            "Set IBKR_ACCOUNT to one of the sub-accounts (e.g. DUQ…)."
         )
-        logger.info("Connected to IBKR port=%d clientId=%d account=%s (IB market data primary, yfinance fallback)", port, client_id, ib_account or "(auto)")
-    except Exception as exc:
-        message = f"IBKR connection failed; execution service requires Interactive Brokers: {exc}"
-        logger.error(message)
-        raise RuntimeError(message) from exc
+
+    ib: IB | None = None
+    engine: ExecutionEngine
+    market_data: MarketDataProvider
+    while True:
+        try:
+            ib = IB()
+            await ib.connectAsync("127.0.0.1", port, clientId=client_id)
+            # Explicitly load all existing positions into the ib_async local cache.
+            # ib_async does NOT auto-request positions on connect, so without this
+            # call any positions opened by a previous session would be invisible to
+            # ib.positions() and therefore absent from positions:live.
+            await ib.reqPositionsAsync()
+            # Explicitly request account updates so accountValues() is populated
+            # before the engine starts.  connectAsync() fires connectedEvent before
+            # IBKRExecutionEngine registers its _on_ib_reconnect handler, meaning the
+            # automatic reqAccountUpdatesAsync() in _reseed_positions() is skipped on
+            # initial startup.  Without this call, accountValues() returns [] for the
+            # first several seconds → NLV=0 → circuit breaker fires spurious FULL_HALT.
+            await ib.reqAccountUpdatesAsync(account=ib_account or "")
+            logger.info("[IBKR] Account data loaded — NLV=%.2f", next(
+                (float(av.value) for av in ib.accountValues()
+                 if av.tag == "NetLiquidation" and av.currency in ("USD", "BASE")),
+                0.0,
+            ))
+            engine = IBKRExecutionEngine(ib=ib, account=ib_account, host="127.0.0.1", port=port, client_id=client_id)  # type: ignore[assignment]
+            market_data = FallbackMarketData(  # type: ignore[assignment]
+                primary=IBKRMarketData(ib=ib),     # IB: real-time quotes, ATR, OHLCV
+                secondary=YFinanceMarketData(),    # fallback: missing subscriptions / off-hours
+            )
+            logger.info(
+                "Connected to IBKR port=%d clientId=%d account=%s "
+                "(IB market data primary, yfinance fallback)",
+                port, client_id, ib_account or "(auto)",
+            )
+            break  # success — proceed with startup
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                if ib is not None:
+                    ib.disconnect()
+            except Exception:
+                pass
+            logger.warning(
+                "[IBKR] Connection to port %d failed: %s — retrying in %ds",
+                port, exc, _IB_RETRY_SECS,
+            )
+            # Write heartbeat so the UI shows "service alive, IB disconnected"
+            # rather than "service offline".
+            await redis.setex("service:heartbeat", 60, "1")
+            await redis.set("ib:connected", "0")
+            await asyncio.sleep(_IB_RETRY_SECS)
     exit_manager = PositionExitManager()
     breaker = CircuitBreaker(redis)
     bus = TradingEventBus(redis)
@@ -2237,6 +2347,18 @@ async def main() -> None:
             logger.warning("[EXEC] Market data warmup error: %s", exc)
 
     asyncio.create_task(_warmup_market_data(), name="exec:market_warmup")
+
+    # Request all open orders from IB so the ib_async cache is populated before
+    # the exit loop starts.  TWS sends openOrder callbacks asynchronously after
+    # connect; without this explicit request the first naked-position check may
+    # see openTrades()=[] and incorrectly reattach OCA brackets that are live.
+    try:
+        ib.reqAllOpenOrders()
+        await asyncio.sleep(3)  # allow openOrder callbacks to arrive
+        n_orders = len(ib.openTrades())
+        logger.info("[IBKR] Open orders loaded at startup: %d order(s)", n_orders)
+    except Exception as exc:
+        logger.debug("[IBKR] reqAllOpenOrders at startup failed: %s", exc)
 
     # Write account state immediately at startup so the risk service has a
     # valid NLV before the first exit loop cycle.  This also refreshes any
