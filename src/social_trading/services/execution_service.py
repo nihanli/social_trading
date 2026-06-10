@@ -1013,6 +1013,25 @@ async def _write_market_snapshot_and_get_price(
                 logger.debug("momentum fetch failed for %s: %s", ticker, _m_exc)
 
             await redis.hset(key, mapping=mapping)
+
+            # Clean up any stale zero-value ADV/market-cap fields that may have been
+            # written by an older code version.  hset() never removes fields so a
+            # legacy "adv_usd=0" persists indefinitely unless explicitly deleted.
+            # Only delete when we did NOT write a fresh value (if we did write it,
+            # it is already correct and the hdel would be redundant).
+            stale_fields: list[str] = []
+            if "adv_shares" not in mapping:
+                existing_adv = await redis.hget(key, "adv_shares") or await redis.hget(key, b"adv_shares")
+                if existing_adv is not None and float(existing_adv) == 0:
+                    stale_fields.extend(["adv_shares", "adv_usd"])
+            if "market_cap_usd" not in mapping:
+                existing_mc = await redis.hget(key, "market_cap_usd") or await redis.hget(key, b"market_cap_usd")
+                if existing_mc is not None and float(existing_mc) == 0:
+                    stale_fields.append("market_cap_usd")
+            if stale_fields:
+                await redis.hdel(key, *stale_fields)
+                logger.debug("Cleaned stale zero fields %s from market_data:%s", stale_fields, ticker)
+
             # Expire after 4 hours — prevents stale tickers accumulating as
             # the watchlist rotates.  Active tickers are refreshed every cycle
             # so they never actually expire while in the watchlist.

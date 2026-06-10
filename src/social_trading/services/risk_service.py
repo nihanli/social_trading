@@ -139,17 +139,19 @@ async def _get_market_snapshot(
     """
     raw = await redis.hgetall(_MARKET_DATA_KEY.format(ticker=ticker))
     if not raw:
-        # No market data available — return zero price so the calling code
-        # rejects the signal via the entry_price <= 0 guard rather than
-        # approving it against fake placeholder values.
+        # No market data hash at all — price is unknown so we return last=0
+        # which causes the sizer to reject (entry_price <= 0) rather than
+        # the liquidity gate, which gives a clearer rejection reason.
+        # ADV/market-cap defaults are set to pass-through values so the only
+        # blocker is the missing price.
         logger.debug("[RISK] No market data for %s — returning zero price to block signal", ticker)
         return {
             "last": 0.0,
             "bid": 0.0,
             "ask": 0.0,
-            "adv_shares": 0.0,
-            "adv_usd": 0.0,
-            "market_cap_usd": 0.0,
+            "adv_shares": 1_000_000.0,
+            "adv_usd": 100_000_000.0,
+            "market_cap_usd": 10_000_000_000.0,
             "atr_14": 0.0,
             "realised_vol": 0.20,  # conservative default (vol scalar will limit size)
             "vix": 15.0,           # conservative default (normal regime)
@@ -159,13 +161,24 @@ async def _get_market_snapshot(
         v = raw.get(key) or raw.get(key.encode())
         return float(v) if v is not None else default
 
+    def _fpos(key: str, default: float) -> float:
+        """Like _f but treats zero as missing — returns default if stored value <= 0.
+
+        Used for fields where 0 means "data was never written" rather than a
+        legitimate zero value.  A previous code version may have written 0 for
+        adv_usd/adv_shares; hset() never deletes fields so those zeroes persist
+        even after the field was removed from the write mapping.
+        """
+        val = _f(key, default)
+        return val if val > 0 else default
+
     return {
         "last":           _f("last", 100.0),
         "bid":            _f("bid", 99.9),
         "ask":            _f("ask", 100.1),
-        "adv_shares":     _f("adv_shares", 1_000_000.0),
-        "adv_usd":        _f("adv_usd", 100_000_000.0),
-        "market_cap_usd": _f("market_cap_usd", 10_000_000_000.0),
+        "adv_shares":     _fpos("adv_shares", 1_000_000.0),
+        "adv_usd":        _fpos("adv_usd", 100_000_000.0),
+        "market_cap_usd": _fpos("market_cap_usd", 10_000_000_000.0),
         "atr_14":         _f("atr_14", 2.0),
         "realised_vol":   _f("realised_vol", 0.20),
         "vix":            _f("vix", 15.0),
