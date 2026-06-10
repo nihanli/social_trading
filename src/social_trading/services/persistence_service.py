@@ -419,6 +419,19 @@ def _prune_old_data() -> dict[str, int]:
             f"DELETE FROM sentiment_scores WHERE scored_at < NOW() - INTERVAL '{_RETAIN_SENTIMENT_SCORES_HOURS} hours'",
         ),
         (
+            # Pre-delete sentiment_scores that reference posts about to be pruned
+            # but whose scored_at is recent (NLP backlog).  Without this the FK
+            # constraint sentiment_scores_post_id_fkey blocks the social_raw DELETE.
+            "sentiment_scores (orphaned by social_raw prune)",
+            f"""
+            DELETE FROM sentiment_scores
+            WHERE post_id IN (
+                SELECT post_id FROM social_raw
+                WHERE ingested_at < NOW() - INTERVAL '{_RETAIN_SOCIAL_RAW_HOURS} hours'
+            )
+            """,
+        ),
+        (
             "social_raw",
             f"DELETE FROM social_raw WHERE ingested_at < NOW() - INTERVAL '{_RETAIN_SOCIAL_RAW_HOURS} hours'",
         ),
