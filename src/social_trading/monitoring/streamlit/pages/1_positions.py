@@ -24,8 +24,12 @@ from streamlit_autorefresh import st_autorefresh
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
+    dismiss_all_fill_sync_alerts,
+    dismiss_fill_sync_alert,
+    get_fill_sync_alerts,
     get_live_positions,
     get_system_state,
+    trigger_sync_reconcile,
 )
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
     sidebar_refresh_countdown,
@@ -43,6 +47,43 @@ state = get_system_state()
 # ── Circuit breaker status banner ─────────────────────────────────────────────
 if state["circuit"] != "NORMAL":
     st.error(f"Circuit breaker active: **{state['circuit']}** — new trades may be blocked")
+
+# ── Fill sync alerts (unresolved fill prices) ─────────────────────────────────
+_sync_alerts = get_fill_sync_alerts()
+if _sync_alerts:
+    with st.container(border=True):
+        st.subheader("⚠️ Fill Price Sync Alerts", divider="orange")
+        for _alert in _sync_alerts:
+            _sev = _alert.get("severity", "warning")
+            _msg = _alert.get("message", "")
+            _oid = _alert.get("order_id", "")
+            _ticker = _alert.get("ticker", "")
+            if _sev == "error":
+                st.error(_msg)
+            else:
+                st.warning(_msg)
+            _c1, _c2, _c3 = st.columns([2, 2, 2])
+            with _c1:
+                if st.button("🔄 Attempt Reconcile", key=f"sync_{_oid}",
+                             help="Ask the execution service to re-query IB for the fill price"):
+                    trigger_sync_reconcile()
+                    st.info("Reconcile requested — results will appear in 10–30 seconds.")
+            with _c2:
+                if _alert.get("type") == "entry_fill_pending" and _ticker:
+                    if st.button(f"❌ Close {_ticker}", key=f"close_{_oid}",
+                                 help="Close this position now to exit safely"):
+                        close_position(_ticker)
+                        st.warning(f"Close command sent for {_ticker}.")
+            with _c3:
+                if st.button("✓ Dismiss", key=f"dismiss_{_oid}",
+                             help="Remove this alert (does not fix the fill price)"):
+                    dismiss_fill_sync_alert(_oid)
+                    st.rerun()
+        if len(_sync_alerts) > 1:
+            if st.button("✓ Dismiss All Alerts"):
+                dismiss_all_fill_sync_alerts()
+                st.rerun()
+    st.divider()
 
 # ── Load positions from Redis (real-time) ────────────────────────────────────
 raw_positions = get_live_positions()
@@ -66,12 +107,20 @@ for p in raw_positions:
     pnl_pct = round(unreal / (entry * shares) * 100, 2) if entry and shares else 0.0
     _t = p.get("ticker", "")
     cache_missing = p.get("ib_cache_missing", False)
+    fill_pending = (entry == 0.0 and not cache_missing)
+    # Prefix ticker with the most prominent active flag
+    if cache_missing:
+        _ticker_display = f"⚠ {_t}"
+    elif fill_pending:
+        _ticker_display = f"⏳ {_t}"
+    else:
+        _ticker_display = _t
     rows.append({
         "chart":          f"/chart?ticker={_t}&tf=6M",
-        "ticker":         f"⚠ {_t}" if cache_missing else _t,
+        "ticker":         _ticker_display,
         "direction":      p.get("direction", ""),
         "shares":         shares if not cache_missing else "?",
-        "entry_price":    round(entry, 2) if not cache_missing else "?",
+        "entry_price":    (round(entry, 2) if not cache_missing else "?") if not fill_pending else "⏳ pending",
         "stop_loss":      round(float(p.get("stop_loss", 0)), 2),
         "take_profit":    round(float(p.get("take_profit", 0)), 2),
         "unrealized_pnl": round(unreal, 2),

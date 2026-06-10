@@ -178,6 +178,30 @@ all_trades = query(f"""
     LIMIT 500
 """)
 if not all_trades.empty:
+    # Flag rows where entry or exit price is missing (fill sync incomplete)
+    def _flag_unresolved(row):
+        entry_val = row.get("entry") if not hasattr(row, "get") else row["entry"]
+        exit_val  = row.get("exit")  if not hasattr(row, "get") else row["exit"]
+        flags = []
+        try:
+            if entry_val is None or float(entry_val) == 0:
+                flags.append("entry ⏳")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if exit_val is None or float(exit_val) == 0:
+                flags.append("exit ⏳")
+        except (TypeError, ValueError):
+            pass
+        return ", ".join(flags) if flags else ""
+
+    all_trades["sync"] = all_trades.apply(_flag_unresolved, axis=1)
+    unresolved_count = (all_trades["sync"] != "").sum()
+    if unresolved_count:
+        st.warning(
+            f"⚠️ **{unresolved_count}** trade(s) have unconfirmed fill prices (marked ⏳). "
+            f"P&L for these rows may be inaccurate. Go to **Open Positions** to trigger a reconcile."
+        )
     _trade_names = enrich_tickers(all_trades["ticker"].unique().tolist())
     render_table(
         all_trades,

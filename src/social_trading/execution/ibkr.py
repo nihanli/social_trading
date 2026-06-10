@@ -81,6 +81,12 @@ class IBKRExecutionEngine:
         # Restored from Redis on restart so exit rules work correctly.
         self._position_params: dict[str, dict] = {}
 
+        # Active trade objects keyed by IB orderId.
+        # Kept alive so fill callbacks can be registered after submit_signal / close_position return.
+        # ib_async also keeps Trade objects internally, but this dict provides an O(1) lookup path
+        # and avoids having to search ib.trades() which may be slower for large session histories.
+        self._active_trades: dict[int, Any] = {}
+
         # Connection params stored for reconnect attempts
         self._host = host
         self._port = port
@@ -212,6 +218,61 @@ class IBKRExecutionEngine:
         self._ts_order_id.pop(ticker, None)
         self._position_params.pop(ticker, None)
 
+    def register_order_fill_callback(
+        self,
+        order_id: int,
+        callback: Any,
+    ) -> bool:
+        """
+        Register a one-shot async callback to fire once an order is fully filled.
+
+        Searches self._active_trades first, then ib.trades() as a fallback.
+        If the order is already fully filled at registration time, the callback is
+        scheduled immediately via asyncio.ensure_future().
+
+        The callback receives a single float argument: the average fill price.
+
+        Returns True if the trade was found; False if the order_id is unknown
+        (already cleaned up, or never placed through this engine instance).
+        """
+        trade = self._active_trades.get(order_id)
+        if trade is None:
+            for t in self._ib.trades():
+                if t.order.orderId == order_id:
+                    trade = t
+                    break
+
+        if trade is None:
+            logger.warning(
+                "[IBKR] register_order_fill_callback: orderId=%d not found in active trades",
+                order_id,
+            )
+            return False
+
+        # Already fully filled?  Schedule immediately.
+        avg_fill = float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0)
+        if getattr(trade.orderStatus, "status", "") == "Filled" and avg_fill > 0:
+            asyncio.ensure_future(callback(avg_fill))
+            self._active_trades.pop(order_id, None)
+            return True
+
+        # Register a fillEvent handler that fires the callback when remaining qty hits 0.
+        # fillEvent(trade, fill) fires on each partial execution; avgFillPrice is the VWAP.
+        _called = [False]
+        def _on_fill(t, fill, _oid=order_id, _cb=callback, _flag=_called) -> None:
+            if _flag[0]:
+                return
+            remaining = getattr(t.orderStatus, "remaining", 1)
+            if remaining > 0:
+                return  # partial fill — wait for the rest
+            _flag[0] = True
+            avg = float(getattr(t.orderStatus, "avgFillPrice", None) or fill.execution.price)
+            asyncio.ensure_future(_cb(avg))
+            self._active_trades.pop(_oid, None)
+
+        trade.fillEvent += _on_fill
+        return True
+
     @property
     def open_tickers(self) -> set[str]:
         """Return set of tickers with open IBKR positions."""
@@ -278,6 +339,7 @@ class IBKRExecutionEngine:
                 entry.account = self._account
             entry_trade = self._ib.placeOrder(contract, entry)
             entry_id = entry_trade.order.orderId
+            self._active_trades[entry_id] = entry_trade
             logger.info(
                 "[IBKR] ENTRY submitted %s %s qty=%d orderId=%d",
                 action, ticker, quantity, entry_id,
@@ -680,10 +742,12 @@ class IBKRExecutionEngine:
             close_action = "SELL" if pos_qty > 0 else "BUY"
             direction: Direction = "LONG" if pos_qty > 0 else "SHORT"
             close_order = MarketOrder(close_action, abs(pos_qty))
-            close_order.transmit = True  # must be explicit — default varies by ib_async version
+            close_order.transmit  = True  # must be explicit — default varies by ib_async version
+            close_order.orderRef  = ORDER_REF
             if self._account:
                 close_order.account = self._account
             trade = self._ib.placeOrder(contract, close_order)
+            self._active_trades[trade.order.orderId] = trade
             await asyncio.sleep(0.5)
 
             fill_price: float | None = None

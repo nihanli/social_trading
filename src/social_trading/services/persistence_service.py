@@ -641,6 +641,134 @@ def _write_trade_closed(data: dict) -> None:
         conn.close()
 
 
+def _update_entry_price(data: dict) -> None:
+    """
+    Correct entry_price=0 on a trade row after an async IB fill arrives.
+
+    Idempotent: only updates rows where entry_price is currently 0 so
+    replayed events cannot overwrite a previously corrected price.
+    Recomputes P&L when the position is already closed (exit_price set).
+
+    Matches by (ticker, opened_at) with a fallback to the latest row with
+    entry_price=0 for the ticker.
+    """
+    ticker = data.get("ticker", "")
+    entry_price = _float(data.get("entry_price", 0))
+    opened_at = data.get("opened_at") or None
+    if not ticker or entry_price <= 0:
+        return
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if opened_at:
+                    cur.execute(
+                        "SELECT id, exit_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND opened_at = %s::timestamptz AND entry_price = 0 "
+                        "ORDER BY id DESC LIMIT 1",
+                        (ticker, opened_at),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        # Microsecond-drift fallback
+                        cur.execute(
+                            "SELECT id, exit_price, shares, direction FROM trades "
+                            "WHERE ticker = %s AND entry_price = 0 ORDER BY id DESC LIMIT 1",
+                            (ticker,),
+                        )
+                        row = cur.fetchone()
+                else:
+                    cur.execute(
+                        "SELECT id, exit_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND entry_price = 0 ORDER BY id DESC LIMIT 1",
+                        (ticker,),
+                    )
+                    row = cur.fetchone()
+                if not row:
+                    logger.debug(
+                        "entry_price update: no row with entry_price=0 for %s — already corrected", ticker
+                    )
+                    return
+                trade_id, exit_price_db, shares, direction = row
+                # Recompute P&L if position is already closed
+                pnl = None
+                pnl_pct = None
+                ep_exit = float(exit_price_db) if exit_price_db else 0.0
+                if ep_exit > 0 and shares and float(shares) > 0:
+                    sh = float(shares)
+                    pnl = (ep_exit - entry_price) * sh if direction == "LONG" else (entry_price - ep_exit) * sh
+                    pnl_pct = pnl / (entry_price * sh) * 100
+                cur.execute(
+                    "UPDATE trades SET entry_price = %s, pnl = %s, net_pnl = %s, pnl_pct = %s WHERE id = %s",
+                    (entry_price, pnl, pnl, pnl_pct, trade_id),
+                )
+                logger.info("entry_price corrected for %s: 0 → %.4f (trade id=%s)", ticker, entry_price, trade_id)
+    except psycopg2.Error as exc:
+        logger.warning("entry_price update failed (%s): %s", ticker, exc)
+    finally:
+        conn.close()
+
+
+def _update_exit_price(data: dict) -> None:
+    """
+    Correct exit_price on a closed trade row after an async IB fill arrives.
+
+    Rewrites exit_price, pnl, net_pnl, and pnl_pct.  Matches by
+    (ticker, opened_at) with a fallback to the latest closed row.
+    """
+    ticker = data.get("ticker", "")
+    exit_price = _float(data.get("exit_price", 0))
+    opened_at = data.get("opened_at") or None
+    if not ticker or exit_price <= 0:
+        return
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if opened_at:
+                    cur.execute(
+                        "SELECT id, entry_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND opened_at = %s::timestamptz AND status = 'closed' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (ticker, opened_at),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        cur.execute(
+                            "SELECT id, entry_price, shares, direction FROM trades "
+                            "WHERE ticker = %s AND status = 'closed' ORDER BY id DESC LIMIT 1",
+                            (ticker,),
+                        )
+                        row = cur.fetchone()
+                else:
+                    cur.execute(
+                        "SELECT id, entry_price, shares, direction FROM trades "
+                        "WHERE ticker = %s AND status = 'closed' ORDER BY id DESC LIMIT 1",
+                        (ticker,),
+                    )
+                    row = cur.fetchone()
+                if not row:
+                    return
+                trade_id, entry_price_db, shares, direction = row
+                pnl = None
+                pnl_pct = None
+                ep = float(entry_price_db) if entry_price_db else 0.0
+                if ep > 0 and shares and float(shares) > 0:
+                    sh = float(shares)
+                    pnl = (exit_price - ep) * sh if direction == "LONG" else (ep - exit_price) * sh
+                    pnl_pct = pnl / (ep * sh) * 100
+                cur.execute(
+                    "UPDATE trades SET exit_price = %s, pnl = %s, net_pnl = %s, pnl_pct = %s WHERE id = %s",
+                    (exit_price, pnl, pnl, pnl_pct, trade_id),
+                )
+                logger.info("exit_price corrected for %s: → %.4f (trade id=%s)", ticker, exit_price, trade_id)
+    except psycopg2.Error as exc:
+        logger.warning("exit_price update failed (%s): %s", ticker, exc)
+    finally:
+        conn.close()
+
+
+
 def _sync_positions(positions: list[dict]) -> None:
     """
     Upsert current open positions into the positions table.
@@ -883,6 +1011,18 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
                         logger.info(
                             "[EXEC_EVENTS] Trade closed: %s reason=%s",
                             fields.get("ticker", ""), fields.get("exit_reason", ""),
+                        )
+                    elif event_type == "position_entry_updated":
+                        await _run_db(_update_entry_price, fields)
+                        logger.info(
+                            "[EXEC_EVENTS] Entry price corrected: %s → %.4f",
+                            fields.get("ticker", ""), _float(fields.get("entry_price", 0)),
+                        )
+                    elif event_type == "position_exit_corrected":
+                        await _run_db(_update_exit_price, fields)
+                        logger.info(
+                            "[EXEC_EVENTS] Exit price corrected: %s → %.4f",
+                            fields.get("ticker", ""), _float(fields.get("exit_price", 0)),
                         )
                     else:
                         logger.debug("Unknown execution event type: %s", event_type)

@@ -146,18 +146,25 @@ async def _publish_execution_event(
     redis: aioredis.Redis,
     event_type: str,
     data: dict,
-) -> None:
-    """Publish a position lifecycle event to the execution:events stream."""
+) -> str | None:
+    """Publish a position lifecycle event to the execution:events stream.
+
+    Returns the Redis stream message ID on success, or None on failure.
+    The message ID is useful for correction events that need to reference the
+    original trade row (e.g. position_entry_updated, position_exit_corrected).
+    """
     try:
         fields = {"event": event_type}
         fields.update({k: str(v) if v is not None else "" for k, v in data.items()})
-        await redis.xadd(
+        msg_id = await redis.xadd(
             _EXEC_EVENTS_STREAM, fields,
             maxlen=STREAM_MAXLEN.get(_EXEC_EVENTS_STREAM, 50_000),
             approximate=True,
         )
+        return msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id) if msg_id else None
     except Exception as exc:
         logger.warning("[EVENTS] Failed to publish %s event: %s", event_type, exc)
+        return None
 
 
 async def _write_positions_to_redis(
@@ -458,6 +465,65 @@ async def run_trade_loop(
                             signal.direction, signal.ticker, quantity,
                             result.fill_price or 0.0, submitted,
                         )
+
+                        # ── Async entry fill tracking ──────────────────────────
+                        # When IB fill arrives after our 3s wait (paper / slow market),
+                        # register a callback to correct entry_price=0 in Redis + DB.
+                        if result.fill_price is None and hasattr(engine, "register_order_fill_callback"):
+                            _entry_order_id = int(result.order_id) if result.order_id else 0
+                            _entry_ticker   = signal.ticker
+                            _entry_opened_at = result.submitted_at.isoformat()
+                            if _entry_order_id:
+                                try:
+                                    await redis.hset(
+                                        _INFLIGHT_ENTRY_KEY, str(_entry_order_id),
+                                        json.dumps({
+                                            "ticker": _entry_ticker,
+                                            "direction": signal.direction,
+                                            "quantity": quantity,
+                                            "opened_at": _entry_opened_at,
+                                        }),
+                                    )
+                                    await redis.expire(_INFLIGHT_ENTRY_KEY, _INFLIGHT_TTL_SEC)
+                                except Exception as _inf_exc:
+                                    logger.debug("[EXEC] Failed to write inflight entry for %s: %s", _entry_ticker, _inf_exc)
+
+                                async def _on_entry_fill_async(
+                                    actual_fill: float,
+                                    _t: str = _entry_ticker,
+                                    _oa: str = _entry_opened_at,
+                                    _oid: str = str(_entry_order_id),
+                                ) -> None:
+                                    logger.info("[EXEC] Async entry fill received for %s: %.4f (orderId=%s)", _t, actual_fill, _oid)
+                                    try:
+                                        # Correct Redis position:params entry_price
+                                        _pr = await redis.hget(_POSITION_PARAMS_KEY, _t)
+                                        if _pr:
+                                            _pd = json.loads(_pr.decode() if isinstance(_pr, bytes) else _pr)
+                                            if _pd.get("entry_price", 0) == 0:
+                                                _pd["entry_price"] = actual_fill
+                                                await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps(_pd))
+                                        # Correct positions:live entry_price
+                                        _lr = await redis.hget(_POSITIONS_LIVE_KEY, _t)
+                                        if _lr:
+                                            _ld = json.loads(_lr.decode() if isinstance(_lr, bytes) else _lr)
+                                            if _ld.get("entry_price", 0) == 0:
+                                                _ld["entry_price"] = actual_fill
+                                                _ld["high_water_mark"] = max(actual_fill, _ld.get("high_water_mark") or 0)
+                                                await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps(_ld))
+                                        # Publish DB correction event
+                                        await _publish_execution_event(redis, "position_entry_updated", {
+                                            "ticker": _t,
+                                            "entry_price": actual_fill,
+                                            "opened_at": _oa,
+                                            "order_id": _oid,
+                                        })
+                                        # Remove from inflight ledger
+                                        await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid)
+                                    except Exception as _cb_exc:
+                                        logger.warning("[EXEC] Error in entry fill callback for %s: %s", _t, _cb_exc)
+
+                                engine.register_order_fill_callback(_entry_order_id, _on_entry_fill_async)  # type: ignore[union-attr]
                     else:
                         ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
                         logger.warning("[EXEC] Rejected %s: %s", signal.ticker, result.error)
@@ -559,6 +625,14 @@ async def run_exit_loop(
                         logger.info("[SYNC] IB reconnected — resuming position evaluation")
                         _last_ib_cache_refresh = now_ts  # mark cache as fresh
                         _loop_start_ts = now_ts  # reset grace period for naked check
+                        # Run inflight reconcile to recover any fills that arrived during
+                        # the disconnect window (fillEvent callbacks fire on dead Trade
+                        # objects and are silently dropped by ib_async after reconnect).
+                        try:
+                            _cur_tickers = engine.open_tickers if hasattr(engine, "open_tickers") else set()  # type: ignore[union-attr]
+                            await _reconcile_inflight_orders(redis, engine, _cur_tickers, mode=mode)
+                        except Exception as _ri_exc:
+                            logger.debug("[SYNC] Post-reconnect inflight reconcile failed: %s", _ri_exc)
                         # fall through to normal cycle
                     else:
                         logger.warning("[SYNC] IB reconnect failed — will retry in %ds", _RECONNECT_INTERVAL_SECS)
@@ -739,18 +813,32 @@ async def run_exit_loop(
                     now=now,
                 )
                 if decision.should_exit:
-                    await engine.close_position(pos.ticker, reason=decision.reason)
+                    # Capture position metadata before close_position clears engine state.
+                    _pos_opened_at = pos.opened_at.isoformat() if pos.opened_at else ""
+                    _pos_entry_price = pos.entry_price
+                    _pos_shares = pos.shares
+                    _pos_direction = pos.direction
+
+                    close_result = await engine.close_position(pos.ticker, reason=decision.reason)
                     just_closed.add(pos.ticker)
                     _trailing_pct_applied.pop(pos.ticker, None)
+
+                    # Use actual IB fill price if available; fall back to cached price.
+                    _actual_exit = (
+                        close_result.fill_price
+                        if (close_result and close_result.fill_price)
+                        else current_price
+                    )
+
                     await _publish_execution_event(redis, "position_closed", {
                         "ticker": pos.ticker,
-                        "exit_price": current_price,
+                        "exit_price": _actual_exit,
                         "exit_reason": decision.reason or "unknown",
-                        "shares": pos.shares,
-                        "direction": pos.direction,
-                        "entry_price": pos.entry_price,
+                        "shares": _pos_shares,
+                        "direction": _pos_direction,
+                        "entry_price": _pos_entry_price,
                         "closed_at": datetime.now(UTC).isoformat(),
-                        "opened_at": pos.opened_at.isoformat() if pos.opened_at else "",
+                        "opened_at": _pos_opened_at,
                         "mode": mode,
                     })
                     await redis.hdel(_HWM_REDIS_KEY, pos.ticker)
@@ -758,11 +846,59 @@ async def run_exit_loop(
                     POSITIONS_CLOSED.labels(reason=decision.reason or "unknown").inc()
                     logger.info(
                         "[EXIT] %s %s reason=%s pnl_approx=%.2f",
-                        pos.direction, pos.ticker, decision.reason,
-                        (current_price - pos.entry_price) * pos.shares
-                        if pos.direction == "LONG"
-                        else (pos.entry_price - current_price) * pos.shares,
+                        _pos_direction, pos.ticker, decision.reason,
+                        (_actual_exit - _pos_entry_price) * _pos_shares
+                        if _pos_direction == "LONG"
+                        else (_pos_entry_price - _actual_exit) * _pos_shares,
                     )
+
+                    # ── Async exit fill tracking ───────────────────────────────
+                    # When the close MKT fill doesn't arrive within the 0.5s wait,
+                    # register a callback to correct exit_price in the DB.
+                    if (
+                        close_result
+                        and close_result.fill_price is None
+                        and hasattr(engine, "register_order_fill_callback")
+                    ):
+                        _exit_order_id = int(close_result.order_id) if close_result.order_id else 0
+                        if _exit_order_id:
+                            _ex_ticker     = pos.ticker
+                            _ex_opened_at  = _pos_opened_at
+                            try:
+                                await redis.hset(
+                                    _INFLIGHT_EXIT_KEY, str(_exit_order_id),
+                                    json.dumps({
+                                        "ticker": _ex_ticker,
+                                        "opened_at": _ex_opened_at,
+                                        "entry_price": _pos_entry_price,
+                                        "shares": _pos_shares,
+                                        "direction": _pos_direction,
+                                        "provisional_exit": _actual_exit,
+                                    }),
+                                )
+                                await redis.expire(_INFLIGHT_EXIT_KEY, _INFLIGHT_TTL_SEC)
+                            except Exception as _inf_exc:
+                                logger.debug("[EXEC] Failed to write inflight exit for %s: %s", _ex_ticker, _inf_exc)
+
+                            async def _on_exit_fill_async(
+                                actual_fill: float,
+                                _t: str = _ex_ticker,
+                                _oa: str = _ex_opened_at,
+                                _oid: str = str(_exit_order_id),
+                            ) -> None:
+                                logger.info("[EXEC] Async exit fill received for %s: %.4f (orderId=%s)", _t, actual_fill, _oid)
+                                try:
+                                    await _publish_execution_event(redis, "position_exit_corrected", {
+                                        "ticker": _t,
+                                        "exit_price": actual_fill,
+                                        "opened_at": _oa,
+                                        "order_id": _oid,
+                                    })
+                                    await redis.hdel(_INFLIGHT_EXIT_KEY, _oid)
+                                except Exception as _cb_exc:
+                                    logger.warning("[EXEC] Error in exit fill callback for %s: %s", _t, _cb_exc)
+
+                            engine.register_order_fill_callback(_exit_order_id, _on_exit_fill_async)  # type: ignore[union-attr]
                 else:
                     # Position is holding — update IB TRAIL order if tightening changed.
                     # Done AFTER exit evaluation to avoid placing a TRAIL order that
@@ -1053,6 +1189,17 @@ _POSITION_PARAMS_KEY = "position:params"
 _TRAIL_ORDERS_KEY = "position:trail_orders"
 _EXEC_EVENTS_STREAM = "execution:events"
 _POSITIONS_LIVE_KEY = "positions:live"
+
+# In-flight order ledger: tracks entry/exit orders submitted to IB but not yet
+# fill-confirmed.  Used to recover actual fill prices after a service restart.
+_INFLIGHT_ENTRY_KEY   = "orders:inflight"   # entry MKT orders awaiting fill
+_INFLIGHT_EXIT_KEY    = "exits:inflight"    # close MKT orders awaiting fill
+_INFLIGHT_TTL_SEC     = 86400               # 24h TTL — auto-expires if never cleared
+
+# Fill-sync alert bus: unresolved inflight entries become user-visible alerts.
+# Written by _reconcile_inflight_orders; read by the Streamlit positions page.
+_FILL_SYNC_ALERTS_KEY = "alerts:fill_sync"  # hash: oid → JSON alert payload
+_FILL_SYNC_ALERT_TTL  = 86400               # 24h — stale alerts auto-expire
 
 
 async def _load_hwm_from_redis(
@@ -1755,6 +1902,206 @@ async def _reconcile_startup(
                 except Exception as exc:
                     logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
+    # ── Inflight order reconciliation ─────────────────────────────────────────
+    # Delegate to the shared _reconcile_inflight_orders helper so the same
+    # recovery logic runs at startup AND after a mid-session IB reconnect.
+    await _reconcile_inflight_orders(redis, engine, current_tickers, mode=mode)
+
+
+async def _reconcile_inflight_orders(
+    redis: aioredis.Redis,
+    engine: ExecutionEngine,
+    current_tickers: set[str],
+    mode: str = "live",
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+) -> tuple[int, int]:
+    """
+    Attempt to recover actual fill prices for any entry/exit orders still in the
+    inflight ledger (orders:inflight / exits:inflight).
+
+    Called from:
+      - _reconcile_startup() — on every service start
+      - run_exit_loop()       — after every successful mid-session IB reconnect
+      - REFRESH_SYNC command  — on-demand from the UI
+
+    Fill prices are sourced from IB's server-side execution history
+    (reqExecutionsAsync) AND completed order history (reqCompletedOrdersAsync).
+    The query is retried up to max_retries times (2s apart) to handle IB startup lag.
+
+    For inflight entries that cannot be resolved after all retries:
+      - If the position is still open: writes a warning to alerts:fill_sync so the UI
+        can prompt the user with action options (Attempt Reconcile / Close Position).
+      - If the position is already gone: cleans up the ledger entry silently.
+
+    Returns (entry_fixes, exit_fixes) counts.
+    """
+    ib_obj = getattr(engine, "_ib", None)
+    if ib_obj is None:
+        return 0, 0
+
+    # ── Build fill price map from IB with retries ──────────────────────────────
+    # Primary: reqExecutionsAsync — server-side fills for today's session.
+    # Fallback: reqCompletedOrdersAsync — completed orders (may include OCA legs).
+    _all_fills: dict[int, float] = {}
+    for _attempt in range(max_retries):
+        try:
+            from ib_async import ExecutionFilter as _EF  # noqa: PLC0415
+            for _f in await ib_obj.reqExecutionsAsync(_EF()):
+                _oid = getattr(getattr(_f, "execution", None), "orderId", 0)
+                _px  = getattr(getattr(_f, "execution", None), "price", 0.0)
+                if _oid and _px:
+                    _all_fills[int(_oid)] = float(_px)
+            # Supplement with avgFillPrice from completed orders
+            try:
+                for _co in (await ib_obj.reqCompletedOrdersAsync(apiOnly=False) or []):
+                    _oid = getattr(getattr(_co, "order", None), "orderId", 0)
+                    _px  = getattr(getattr(_co, "orderStatus", None), "avgFillPrice", 0.0)
+                    if _oid and _px:
+                        _all_fills.setdefault(int(_oid), float(_px))
+            except Exception:
+                pass
+            break  # success
+        except Exception as _exc:
+            if _attempt < max_retries - 1:
+                logger.debug(
+                    "[SYNC] Inflight reconcile: IB exec fetch attempt %d/%d failed: %s — retrying in %.0fs",
+                    _attempt + 1, max_retries, _exc, retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.warning(
+                    "[SYNC] Inflight reconcile: could not fetch IB executions after %d attempts: %s",
+                    max_retries, _exc,
+                )
+
+    now_utc = datetime.now(UTC)
+    entry_fixes = 0
+    exit_fixes = 0
+
+    # ── Entry inflight reconcile ───────────────────────────────────────────────
+    try:
+        _entry_inf = await redis.hgetall(_INFLIGHT_ENTRY_KEY)
+        for _k, _v in (_entry_inf or {}).items():
+            _oid_str = _k.decode() if isinstance(_k, bytes) else str(_k)
+            try:
+                _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                _t  = _d.get("ticker", "")
+                _oa = _d.get("opened_at", "")
+                _fp = _all_fills.get(int(_oid_str), 0.0)
+
+                if _fp > 0:
+                    logger.info("[SYNC] Inflight entry %s orderId=%s: recovered fill %.4f", _t, _oid_str, _fp)
+                    await _publish_execution_event(redis, "position_entry_updated", {
+                        "ticker": _t, "entry_price": _fp,
+                        "opened_at": _oa, "order_id": _oid_str,
+                    })
+                    await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid_str)
+                    await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
+                    entry_fixes += 1
+
+                elif _t not in current_tickers:
+                    # Position gone AND no fill found — discard stale ledger entry
+                    logger.debug(
+                        "[SYNC] Inflight entry %s orderId=%s: no position + no fill — discarding",
+                        _t, _oid_str,
+                    )
+                    await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid_str)
+                    await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
+
+                else:
+                    # Position still open but fill unconfirmed — escalate to alert
+                    _age_min = 0
+                    try:
+                        _age_min = int((now_utc - datetime.fromisoformat(_oa)).total_seconds() / 60)
+                    except Exception:
+                        pass
+                    severity = "error" if _age_min > 30 else "warning"
+                    alert = {
+                        "ticker": _t,
+                        "order_id": _oid_str,
+                        "type": "entry_fill_pending",
+                        "opened_at": _oa,
+                        "age_minutes": _age_min,
+                        "severity": severity,
+                        "message": (
+                            f"**{_t}**: Entry fill price unconfirmed after {_age_min} min "
+                            f"(IB orderId {_oid_str}). "
+                            f"The position may be open without a recorded entry price. "
+                            f"Options: **Attempt Reconcile** to retry IB lookup, "
+                            f"**Close Position** to exit safely, "
+                            f"or verify directly in Trader Workstation."
+                        ),
+                        "updated_at": now_utc.isoformat(),
+                    }
+                    await redis.hset(_FILL_SYNC_ALERTS_KEY, _oid_str, json.dumps(alert))
+                    await redis.expire(_FILL_SYNC_ALERTS_KEY, _FILL_SYNC_ALERT_TTL)
+                    logger.warning(
+                        "[SYNC] Inflight entry %s orderId=%s unresolved after %dm — alert raised",
+                        _t, _oid_str, _age_min,
+                    )
+            except Exception as _ie:
+                logger.debug("[SYNC] Error processing inflight entry %s: %s", _oid_str, _ie)
+    except Exception as _exc:
+        logger.debug("[SYNC] Inflight entry reconcile failed: %s", _exc)
+
+    # ── Exit inflight reconcile ────────────────────────────────────────────────
+    try:
+        _exit_inf = await redis.hgetall(_INFLIGHT_EXIT_KEY)
+        for _k, _v in (_exit_inf or {}).items():
+            _oid_str = _k.decode() if isinstance(_k, bytes) else str(_k)
+            try:
+                _d   = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                _t   = _d.get("ticker", "")
+                _oa  = _d.get("opened_at", "")
+                _fp  = _all_fills.get(int(_oid_str), 0.0)
+                _prov = float(_d.get("provisional_exit", 0))
+
+                if _fp > 0:
+                    logger.info("[SYNC] Inflight exit %s orderId=%s: recovered fill %.4f", _t, _oid_str, _fp)
+                    await _publish_execution_event(redis, "position_exit_corrected", {
+                        "ticker": _t, "exit_price": _fp,
+                        "opened_at": _oa, "order_id": _oid_str,
+                    })
+                    await redis.hdel(_INFLIGHT_EXIT_KEY, _oid_str)
+                    await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
+                    exit_fixes += 1
+                else:
+                    # Fill not found — clean up and write advisory alert
+                    _age_min = 0
+                    try:
+                        _age_min = int((now_utc - datetime.fromisoformat(_oa)).total_seconds() / 60)
+                    except Exception:
+                        pass
+                    await redis.hdel(_INFLIGHT_EXIT_KEY, _oid_str)
+                    if _age_min > 5:
+                        alert = {
+                            "ticker": _t,
+                            "order_id": _oid_str,
+                            "type": "exit_fill_pending",
+                            "opened_at": _oa,
+                            "provisional_exit": _prov,
+                            "age_minutes": _age_min,
+                            "severity": "warning",
+                            "message": (
+                                f"**{_t}**: Exit fill price could not be confirmed "
+                                f"(IB orderId {_oid_str}, provisional ≈ ${_prov:.2f}). "
+                                f"P&L shown may be approximate. "
+                                f"Verify the actual fill price in Trader Workstation."
+                            ),
+                            "updated_at": now_utc.isoformat(),
+                        }
+                        await redis.hset(_FILL_SYNC_ALERTS_KEY, _oid_str, json.dumps(alert))
+                        await redis.expire(_FILL_SYNC_ALERTS_KEY, _FILL_SYNC_ALERT_TTL)
+            except Exception as _ie:
+                logger.debug("[SYNC] Error processing inflight exit %s: %s", _oid_str, _ie)
+    except Exception as _exc:
+        logger.debug("[SYNC] Inflight exit reconcile failed: %s", _exc)
+
+    if entry_fixes or exit_fixes:
+        logger.info("[SYNC] Inflight reconcile complete: %d entry fix(es), %d exit fix(es)", entry_fixes, exit_fixes)
+    return entry_fixes, exit_fixes
+
 
 async def _prune_old_data() -> None:
     """
@@ -2083,6 +2430,27 @@ async def _reconcile_external_closes(
         await redis.hdel(_HWM_REDIS_KEY, ticker)
         await redis.hdel(_POSITION_PARAMS_KEY, ticker)
         POSITIONS_CLOSED.labels(reason=exit_reason).inc()
+
+        # Clean up any exits:inflight entry for this ticker.
+        # The close_position callback may have written an inflight entry that
+        # never fired (fill arrived during a disconnect window).  Since we've
+        # now detected the close via _reconcile_external_closes we can remove
+        # the stale ledger entry — the position_closed event we're about to
+        # publish carries the actual exit price.
+        try:
+            _ei = await redis.hgetall(_INFLIGHT_EXIT_KEY)
+            for _k, _v in (_ei or {}).items():
+                _oid = _k.decode() if isinstance(_k, bytes) else str(_k)
+                try:
+                    _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                    if _d.get("ticker") == ticker:
+                        await redis.hdel(_INFLIGHT_EXIT_KEY, _oid)
+                        await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         logger.info(
             "[SYNC] %s closed externally by IB: reason=%s exit_price=%.4f",
             ticker, exit_reason, exit_price,
@@ -2172,6 +2540,18 @@ async def run_command_listener(engine: ExecutionEngine, redis: aioredis.Redis) -
                     logger.error("Failed to close %s: %s", ticker, exc)
         elif cmd == "CONFIG_UPDATED":
             logger.info("CONFIG_UPDATED received — config will reload on next cycle")
+        elif cmd == "REFRESH_SYNC":
+            logger.info("REFRESH_SYNC: running on-demand inflight order reconcile")
+            try:
+                _cur = engine.open_tickers if hasattr(engine, "open_tickers") else set()
+                ef, xf = await _reconcile_inflight_orders(redis, engine, _cur)
+                logger.info("REFRESH_SYNC complete: %d entry fix(es), %d exit fix(es)", ef, xf)
+                await redis.setex(
+                    "sync:last_reconcile", 300,
+                    json.dumps({"entry_fixes": ef, "exit_fixes": xf, "ts": datetime.now(UTC).isoformat()}),
+                )
+            except Exception as exc:
+                logger.warning("REFRESH_SYNC failed: %s", exc)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

@@ -108,6 +108,49 @@ def close_position(ticker: str) -> None:
     send_command("CLOSE_TICKER", {"ticker": ticker.upper()})
 
 
+def trigger_sync_reconcile() -> None:
+    """Publish REFRESH_SYNC so the execution service re-runs inflight order recovery."""
+    send_command("REFRESH_SYNC")
+
+
+def get_fill_sync_alerts() -> list[dict]:
+    """
+    Return all active fill-sync alert entries from alerts:fill_sync.
+    Each dict has: ticker, order_id, type, severity, message, age_minutes, updated_at.
+    """
+    import json as _json
+    r = _get_redis()
+    result = []
+    try:
+        raw = r.hgetall("alerts:fill_sync") or {}
+        for _, v in raw.items():
+            try:
+                result.append(_json.loads(v))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return sorted(result, key=lambda a: a.get("age_minutes", 0), reverse=True)
+
+
+def dismiss_fill_sync_alert(order_id: str) -> None:
+    """Dismiss a specific fill-sync alert by order_id."""
+    r = _get_redis()
+    try:
+        r.hdel("alerts:fill_sync", order_id)
+    except Exception:
+        pass
+
+
+def dismiss_all_fill_sync_alerts() -> None:
+    """Dismiss all active fill-sync alerts."""
+    r = _get_redis()
+    try:
+        r.delete("alerts:fill_sync")
+    except Exception:
+        pass
+
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _sync_load_config() -> SystemConfig:
