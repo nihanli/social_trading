@@ -237,7 +237,8 @@ with col_left:
     positions = query("""
         SELECT ticker,
                '/chart?ticker=' || ticker || '&tf=6M' AS chart,
-               direction, shares, entry_price,
+               direction, shares,
+               ROUND(entry_price::numeric, 2)         AS entry_price,
                ROUND(unrealized_pnl::numeric, 2)      AS unrealized_pnl,
                ROUND((unrealized_pnl /
                  NULLIF(entry_price * shares, 0) * 100)::numeric, 1) AS pnl_pct,
@@ -349,7 +350,9 @@ st.subheader("Recent Closed Trades")
 trades = query("""
     SELECT ticker,
            '/chart?ticker=' || ticker || '&tf=6M' AS chart,
-           direction, shares, entry_price, exit_price,
+           direction, shares,
+           ROUND(entry_price::numeric, 2) AS entry_price,
+           ROUND(exit_price::numeric, 2)  AS exit_price,
            ROUND(net_pnl::numeric, 2) AS net_pnl,
            exit_reason,
            TO_CHAR(opened_at,  'MM-DD HH24:MI') AS opened,
