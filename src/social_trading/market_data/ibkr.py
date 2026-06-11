@@ -47,34 +47,26 @@ class IBKRMarketData:
 
     def __init__(self, ib: Any) -> None:
         self._ib = ib
-        self._market_data_type_set = False
-
-    def _ensure_delayed_data(self) -> None:
-        """Set market data type to delayed (3) once per connection."""
-        if not self._market_data_type_set:
-            self._ib.reqMarketDataType(3)
-            self._market_data_type_set = True
 
     async def get_quote(self, ticker: str) -> dict[str, Any]:
         """
         Return last price, bid, ask, and volume via reqMktData.
 
-        Uses delayed market data (type 3) as fallback when no live subscription.
-        Warning 10167 ("not subscribed, showing delayed data") is expected for
-        paper accounts without live data subscriptions and is suppressed to DEBUG.
+        Requests live data (type 1) first; falls back to delayed (type 3) when
+        the live price is unavailable (no subscription, outside hours, etc.).
+        Restores live mode after the call so the shared IB connection stays in
+        live mode for other callers (e.g. get_market_prices in ibkr.py).
         """
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed")
 
         from ib_async import Stock  # noqa: PLC0415
-        self._ensure_delayed_data()
+
         contract = Stock(ticker, "SMART", "USD")
         await self._ib.qualifyContractsAsync(contract)
-        ticker_data = self._ib.reqMktData(contract, "", False, False)
-        await asyncio.sleep(1.5)  # allow data to arrive
-        self._ib.cancelMktData(contract)
 
         import math  # noqa: PLC0415
+
         def _safe(val: Any) -> float | None:
             """Return float if val is a real finite number, else None."""
             try:
@@ -83,7 +75,23 @@ class IBKRMarketData:
             except (TypeError, ValueError):
                 return None
 
+        # Try live data first
+        self._ib.reqMarketDataType(1)
+        ticker_data = self._ib.reqMktData(contract, "", False, False)
+        await asyncio.sleep(1.5)
+        self._ib.cancelMktData(contract)
+
         last = _safe(ticker_data.last) or _safe(ticker_data.close)
+        if last is None:
+            # No live data (no subscription or outside hours) — retry with delayed
+            self._ib.reqMarketDataType(3)
+            ticker_data = self._ib.reqMktData(contract, "", False, False)
+            await asyncio.sleep(1.5)
+            self._ib.cancelMktData(contract)
+            # Restore live mode so the shared connection stays in live mode
+            self._ib.reqMarketDataType(1)
+            last = _safe(ticker_data.last) or _safe(ticker_data.close)
+
         if last is None:
             # Error 10089 / no data received — raise so FallbackMarketData
             # can retry with yfinance.
@@ -174,12 +182,14 @@ class IBKRMarketData:
             raise RuntimeError("ib_async is not installed")
 
         from ib_async import Index  # noqa: PLC0415
-        self._ensure_delayed_data()
+        import math  # noqa: PLC0415
+
         contract = Index("VIX", "CBOE", "USD")
+        # VIX is an index — live data (type 1) should always be available via CBOE
+        self._ib.reqMarketDataType(1)
         ticker_data = self._ib.reqMktData(contract, "", False, False)
         await asyncio.sleep(1.5)
         self._ib.cancelMktData(contract)
-        import math  # noqa: PLC0415
         for candidate in (ticker_data.last, ticker_data.close):
             try:
                 v = float(candidate)

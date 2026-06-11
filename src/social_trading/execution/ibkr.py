@@ -1051,7 +1051,30 @@ class IBKRExecutionEngine:
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed")
 
+        import math as _math  # noqa: PLC0415
+
         positions = []
+
+        # Build a portfolio map keyed by symbol for fast lookup.
+        # ib.portfolio() carries live marketPrice updated by IB's account
+        # subscription — always available when connected, no market-data
+        # subscription required.  Used as a fallback when _prices has no
+        # cached value for a ticker yet (e.g. first cycle or fetch failure).
+        portfolio_map: dict[str, Any] = {}
+        try:
+            for item in self._ib.portfolio():
+                if self._account and item.account != self._account:
+                    continue
+                sym = item.contract.symbol
+                mp = getattr(item, "marketPrice", None)
+                try:
+                    if mp is not None and _math.isfinite(float(mp)) and float(mp) > 0:
+                        portfolio_map[sym] = item
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
+
         for p in self._ib.positions():
             if p.position == 0:
                 continue
@@ -1087,8 +1110,20 @@ class IBKRExecutionEngine:
             except (ValueError, KeyError):
                 opened_at = datetime.now(UTC)
 
-            # Compute unrealised PnL from price cache
-            current_price = self._prices.get(ticker, entry_price)
+            # Compute unrealised PnL from price cache, with portfolio fallback.
+            # Preference order:
+            #   1. _prices — refreshed from get_market_prices() every exit-loop tick
+            #   2. ib.portfolio() marketPrice — live account-subscription data,
+            #      used when _prices has no value yet (first cycle / fetch failure)
+            #   3. entry_price — last resort (unrealized = 0)
+            current_price = self._prices.get(ticker)
+            if current_price is None:
+                port = portfolio_map.get(ticker)
+                if port is not None:
+                    current_price = float(port.marketPrice)
+                    self._prices[ticker] = current_price  # seed cache
+                else:
+                    current_price = entry_price
             if direction == "LONG":
                 unrealized = (current_price - entry_price) * shares
             else:
@@ -1166,8 +1201,14 @@ class IBKRExecutionEngine:
         from ib_async import Stock  # noqa: PLC0415
 
         try:
-            # Set delayed data once so paper/non-subscribed accounts still get prices
-            self._ib.reqMarketDataType(3)
+            # Request live data. For accounts with live subscriptions this
+            # returns real-time prices.  For paper/unsubscribed tickers IB
+            # returns NaN → those tickers are omitted and the caller falls
+            # back to yfinance.  We do NOT force type 3 (delayed) here because
+            # reqMarketDataType is global on the connection — forcing delayed
+            # mode would poison all subsequent market-data requests (including
+            # market_data/ibkr.py) even for subscribed tickers.
+            self._ib.reqMarketDataType(1)
             contracts = [Stock(t, "SMART", "USD") for t in tickers]
             ticker_objects = await self._ib.reqTickersAsync(*contracts)
         except Exception as exc:
