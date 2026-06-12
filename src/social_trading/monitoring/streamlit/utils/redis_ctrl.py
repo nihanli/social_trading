@@ -151,6 +151,85 @@ def dismiss_all_fill_sync_alerts() -> None:
         pass
 
 
+def get_pending_reconcile() -> list[dict]:
+    """
+    Return all entries from positions:pending_reconcile.
+
+    These are positions persisted in the app that could not be automatically
+    reconciled against IB at startup (no current IB position AND no fill record).
+    Each dict includes: ticker, direction, entry_price, shares, opened_at,
+    reason, message, last_checked_at.
+    """
+    r = _get_redis()
+    result = []
+    try:
+        raw = r.hgetall("positions:pending_reconcile") or {}
+        for _, v in raw.items():
+            try:
+                result.append(json.loads(v))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return sorted(result, key=lambda x: x.get("opened_at", ""), reverse=True)
+
+
+def resolve_pending_position(ticker: str, action: str) -> None:
+    """
+    Ask the execution service to resolve a pending-reconcile position.
+
+    action="close"  → publishes position_closed (exit_price=0), removes from tracking
+    action="delete" → removes from app state with no DB event
+    """
+    if action == "close":
+        send_command("RESOLVE_PENDING_CLOSE", {"ticker": ticker.upper()})
+    elif action == "delete":
+        send_command("RESOLVE_PENDING_DELETE", {"ticker": ticker.upper()})
+
+
+def trigger_full_reconcile() -> None:
+    """Ask the execution service to re-run the full startup reconcile on demand."""
+    send_command("FULL_RECONCILE")
+
+
+def get_reconcile_state() -> str:
+    """Return current reconcile state: collecting|awaiting_approval|approved|skipped_no_ib|''"""
+    r = _get_redis()
+    try:
+        v = r.get("reconcile:state")
+        return v if v else ""
+    except Exception:
+        return ""
+
+
+def get_reconcile_data() -> dict:
+    """Return full reconcile data dict from reconcile:data, or {}."""
+    r = _get_redis()
+    try:
+        raw = r.get("reconcile:data")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+
+
+def approve_reconcile() -> None:
+    """Send RECONCILE_APPROVE command to execution service."""
+    send_command("RECONCILE_APPROVE")
+
+
+def delete_reconcile_position(ticker: str) -> None:
+    """Send RECONCILE_DELETE_POSITION command for the given ticker."""
+    send_command("RECONCILE_DELETE_POSITION", {"ticker": ticker.upper()})
+
+
+def skip_reconcile() -> None:
+    """Skip the startup reconcile — sends RECONCILE_SKIP command so the execution
+    service also marks the session reconcile as done (preventing a re-run on reconnect)."""
+    send_command("RECONCILE_SKIP")
+
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _sync_load_config() -> SystemConfig:

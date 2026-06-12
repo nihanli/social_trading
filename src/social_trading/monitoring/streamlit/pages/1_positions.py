@@ -28,7 +28,10 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     dismiss_fill_sync_alert,
     get_fill_sync_alerts,
     get_live_positions,
+    get_pending_reconcile,
     get_system_state,
+    resolve_pending_position,
+    trigger_full_reconcile,
     trigger_sync_reconcile,
 )
 from social_trading.monitoring.streamlit.utils.refresh_countdown import (
@@ -85,6 +88,56 @@ if _sync_alerts:
                 st.rerun()
     st.divider()
 
+# ── Pending reconcile: positions needing manual resolution ────────────────────
+_pending = get_pending_reconcile()
+if _pending:
+        with st.container(border=True):
+            st.subheader("🔍 Pending Reconcile", divider="red")
+            st.caption(
+                "These positions are tracked by the app but could not be automatically "
+                "confirmed as open or closed in IB. Choose an action for each one."
+            )
+            _col_rerun = False
+            for _item in _pending:
+                _t = _item.get("ticker", "?")
+                _dir = _item.get("direction", "?")
+                _entry = _item.get("entry_price", 0.0)
+                _shares = _item.get("shares", 0)
+                _opened = _item.get("opened_at", "")
+                _msg = _item.get("message", "")
+                _checked = _item.get("last_checked_at", "")
+                with st.expander(f"⚠ {_t}  —  {_dir}  {_shares} shares @ ${_entry:.2f}", expanded=True):
+                    st.warning(_msg)
+                    if _checked:
+                        try:
+                            _age = (datetime.now(UTC) - datetime.fromisoformat(_checked)).total_seconds() / 60
+                            st.caption(f"Last checked: {_checked[:19]} UTC  ({_age:.0f} min ago)")
+                        except Exception:
+                            st.caption(f"Last checked: {_checked}")
+                    _pa, _pb, _pc = st.columns(3)
+                    with _pa:
+                        if st.button("🔄 Re-attempt Reconcile", key=f"pr_sync_{_t}",
+                                     help="Ask the execution service to re-query IB for this position"):
+                            trigger_full_reconcile()
+                            st.info("Full reconcile requested — results will appear within 30 seconds.")
+                    with _pb:
+                        if st.button(f"✓ Mark {_t} as Closed", key=f"pr_close_{_t}",
+                                     help="Confirm this position is closed. No exit price will be recorded."):
+                            resolve_pending_position(_t, "close")
+                            st.success(f"{_t} marked as closed. Refreshing…")
+                            _col_rerun = True
+                    with _pc:
+                        if st.button(f"🗑 Remove {_t} from App", key=f"pr_delete_{_t}",
+                                     help="Remove this entry from the app without recording a trade close."):
+                            resolve_pending_position(_t, "delete")
+                            st.info(f"{_t} removed from app. Refreshing…")
+                            _col_rerun = True
+            if _col_rerun:
+                import time as _time
+                _time.sleep(1)
+                st.rerun()
+        st.divider()
+
 # ── Load positions from Redis (real-time) ────────────────────────────────────
 raw_positions = get_live_positions()
 
@@ -107,10 +160,13 @@ for p in raw_positions:
     pnl_pct = round(unreal / (entry * shares) * 100, 2) if entry and shares else 0.0
     _t = p.get("ticker", "")
     cache_missing = p.get("ib_cache_missing", False)
+    close_pending = p.get("close_pending", False)
     fill_pending = (entry == 0.0 and not cache_missing)
     # Prefix ticker with the most prominent active flag
     if cache_missing:
         _ticker_display = f"⚠ {_t}"
+    elif close_pending:
+        _ticker_display = f"🔄 {_t}"
     elif fill_pending:
         _ticker_display = f"⏳ {_t}"
     else:
@@ -126,6 +182,7 @@ for p in raw_positions:
         "unrealized_pnl": round(unreal, 2),
         "pnl_pct":        pnl_pct,
         "hold_hrs":       hold_hrs,
+        "status":         "🔄 close pending" if close_pending else ("⚠ cache missing" if cache_missing else "open"),
     })
 
 positions = pd.DataFrame(rows).sort_values("unrealized_pnl", ascending=False)

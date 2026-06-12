@@ -33,6 +33,7 @@ from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
     get_phase_pipeline_stats,
+    get_reconcile_state,
     get_system_state,
     halt_new_trades,
     resume_trading,
@@ -142,6 +143,15 @@ with st.sidebar:
 
     st.metric("VIX", f"{state['vix']:.1f}",
               help="Live VIX — affects position size scalars")
+
+# Startup reconcile banner
+_rec_state = get_reconcile_state()
+if _rec_state == "awaiting_approval":
+    st.warning(
+        "⚠️ **Startup reconcile is pending** — trading is paused until approved. "
+        "Go to [**Reconcile page**](/Reconcile) to review and approve.",
+        icon="⚠️",
+    )
 
 # ═══════════════════════════════════════
 # MAIN — KPI Row

@@ -768,6 +768,25 @@ def _update_exit_price(data: dict) -> None:
         conn.close()
 
 
+def _handle_position_deleted_db(data: dict) -> None:
+    ticker = data.get("ticker", "")
+    if not ticker:
+        return
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE trades SET status = 'deleted', closed_at = NOW(), "
+                    "exit_reason = 'USER_DELETED_AT_RECONCILE' "
+                    "WHERE ticker = %s AND status = 'open'",
+                    (ticker,),
+                )
+                cur.execute("DELETE FROM positions WHERE ticker = %s", (ticker,))
+    finally:
+        conn.close()
+
+
 
 def _sync_positions(positions: list[dict]) -> None:
     """
@@ -954,6 +973,69 @@ async def run_prune_task() -> None:
             logger.info("DB prune: deleted %d rows (%s)", total_deleted, parts)
 
 
+async def _handle_position_opened_event(fields: dict) -> None:
+    await _run_db(_write_trade_opened, fields)
+    signal_ts = fields.get("signal_generated_at", "")
+    ticker = fields.get("ticker", "")
+    if ticker:
+        try:
+            if signal_ts:
+                await _run_db(_mark_signal_executed, ticker, signal_ts)
+            else:
+                updated = await _run_db(_mark_latest_signal_executed, ticker)
+                if updated:
+                    logger.info(
+                        "[EXEC_EVENTS] Marked latest signal executed for adopted position %s",
+                        ticker,
+                    )
+                else:
+                    logger.debug(
+                        "[EXEC_EVENTS] No unexecuted signal found for adopted position %s",
+                        ticker,
+                    )
+        except Exception as exc:
+            logger.warning("Failed to mark signal executed (%s): %s", ticker, exc)
+    logger.info(
+        "[EXEC_EVENTS] Trade opened: %s %s",
+        fields.get("direction", ""), fields.get("ticker", ""),
+    )
+
+
+async def _handle_position_closed_event(fields: dict) -> None:
+    await _run_db(_write_trade_closed, fields)
+    logger.info(
+        "[EXEC_EVENTS] Trade closed: %s reason=%s",
+        fields.get("ticker", ""), fields.get("exit_reason", ""),
+    )
+
+
+async def _handle_position_entry_updated_event(fields: dict) -> None:
+    await _run_db(_update_entry_price, fields)
+    logger.info(
+        "[EXEC_EVENTS] Entry price corrected: %s → %.4f",
+        fields.get("ticker", ""), _float(fields.get("entry_price", 0)),
+    )
+
+
+async def _handle_position_exit_corrected_event(fields: dict) -> None:
+    await _run_db(_update_exit_price, fields)
+    logger.info(
+        "[EXEC_EVENTS] Exit price corrected: %s → %.4f",
+        fields.get("ticker", ""), _float(fields.get("exit_price", 0)),
+    )
+
+
+async def _handle_position_deleted(event_data: dict) -> None:
+    ticker = event_data.get("ticker", "")
+    if not ticker:
+        return
+    try:
+        await _run_db(_handle_position_deleted_db, event_data)
+        logger.info("[DB] position_deleted: cleaned DB records for %s", ticker)
+    except Exception as exc:
+        logger.warning("[DB] position_deleted handler failed for %s: %s", ticker, exc)
+
+
 async def run_execution_events_task(bus: TradingEventBus) -> None:
     """
     Consume execution:events stream and persist trade lifecycle to PostgreSQL.
@@ -963,6 +1045,13 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
     """
     await bus.create_group(_EXEC_EVENTS_STREAM, _GROUP)
     logger.info("Execution events consumer started (stream=%s)", _EXEC_EVENTS_STREAM)
+    handlers = {
+        "position_opened": _handle_position_opened_event,
+        "position_closed": _handle_position_closed_event,
+        "position_entry_updated": _handle_position_entry_updated_event,
+        "position_exit_corrected": _handle_position_exit_corrected_event,
+        "position_deleted": _handle_position_deleted,
+    }
     while True:
         try:
             messages = await bus.consume(
@@ -973,57 +1062,9 @@ async def run_execution_events_task(bus: TradingEventBus) -> None:
                 # Include stream message ID for idempotent inserts
                 fields["stream_event_id"] = msg_id
                 try:
-                    if event_type == "position_opened":
-                        await _run_db(_write_trade_opened, fields)
-                        # Mark the originating signal as executed.
-                        # If signal_generated_at is present (normal trade loop path), use it
-                        # for an exact match.  For adopted/reconciled positions that lack a
-                        # timestamp, fall back to marking the most recent approved-but-unexecuted
-                        # signal for the ticker (within the last 48 h) as a best effort.
-                        signal_ts = fields.get("signal_generated_at", "")
-                        ticker = fields.get("ticker", "")
-                        if ticker:
-                            try:
-                                if signal_ts:
-                                    await _run_db(_mark_signal_executed, ticker, signal_ts)
-                                else:
-                                    updated = await _run_db(_mark_latest_signal_executed, ticker)
-                                    if updated:
-                                        logger.info(
-                                            "[EXEC_EVENTS] Marked latest signal executed for adopted position %s",
-                                            ticker,
-                                        )
-                                    else:
-                                        logger.debug(
-                                            "[EXEC_EVENTS] No unexecuted signal found for adopted position %s",
-                                            ticker,
-                                        )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Failed to mark signal executed (%s): %s", ticker, exc
-                                )
-                        logger.info(
-                            "[EXEC_EVENTS] Trade opened: %s %s",
-                            fields.get("direction", ""), fields.get("ticker", ""),
-                        )
-                    elif event_type == "position_closed":
-                        await _run_db(_write_trade_closed, fields)
-                        logger.info(
-                            "[EXEC_EVENTS] Trade closed: %s reason=%s",
-                            fields.get("ticker", ""), fields.get("exit_reason", ""),
-                        )
-                    elif event_type == "position_entry_updated":
-                        await _run_db(_update_entry_price, fields)
-                        logger.info(
-                            "[EXEC_EVENTS] Entry price corrected: %s → %.4f",
-                            fields.get("ticker", ""), _float(fields.get("entry_price", 0)),
-                        )
-                    elif event_type == "position_exit_corrected":
-                        await _run_db(_update_exit_price, fields)
-                        logger.info(
-                            "[EXEC_EVENTS] Exit price corrected: %s → %.4f",
-                            fields.get("ticker", ""), _float(fields.get("exit_price", 0)),
-                        )
+                    handler = handlers.get(event_type)
+                    if handler is not None:
+                        await handler(fields)
                     else:
                         logger.debug("Unknown execution event type: %s", event_type)
                     # ACK only after confirmed DB write — not in the except branch.
