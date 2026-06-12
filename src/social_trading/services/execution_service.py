@@ -1687,7 +1687,12 @@ async def _check_naked_positions(
     # a protective order — it cannot prevent unlimited loss.
     _protective_order_types = {"STP", "STP LMT", "TRAIL"}
     _done_statuses = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+    _active_statuses = {"PendingSubmit", "PreSubmitted", "Submitted"}
     protected_tickers: set[str] = set()
+    # Tickers with a pending MKT close order — OCA was intentionally cancelled
+    # before the close was submitted.  Do NOT reattach for these: doing so would
+    # place new bracket orders that conflict with the in-flight MKT close.
+    pending_mkt_close_tickers: set[str] = set()
     try:
         from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
         for trade in ib.openTrades():
@@ -1702,11 +1707,23 @@ async def _check_naked_positions(
                 continue
             if ot in _protective_order_types:
                 protected_tickers.add(sym)
+            elif ot == "MKT" and status in _active_statuses:
+                # Active MKT order = a close submitted but not yet filled.
+                # OCA brackets were intentionally cancelled before this order.
+                pending_mkt_close_tickers.add(sym)
     except Exception as exc:
         logger.warning("[NAKED] Could not inspect IB open trades: %s — skipping check", exc)
         return just_closed, just_reattached  # cannot safely assess
 
-    naked = [p for p in open_positions if p.ticker not in protected_tickers]
+    naked = [p for p in open_positions
+             if p.ticker not in protected_tickers and p.ticker not in pending_mkt_close_tickers]
+    for ticker in pending_mkt_close_tickers:
+        if any(p.ticker == ticker for p in open_positions):
+            logger.info(
+                "[NAKED] %s: pending MKT close order active in IB — "
+                "OCA intentionally absent; skipping naked check",
+                ticker,
+            )
     if not naked:
         return just_closed, just_reattached
 
@@ -2403,6 +2420,21 @@ async def _reconcile_inflight_orders(
         logger.debug("[SYNC] Inflight entry reconcile failed: %s", _exc)
 
     # ── Exit inflight reconcile ────────────────────────────────────────────────
+    # Build a map of orderId → status for currently active IB orders so we can
+    # distinguish "fill not yet arrived" from "fill truly missing".
+    _active_order_ids: set[int] = set()
+    try:
+        from social_trading.execution.ibkr import ORDER_REF as _ORD_REF  # noqa: PLC0415
+        _active_statuses_inf = {"PendingSubmit", "PreSubmitted", "Submitted"}
+        for _trade in (ib_obj.openTrades() or []):
+            _oid_t = getattr(getattr(_trade, "order", None), "orderId", 0)
+            _status_t = getattr(getattr(_trade, "orderStatus", None), "status", "")
+            _ref_t = getattr(getattr(_trade, "order", None), "orderRef", "")
+            if _oid_t and _status_t in _active_statuses_inf and _ref_t == _ORD_REF:
+                _active_order_ids.add(int(_oid_t))
+    except Exception:
+        pass
+
     try:
         _exit_inf = await redis.hgetall(_INFLIGHT_EXIT_KEY)
         for _k, _v in (_exit_inf or {}).items():
@@ -2423,8 +2455,17 @@ async def _reconcile_inflight_orders(
                     await redis.hdel(_INFLIGHT_EXIT_KEY, _oid_str)
                     await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
                     exit_fixes += 1
+                elif int(_oid_str) in _active_order_ids:
+                    # MKT close order is still active in IB (not yet filled).
+                    # Keep the inflight entry — the fill callback or next reconcile
+                    # cycle will resolve it.  Do NOT write an alert yet.
+                    logger.info(
+                        "[SYNC] Inflight exit %s orderId=%s still active in IB — "
+                        "keeping pending; will resolve when fill arrives",
+                        _t, _oid_str,
+                    )
                 else:
-                    # Fill not found — clean up and write advisory alert
+                    # Fill not found and order no longer active — clean up and write advisory alert.
                     _age_min = 0
                     try:
                         _age_min = int((now_utc - datetime.fromisoformat(_oa)).total_seconds() / 60)
