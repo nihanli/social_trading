@@ -228,11 +228,13 @@ async def _write_positions_to_redis(
         # IB-only tickers (manual) are excluded since they have no params entry.
         all_system_tickers = set(system_params)
 
-        # Any IB position whose ticker is in system_params is included.
-        # Any system_params ticker NOT in IB cache is included with params data
-        # and flagged so the UI knows the cache may be stale for that ticker.
+        # Write to a temp key then atomically RENAME it to positions:live.
+        # This eliminates the brief "empty key" window that occurred with the
+        # old delete+hset pipeline approach, where readers could see 0 positions
+        # between the delete and the first hset executing.
+        _POSITIONS_LIVE_TMP = _POSITIONS_LIVE_KEY + ":tmp"
         pipe = redis.pipeline()
-        pipe.delete(_POSITIONS_LIVE_KEY)
+        pipe.delete(_POSITIONS_LIVE_TMP)
         for ticker in all_system_tickers:
             pos = ib_by_ticker.get(ticker)
             params = system_params[ticker]
@@ -246,7 +248,7 @@ async def _write_positions_to_redis(
                     computed_upnl = (pos.entry_price - current_price) * pos.shares
                 unrealized_pnl = pos.unrealized_pnl if pos.unrealized_pnl != 0.0 else computed_upnl
                 _is_close_pending = bool(pending_close and ticker in pending_close)
-                pipe.hset(_POSITIONS_LIVE_KEY, ticker, json.dumps({
+                pipe.hset(_POSITIONS_LIVE_TMP, ticker, json.dumps({
                     "ticker": ticker,
                     "direction": pos.direction,
                     "shares": pos.shares,
@@ -273,7 +275,7 @@ async def _write_positions_to_redis(
                 entry_price = float(params.get("entry_price", 0.0))
                 shares = int(params.get("shares", 0))
                 _is_close_pending = bool(pending_close and ticker in pending_close)
-                pipe.hset(_POSITIONS_LIVE_KEY, ticker, json.dumps({
+                pipe.hset(_POSITIONS_LIVE_TMP, ticker, json.dumps({
                     "ticker": ticker,
                     "direction": params.get("direction", "LONG"),
                     "shares": shares,
@@ -287,7 +289,23 @@ async def _write_positions_to_redis(
                     "ib_cache_missing": True,
                     **({"close_pending": True} if _is_close_pending else {}),
                 }))
+        # Set TTL on the temp key, then atomically rename to live key.
+        # If there are no system positions, replace live key with an empty hash
+        # so the UI correctly shows "No open positions" rather than stale data.
+        if all_system_tickers:
+            pipe.expire(_POSITIONS_LIVE_TMP, 300)  # 5-minute TTL refreshed each cycle
         await pipe.execute()
+        # RENAME is atomic in Redis — readers see either the old complete key or the
+        # new complete key, never an empty intermediate state.
+        if all_system_tickers:
+            await redis.rename(_POSITIONS_LIVE_TMP, _POSITIONS_LIVE_KEY)
+            await redis.expire(_POSITIONS_LIVE_KEY, 300)
+        else:
+            # No system positions — explicitly clear the live key so stale entries
+            # from a prior session don't linger if the execution service restarts
+            # without positions.
+            await redis.delete(_POSITIONS_LIVE_KEY)
+            await redis.delete(_POSITIONS_LIVE_TMP)
     except Exception as exc:
         logger.warning("[POSITIONS] Failed to write positions:live: %s", exc)
 
@@ -627,10 +645,34 @@ async def run_exit_loop(
                     pass
 
     # Close orders submitted but IB fill not yet confirmed.
-    # Persists across cycles — cleared only when fill callback fires or on restart.
-    # Tickers here are skipped from exit re-evaluation and excluded from the
-    # externally-closed detection so they stay visible in the UI until confirmed.
+    # Persists across cycles — cleared only when fill callback fires.
+    # Seeded from exits:inflight at startup so positions with a pending close
+    # from a prior run are not re-evaluated for exit rules before the fill arrives.
     _pending_close: set[str] = set()
+    try:
+        _startup_inf_exit = await redis.hgetall(_INFLIGHT_EXIT_KEY)
+        if _startup_inf_exit and hasattr(engine, "_ib"):
+            from social_trading.execution.ibkr import ORDER_REF as _SU_ORD_REF  # noqa: PLC0415
+            _startup_active_oids: set[int] = {
+                int(getattr(getattr(t, "order", None), "orderId", 0))
+                for t in (engine._ib.openTrades() if hasattr(engine, "_ib") else [])  # type: ignore[union-attr]
+                if getattr(getattr(t, "order", None), "orderRef", "") == _SU_ORD_REF
+            }
+            for _su_k, _su_v in _startup_inf_exit.items():
+                _su_oid = _su_k.decode() if isinstance(_su_k, bytes) else str(_su_k)
+                try:
+                    _su_d = json.loads(_su_v.decode() if isinstance(_su_v, bytes) else _su_v)
+                    _su_tkr = _su_d.get("ticker", "")
+                    if _su_tkr and int(_su_oid) in _startup_active_oids:
+                        _pending_close.add(_su_tkr)
+                        logger.info(
+                            "[EXIT] Startup: restored %s to _pending_close (exits:inflight orderId=%s still active)",
+                            _su_tkr, _su_oid,
+                        )
+                except Exception:
+                    pass
+    except Exception as _su_exc:
+        logger.debug("[EXIT] Could not seed _pending_close from exits:inflight at startup: %s", _su_exc)
 
     # Track when the IB position cache was last refreshed so we can force a
     # reqPositionsAsync() periodically to prevent cache drift.
@@ -670,6 +712,99 @@ async def run_exit_loop(
                         logger.info("[SYNC] IB reconnected — resuming position evaluation")
                         _last_ib_cache_refresh = now_ts  # mark cache as fresh
                         _loop_start_ts = now_ts  # reset grace period for naked check
+                        # Reconstruct _pending_close from exits:inflight whose orders
+                        # are still active in IB.  This restores the in-memory state
+                        # that was lost when the exit loop task restarted on reconnect,
+                        # preventing _check_naked_positions from treating pending-close
+                        # positions as unprotected during the reconnect grace window.
+                        try:
+                            from social_trading.execution.ibkr import ORDER_REF as _ORD_REF  # noqa: PLC0415
+                            _active_oids: set[int] = {
+                                int(getattr(getattr(t, "order", None), "orderId", 0))
+                                for t in (engine._ib.openTrades() if hasattr(engine, "_ib") else [])  # type: ignore[union-attr]
+                                if getattr(getattr(t, "order", None), "orderRef", "") == _ORD_REF
+                            }
+                            _inf_exit = await redis.hgetall(_INFLIGHT_EXIT_KEY)
+                            for _k, _v in (_inf_exit or {}).items():
+                                _oid_s = _k.decode() if isinstance(_k, bytes) else str(_k)
+                                try:
+                                    _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                                    _tkr = _d.get("ticker", "")
+                                    if _tkr and int(_oid_s) in _active_oids:
+                                        _pending_close.add(_tkr)
+                                        logger.info("[SYNC] Restored %s to _pending_close from exits:inflight", _tkr)
+                                except Exception:
+                                    pass
+                        except Exception as _pc_exc:
+                            logger.debug("[SYNC] Could not restore _pending_close on reconnect: %s", _pc_exc)
+                        # Re-register fill callbacks for still-pending exit orders.
+                        # After reconnect the old Trade objects (and their fillEvent
+                        # handlers) are stale.  Attach fresh callbacks to the Trade
+                        # objects now in ib.openTrades() so deferred fills are not missed.
+                        if hasattr(engine, "register_order_fill_callback") and hasattr(engine, "_ib"):
+                            try:
+                                for _k, _v in (_inf_exit or {}).items():
+                                    _oid_s = _k.decode() if isinstance(_k, bytes) else str(_k)
+                                    try:
+                                        _oid_i = int(_oid_s)
+                                        if _oid_i not in _active_oids:
+                                            continue
+                                        _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                                        _cb_ticker    = _d.get("ticker", "")
+                                        _cb_opened_at = _d.get("opened_at", datetime.now(UTC).isoformat())
+                                        _cb_entry     = float(_d.get("entry_price", 0.0))
+                                        _cb_shares    = int(_d.get("shares", 0))
+                                        _cb_dir       = _d.get("direction", "unknown")
+                                        _cb_oid_str   = _oid_s
+                                        _cb_mode      = mode
+                                        if not _cb_ticker:
+                                            continue
+
+                                        async def _recon_fill_cb(
+                                            fill_price: float,
+                                            _t:   str   = _cb_ticker,
+                                            _oa:  str   = _cb_opened_at,
+                                            _ep:  float = _cb_entry,
+                                            _sh:  int   = _cb_shares,
+                                            _di:  str   = _cb_dir,
+                                            _os:  str   = _cb_oid_str,
+                                            _m:   str   = _cb_mode,
+                                        ) -> None:
+                                            try:
+                                                if hasattr(engine, "forget_position"):
+                                                    engine.forget_position(_t)
+                                                await redis.hdel(_POSITION_PARAMS_KEY, _t)
+                                                await redis.hdel(_HWM_REDIS_KEY, _t)
+                                                await redis.hdel(_TRAIL_ORDERS_KEY, _t)
+                                                await redis.hdel(_INFLIGHT_EXIT_KEY, _os)
+                                                await _publish_execution_event(redis, "position_closed", {
+                                                    "ticker":      _t,
+                                                    "exit_price":  fill_price,
+                                                    "exit_reason": "CLOSE_FILL_RECONNECT",
+                                                    "shares":      _sh,
+                                                    "direction":   _di,
+                                                    "entry_price": _ep,
+                                                    "closed_at":   datetime.now(UTC).isoformat(),
+                                                    "opened_at":   _oa,
+                                                    "mode":        _m,
+                                                })
+                                                logger.info(
+                                                    "[SYNC] Reconnect fill callback: %s filled %.4f", _t, fill_price
+                                                )
+                                            except Exception as _cbe:
+                                                logger.warning(
+                                                    "[SYNC] Reconnect fill callback failed for %s: %s", _t, _cbe
+                                                )
+
+                                        engine.register_order_fill_callback(_oid_i, _recon_fill_cb)  # type: ignore[union-attr]
+                                        logger.info(
+                                            "[SYNC] Re-registered fill callback for %s orderId=%s after reconnect",
+                                            _cb_ticker, _oid_s,
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception as _rc_exc:
+                                logger.debug("[SYNC] Could not re-register fill callbacks on reconnect: %s", _rc_exc)
                         # Run inflight reconcile to recover any fills that arrived during
                         # the disconnect window (fillEvent callbacks fire on dead Trade
                         # objects and are silently dropped by ib_async after reconnect).
@@ -901,6 +1036,7 @@ async def run_exit_loop(
                         })
                         await redis.hdel(_HWM_REDIS_KEY, pos.ticker)
                         await redis.hdel(_POSITION_PARAMS_KEY, pos.ticker)
+                        await redis.hdel(_TRAIL_ORDERS_KEY, pos.ticker)
                         POSITIONS_CLOSED.labels(reason=decision.reason or "unknown").inc()
                         logger.info(
                             "[EXIT] %s %s reason=%s fill=%.4f pnl_approx=%.2f",
@@ -981,6 +1117,7 @@ async def run_exit_loop(
                                     })
                                     await redis.hdel(_HWM_REDIS_KEY, _t)
                                     await redis.hdel(_POSITION_PARAMS_KEY, _t)
+                                    await redis.hdel(_TRAIL_ORDERS_KEY, _t)
                                     await redis.hdel(_INFLIGHT_EXIT_KEY, _oid)
                                     POSITIONS_CLOSED.labels(reason=_reason).inc()
                                     pnl_approx = (actual_fill - _entry) * _shares if _dir == "LONG" else (_entry - actual_fill) * _shares
@@ -1286,6 +1423,13 @@ _POSITIONS_LIVE_KEY = "positions:live"
 _INFLIGHT_ENTRY_KEY   = "orders:inflight"   # entry MKT orders awaiting fill
 _INFLIGHT_EXIT_KEY    = "exits:inflight"    # close MKT orders awaiting fill
 _INFLIGHT_TTL_SEC     = 86400               # 24h TTL — auto-expires if never cleared
+
+# Command-closed set: tracks tickers closed via UI command whose fill was
+# confirmed immediately.  _reconcile_external_closes excludes these tickers so
+# that the exit loop does not publish a second position_closed event on the same
+# position within the same cycle.  Short TTL — only needed for 1 exit-loop cycle.
+_CMD_CLOSED_KEY     = "positions:cmd_closed"  # Redis set: tickers
+_CMD_CLOSED_TTL_SEC = 120                     # 2 minutes — covers any exit-loop cycle
 
 # Fill-sync alert bus: unresolved inflight entries become user-visible alerts.
 # Written by _reconcile_inflight_orders; read by the Streamlit positions page.
@@ -1616,14 +1760,28 @@ async def _persist_position_params_to_redis(
     redis: aioredis.Redis,
     engine: ExecutionEngine,
 ) -> None:
-    """Persist position params (sl/tp/opened_at) to Redis so exit rules survive restarts."""
+    """Persist position params (sl/tp/opened_at) to Redis so exit rules survive restarts.
+
+    Performs a diff-and-delete: after writing current params, removes any Redis
+    hash fields for tickers that are no longer in engine memory (i.e. closed
+    positions whose hdel may have been missed due to a crash or command path gap).
+    """
     import json as _json  # noqa: PLC0415
     try:
         params = engine.get_position_params()  # type: ignore[union-attr]
-        if not params:
-            return
-        mapping = {ticker: _json.dumps(p) for ticker, p in params.items()}
-        await redis.hset(_POSITION_PARAMS_KEY, mapping=mapping)
+        if params:
+            mapping = {ticker: _json.dumps(p) for ticker, p in params.items()}
+            await redis.hset(_POSITION_PARAMS_KEY, mapping=mapping)
+        # Prune stale tickers: any field in the hash that is not in current params
+        # should be removed.  This catches positions closed via commands (CLOSE_ALL,
+        # CLOSE_TICKER) that skip the explicit hdel, or any path where the engine
+        # forgets the position but hdel was not called.
+        redis_keys_raw = await redis.hkeys(_POSITION_PARAMS_KEY)
+        redis_keys = {(k.decode() if isinstance(k, bytes) else k) for k in redis_keys_raw}
+        stale = redis_keys - set(params or {})
+        if stale:
+            await redis.hdel(_POSITION_PARAMS_KEY, *stale)
+            logger.info("[PARAMS] Pruned %d stale ticker(s) from position:params: %s", len(stale), stale)
     except Exception as exc:
         logger.warning("[PARAMS] Failed to persist to Redis: %s", exc)
 
@@ -1848,6 +2006,7 @@ async def _check_naked_positions(
                 })
                 await redis.hdel(_HWM_REDIS_KEY, ticker)
                 await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+                await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
             except Exception as exc:
                 logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
             continue
@@ -1873,6 +2032,24 @@ async def _check_naked_positions(
             if hasattr(engine, "_position_params") and ticker in engine._position_params:  # type: ignore[union-attr]
                 engine._position_params[ticker]["stop_loss"] = stop_loss  # type: ignore[union-attr]
                 engine._position_params[ticker]["take_profit"] = take_profit  # type: ignore[union-attr]
+            # Immediately persist the new oca_group and trail order ID to Redis
+            # so they survive a crash within the next cycle (60s window).
+            try:
+                params_raw_r = await redis.hget(_POSITION_PARAMS_KEY, ticker)
+                _pdata: dict = {}
+                if params_raw_r:
+                    _pdata = json.loads(params_raw_r.decode() if isinstance(params_raw_r, bytes) else params_raw_r)
+                if hasattr(engine, "_position_params") and ticker in engine._position_params:  # type: ignore[union-attr]
+                    new_oca = engine._position_params[ticker].get("oca_group", "")  # type: ignore[union-attr]
+                    if new_oca:
+                        _pdata["oca_group"] = new_oca
+                _pdata["stop_loss"]   = stop_loss
+                _pdata["take_profit"] = take_profit
+                await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(_pdata))
+                if hasattr(engine, "_ts_order_id") and ticker in engine._ts_order_id:  # type: ignore[union-attr]
+                    await redis.hset(_TRAIL_ORDERS_KEY, ticker, str(engine._ts_order_id[ticker]))  # type: ignore[union-attr]
+            except Exception as _rpe:
+                logger.debug("[NAKED] Failed to persist reattach params for %s: %s", ticker, _rpe)
             just_reattached.add(ticker)
             logger.warning(
                 "[NAKED] %s: OCA bracket reattached — sl=%.4f tp=%.4f", ticker, stop_loss, take_profit,
@@ -1897,6 +2074,7 @@ async def _check_naked_positions(
                 })
                 await redis.hdel(_HWM_REDIS_KEY, ticker)
                 await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+                await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
             except Exception as exc:
                 logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
 
@@ -2109,6 +2287,14 @@ async def _reconcile_startup(
                 ticker,
             )
 
+    # ── Inflight order reconciliation ─────────────────────────────────────────
+    # Always run BEFORE the orphaned_in_ib early-return so that entry/exit fill
+    # recovery happens even when there are no orphaned IB positions (the common
+    # case where all positions are already matched).  Previously this call lived
+    # at the end of the function, which meant it was unreachable when
+    # orphaned_in_ib was empty.
+    await _reconcile_inflight_orders(redis, engine, current_tickers, mode=mode)
+
     orphaned_in_ib = current_tickers - set(params)
 
     # ── Scan all open IB orders once ─────────────────────────────────────────
@@ -2181,17 +2367,17 @@ async def _reconcile_startup(
     except Exception as exc:
         logger.debug("[SYNC] Could not check for orphaned pending entries: %s", exc)
 
-    # Fix 1: Recover TRAIL order IDs from IB for ALL current system positions.
-    # _ts_order_id is in-memory only; this seeds it for positions whose Redis key
-    # was already loaded and for newly adopted ones discovered below.
+    # Recover TRAIL order IDs from IB for ALL current system positions.
+    # seed_trail_order_id is in-memory only; this seeds it for positions whose
+    # Redis key was already loaded and for newly adopted ones discovered below.
     if hasattr(engine, "seed_trail_order_id"):
         for sym, oid in trail_order_ids.items():
             engine.seed_trail_order_id(sym, oid)  # type: ignore[union-attr]
             logger.info("[SYNC] %s: recovered TRAIL order ID %d from IB open trades", sym, oid)
 
-    # Fix 4: Reclassify orphaned positions that were opened by this system but have
-    # no remaining open orders (e.g. OCA placement failed).  openTrades() alone can't
-    # detect these; reqCompletedOrdersAsync() MKT fills with ORDER_REF confirm origin.
+    # Reclassify orphaned positions that were opened by this system but have
+    # no remaining open orders (e.g. OCA placement failed).  openTrades() alone
+    # can't detect these; reqCompletedOrdersAsync() MKT fills with ORDER_REF confirm.
     newly_confirmed = (_system_entry_tickers & orphaned_in_ib) - system_tickers
     if newly_confirmed:
         system_tickers |= newly_confirmed
@@ -2347,11 +2533,6 @@ async def _reconcile_startup(
                     await engine.close_position(pos.ticker, reason="NO_STOP_ON_RESTART")  # type: ignore[union-attr]
                 except Exception as exc:
                     logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
-
-    # ── Inflight order reconciliation ─────────────────────────────────────────
-    # Delegate to the shared _reconcile_inflight_orders helper so the same
-    # recovery logic runs at startup AND after a mid-session IB reconnect.
-    await _reconcile_inflight_orders(redis, engine, current_tickers, mode=mode)
 
 
 async def _reconcile_inflight_orders(
@@ -2520,6 +2701,17 @@ async def _reconcile_inflight_orders(
 
                 if _fp > 0:
                     logger.info("[SYNC] Inflight exit %s orderId=%s: recovered fill %.4f", _t, _oid_str, _fp)
+                    # Full position cleanup — mirrors the _on_close_fill_confirmed callback.
+                    # The fill arrived during a disconnect/restart window; the callback
+                    # never fired on the dead engine object, so we do the cleanup here.
+                    try:
+                        if hasattr(engine, "forget_position"):
+                            engine.forget_position(_t)
+                        await redis.hdel(_POSITION_PARAMS_KEY, _t)
+                        await redis.hdel(_HWM_REDIS_KEY, _t)
+                        await redis.hdel(_TRAIL_ORDERS_KEY, _t)
+                    except Exception as _clean_exc:
+                        logger.debug("[SYNC] Position cleanup failed for %s: %s", _t, _clean_exc)
                     await _publish_execution_event(redis, "position_exit_corrected", {
                         "ticker": _t, "exit_price": _fp,
                         "opened_at": _oa, "order_id": _oid_str,
@@ -2806,7 +2998,15 @@ async def _reconcile_external_closes(
     IB_EXTERNAL when no matching fill is found (e.g. position closed offline).
     """
     # Exclude tickers with a pending close order — their fill callback handles cleanup.
-    _excluded = just_closed | (pending_close or set())
+    # Also exclude tickers that were immediately filled by a UI command this cycle —
+    # _command_close_position already published position_closed for them.
+    _cmd_closed: set[str] = set()
+    try:
+        _cmd_raw = await redis.smembers(_CMD_CLOSED_KEY)
+        _cmd_closed = {(k.decode() if isinstance(k, bytes) else k) for k in (_cmd_raw or [])}
+    except Exception:
+        pass
+    _excluded = just_closed | (pending_close or set()) | _cmd_closed
     externally_closed = prev_open - now_open - _excluded
     for ticker in externally_closed:
         # Read params BEFORE cleanup so we can include them in the close event
@@ -2979,6 +3179,7 @@ async def _reconcile_external_closes(
         engine.forget_position(ticker)
         await redis.hdel(_HWM_REDIS_KEY, ticker)
         await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
         POSITIONS_CLOSED.labels(reason=exit_reason).inc()
 
         # Clean up any exits:inflight entry for this ticker.
@@ -3023,6 +3224,130 @@ async def _reconcile_external_closes(
             "closed_at": datetime.now(UTC).isoformat(),
         }))
         await redis.ltrim("trades:recent", 0, 999)
+
+
+async def _command_close_position(
+    redis: aioredis.Redis,
+    engine: ExecutionEngine,
+    ticker: str,
+    reason: str,
+    mode: str = "live",
+) -> None:
+    """
+    Close a position from a UI command (CLOSE_ALL / CLOSE_TICKER).
+
+    Unlike the exit loop, command-triggered closes must handle the deferred-fill
+    case: if the market order is submitted but not immediately filled (e.g., after
+    hours), we write to exits:inflight and register a fill callback so the position
+    is not silently orphaned until the next startup reconcile.
+    """
+    # Capture params before close_position() may clear engine state.
+    params: dict = {}
+    if hasattr(engine, "get_position_params"):
+        params = engine.get_position_params().get(ticker, {})  # type: ignore[union-attr]
+    _pos_opened_at   = params.get("opened_at", datetime.now(UTC).isoformat())
+    _pos_entry       = float(params.get("entry_price", 0.0))
+    _pos_shares      = int(params.get("shares", 0))
+    _pos_direction   = params.get("direction", "unknown")
+
+    close_result = await engine.close_position(ticker, reason=reason)
+
+    if close_result and close_result.status == "rejected":
+        logger.warning("[CMD] close_position for %s rejected: %s", ticker, close_result.error or "unknown")
+        return
+
+    POSITIONS_CLOSED.labels(reason=reason).inc()
+
+    if close_result and close_result.fill_price is not None:
+        # Immediate fill confirmed — full cleanup now.
+        if hasattr(engine, "forget_position"):
+            engine.forget_position(ticker)
+        await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        await redis.hdel(_HWM_REDIS_KEY, ticker)
+        await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
+        # Mark as cmd-closed so _reconcile_external_closes skips it this cycle
+        try:
+            await redis.sadd(_CMD_CLOSED_KEY, ticker)
+            await redis.expire(_CMD_CLOSED_KEY, _CMD_CLOSED_TTL_SEC)
+        except Exception:
+            pass
+        await _publish_execution_event(redis, "position_closed", {
+            "ticker": ticker,
+            "exit_price": close_result.fill_price,
+            "exit_reason": reason,
+            "shares": _pos_shares,
+            "direction": _pos_direction,
+            "entry_price": _pos_entry,
+            "closed_at": datetime.now(UTC).isoformat(),
+            "opened_at": _pos_opened_at,
+            "mode": mode,
+        })
+    else:
+        # Deferred fill — write inflight ledger so startup reconcile can recover.
+        _exit_order_id = int(close_result.order_id) if (close_result and close_result.order_id) else 0
+        _provisional   = engine.get_price(ticker) or _pos_entry  # type: ignore[union-attr]
+        if _exit_order_id and hasattr(engine, "register_order_fill_callback"):
+            try:
+                await redis.hset(
+                    _INFLIGHT_EXIT_KEY, str(_exit_order_id),
+                    json.dumps({
+                        "ticker": ticker,
+                        "opened_at": _pos_opened_at,
+                        "entry_price": _pos_entry,
+                        "shares": _pos_shares,
+                        "direction": _pos_direction,
+                        "provisional_exit": _provisional,
+                    }),
+                )
+                await redis.expire(_INFLIGHT_EXIT_KEY, _INFLIGHT_TTL_SEC)
+            except Exception as _inf_exc:
+                logger.debug("[CMD] Failed to write inflight exit for %s: %s", ticker, _inf_exc)
+
+            _ex_ticker    = ticker
+            _ex_opened_at = _pos_opened_at
+            _ex_entry     = _pos_entry
+            _ex_shares    = _pos_shares
+            _ex_dir       = _pos_direction
+            _ex_oid_str   = str(_exit_order_id)
+
+            async def _on_cmd_fill(
+                actual_fill: float,
+                _t:      str   = _ex_ticker,
+                _oa:     str   = _ex_opened_at,
+                _entry:  float = _ex_entry,
+                _shares: int   = _ex_shares,
+                _dir:    str   = _ex_dir,
+                _r:      str   = reason,
+                _oid:    str   = _ex_oid_str,
+            ) -> None:
+                logger.info("[CMD] Fill confirmed for %s: %.4f (orderId=%s)", _t, actual_fill, _oid)
+                try:
+                    if hasattr(engine, "forget_position"):
+                        engine.forget_position(_t)
+                    await redis.hdel(_POSITION_PARAMS_KEY, _t)
+                    await redis.hdel(_HWM_REDIS_KEY, _t)
+                    await redis.hdel(_TRAIL_ORDERS_KEY, _t)
+                    await redis.hdel(_INFLIGHT_EXIT_KEY, _oid)
+                    await _publish_execution_event(redis, "position_closed", {
+                        "ticker": _t,
+                        "exit_price": actual_fill,
+                        "exit_reason": _r,
+                        "shares": _shares,
+                        "direction": _dir,
+                        "entry_price": _entry,
+                        "closed_at": datetime.now(UTC).isoformat(),
+                        "opened_at": _oa,
+                        "mode": mode,
+                    })
+                    POSITIONS_CLOSED.labels(reason=_r).inc()
+                except Exception as _cb_exc:
+                    logger.warning("[CMD] Error in fill callback for %s: %s", _t, _cb_exc)
+
+            engine.register_order_fill_callback(_exit_order_id, _on_cmd_fill)  # type: ignore[union-attr]
+        logger.info(
+            "[CMD] %s close order submitted (orderId=%s) — awaiting fill",
+            ticker, _exit_order_id or "?",
+        )
 
 
 # ── UI command listener ────────────────────────────────────────────────────────
@@ -3094,8 +3419,7 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
             logger.warning("CLOSE_ALL: closing %d positions", len(tickers))
             for ticker in tickers:
                 try:
-                    await active_engine.close_position(ticker, reason="UI:CLOSE_ALL")
-                    POSITIONS_CLOSED.labels(ticker=ticker, reason="UI:CLOSE_ALL").inc()
+                    await _command_close_position(redis, active_engine, ticker, reason="UI:CLOSE_ALL", mode=mode)
                     logger.info("Closed %s via CLOSE_ALL", ticker)
                 except Exception as exc:
                     logger.error("Failed to close %s: %s", ticker, exc)
@@ -3110,8 +3434,7 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 logger.info("CLOSE_TICKER: %s not in open positions — ignoring", ticker)
             else:
                 try:
-                    await active_engine.close_position(ticker, reason="UI:CLOSE_TICKER")
-                    POSITIONS_CLOSED.labels(ticker=ticker, reason="UI:CLOSE_TICKER").inc()
+                    await _command_close_position(redis, active_engine, ticker, reason="UI:CLOSE_TICKER", mode=mode)
                     logger.info("Closed %s via CLOSE_TICKER", ticker)
                 except Exception as exc:
                     logger.error("Failed to close %s: %s", ticker, exc)
@@ -3224,6 +3547,15 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
             # next IB reconnect within this session.
             _RECONCILE_DONE[0] = True
             await redis.set(_RECONCILE_STATE_KEY, "approved", ex=_RECONCILE_TTL)
+            # Still recover inflight fills even when UI is skipped
+            if active_engine is not None:
+                try:
+                    _skip_mode_raw = await redis.get("trading:mode") or "live"
+                    _skip_mode = _skip_mode_raw.decode() if isinstance(_skip_mode_raw, bytes) else _skip_mode_raw
+                    _skip_tickers = active_engine.open_tickers if hasattr(active_engine, "open_tickers") else set()  # type: ignore[union-attr]
+                    await _reconcile_inflight_orders(redis, active_engine, _skip_tickers, mode=_skip_mode)
+                except Exception as _se:
+                    logger.debug("RECONCILE_SKIP: inflight reconcile failed: %s", _se)
             logger.info("Reconcile skipped by user — session flag set, trading unblocked")
         elif cmd == "RECONCILE_APPROVE":
             if active_engine is None:
@@ -3279,10 +3611,48 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                         await redis.hset(_PENDING_RECONCILE_KEY, ticker, json.dumps(pending_payload, default=str))
                     elif status == "adopted":
                         adoption_needed = True
+                    elif status == "shares_mismatch":
+                        # IB is the source of truth for share counts.
+                        # Update app params and engine to match IB so PnL and
+                        # close sizing use the correct quantity going forward.
+                        ib_data = match.get("ib") if isinstance(match.get("ib"), dict) else {}
+                        ib_shares = int(float(ib_data.get("shares", 0) or 0))
+                        ib_direction = str(ib_data.get("direction", "")).upper() or app_data.get("direction", "unknown")
+                        if ib_shares > 0:
+                            try:
+                                params_raw = await redis.hget(_POSITION_PARAMS_KEY, ticker)
+                                p: dict = {}
+                                if params_raw:
+                                    p = json.loads(params_raw.decode() if isinstance(params_raw, bytes) else params_raw)
+                                p["shares"] = ib_shares
+                                p["direction"] = ib_direction
+                                await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(p))
+                                if hasattr(active_engine, "_position_params") and ticker in active_engine._position_params:  # type: ignore[union-attr]
+                                    active_engine._position_params[ticker]["shares"] = ib_shares  # type: ignore[union-attr]
+                                    active_engine._position_params[ticker]["direction"] = ib_direction  # type: ignore[union-attr]
+                                await _publish_execution_event(redis, "position_entry_updated", {
+                                    "ticker": ticker,
+                                    "shares": ib_shares,
+                                    "direction": ib_direction,
+                                    "opened_at": app_data.get("opened_at", datetime.now(UTC).isoformat()),
+                                })
+                                logger.info(
+                                    "[RECONCILE] %s: corrected shares %d → %d (IB source of truth)",
+                                    ticker, int(float(app_data.get("shares", 0) or 0)), ib_shares,
+                                )
+                            except Exception as _sm_exc:
+                                logger.warning("[RECONCILE] shares_mismatch correction failed for %s: %s", ticker, _sm_exc)
                 if matches:
                     await redis.expire(_PENDING_RECONCILE_KEY, _RECONCILE_TTL)
                 if adoption_needed:
+                    # _reconcile_startup also runs _reconcile_inflight_orders internally
                     await _reconcile_startup(redis, active_engine, mode=mode_value)
+                else:
+                    # No adoption needed, but still recover any inflight fills
+                    # from the prior session (e.g. exit orders that filled during
+                    # the outage window before this startup approve).
+                    _rec_tickers = active_engine.open_tickers if hasattr(active_engine, "open_tickers") else set()  # type: ignore[union-attr]
+                    await _reconcile_inflight_orders(redis, active_engine, _rec_tickers, mode=mode_value)
                 await redis.set(_RECONCILE_STATE_KEY, "approved", ex=_RECONCILE_TTL)
                 if reconcile_data:
                     reconcile_data["state"] = "approved"
@@ -3382,7 +3752,11 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 }
                 active_engine.seed_position_params(ticker, seeded)  # type: ignore[union-attr]
                 await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(seeded))
-                _adopt_flag = f"position:adopted:{ticker}:{opened_at}"
+                # Use stable fingerprint (entry_price + qty) so repeated service
+                # restarts don't create duplicate DB rows. The ADOPT_IB_POSITION
+                # command can be re-sent safely (e.g. after reconnect).
+                _adopt_fp = f"{entry_price:.4f}:{abs(qty)}"
+                _adopt_flag = f"position:adopted:{ticker}:{_adopt_fp}"
                 if await redis.set(_adopt_flag, "1", nx=True, ex=86400 * 90):
                     await _publish_execution_event(redis, "position_opened", {
                         "ticker": ticker,
@@ -3513,6 +3887,11 @@ async def _initialize_connected_runtime(
     _is_first_connect = (reconcile_done is None) or (not reconcile_done[0])
     if _is_first_connect:
         await redis.set(_RECONCILE_STATE_KEY, "collecting", ex=_RECONCILE_TTL)
+        # Prime open orders cache BEFORE collecting reconcile data so that
+        # openTrades() is fully populated when _collect_reconcile_data runs.
+        # Without this, OCA bracket orders for orphaned positions are missing
+        # from the cache and they are misclassified as manual_ib.
+        await _prime_ib_open_orders(ib)
         reconcile_data = await _collect_reconcile_data(redis, engine, ib_account=ib_account)
         await _persist_reconcile_snapshot(redis, reconcile_data)
         logger.info(
@@ -3524,14 +3903,22 @@ async def _initialize_connected_runtime(
     else:
         # Mid-session reconnect: IB cache was cleared on disconnect; reseed and run
         # inflight reconcile to recover any fill prices missed during the outage.
-        logger.info("[RECONCILE] Mid-session reconnect — skipping full reconcile, running inflight reconcile only")
+        # Also refresh reconcile:data so the reconcile page shows an up-to-date
+        # snapshot of the post-reconnect state (without re-blocking trading).
+        logger.info("[RECONCILE] Mid-session reconnect — skipping blocking UI, running inflight reconcile")
+        # _reconcile_startup internally calls _reconcile_inflight_orders (fix 1) —
+        # no need to call it again here.
         await _reconcile_startup(redis, engine, mode=mode)
-        current_tickers = engine.open_tickers if hasattr(engine, "open_tickers") else set()  # type: ignore[union-attr]
-        await _reconcile_inflight_orders(redis, engine, current_tickers, mode=mode)
+        try:
+            fresh_data = await _collect_reconcile_data(redis, engine, ib_account=ib_account)
+            fresh_data["state"] = "approved"  # non-blocking — don't re-show the UI
+            await redis.set(_RECONCILE_DATA_KEY, json.dumps(fresh_data, default=str), ex=_RECONCILE_TTL)
+            logger.info("[RECONCILE] Refreshed reconcile:data after mid-session reconnect")
+        except Exception as _rd_exc:
+            logger.debug("[RECONCILE] Could not refresh reconcile:data on reconnect: %s", _rd_exc)
 
     await _prune_old_data()
     asyncio.create_task(_warmup_market_data_task(redis, market_data), name="exec:market_warmup")
-    await _prime_ib_open_orders(ib)
     await _write_account_state(redis, engine)
     _ACTIVE_ENGINE = engine
     return engine, market_data, exit_manager, breaker, bus, cfg
@@ -3582,6 +3969,7 @@ async def _run_ib_reconnect_watcher(
                 "exec:exit",
                 run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode),
             )
+            _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
             if _RECONCILE_DONE[0]:
                 logger.info("[IBKR] Reconnect watcher connected (mid-session) — loops resuming immediately")
             else:
@@ -3602,6 +3990,68 @@ async def _run_ib_reconnect_watcher(
                 port, exc, _IB_RETRY_SECS,
             )
             await asyncio.sleep(_IB_RETRY_SECS)
+
+
+async def _run_price_push(engine: Optional[ExecutionEngine], redis: aioredis.Redis) -> None:
+    """
+    Lightweight task: update unrealized_pnl in positions:live every 5 seconds
+    using the engine's in-memory price cache (already kept fresh by the exit loop).
+
+    The exit loop writes positions:live once per full cycle (up to 60s cadence).
+    This task fills the gap so the UI always shows prices that are at most 5s old,
+    without the overhead of a full IB market-data batch fetch.
+    """
+    _PUSH_INTERVAL = 5
+    while True:
+        try:
+            active_engine = engine if engine is not None else _ACTIVE_ENGINE
+            if active_engine is not None:
+                live_raw = await redis.hgetall(_POSITIONS_LIVE_KEY)
+                if live_raw:
+                    # Prefer the live IB portfolio subscription (real-time, pushed
+                    # every few seconds by IB's account subscription) over the
+                    # exit-loop price cache (updated only every ~60s).
+                    portfolio_prices: dict[str, float] = {}
+                    if hasattr(active_engine, "get_portfolio_prices"):
+                        try:
+                            portfolio_prices = active_engine.get_portfolio_prices()  # type: ignore[union-attr]
+                        except Exception:
+                            pass
+                    updates: dict[str, str] = {}
+                    for field, val in live_raw.items():
+                        t = field.decode() if isinstance(field, bytes) else field
+                        try:
+                            pos_data = json.loads(val.decode() if isinstance(val, bytes) else val)
+                            # Portfolio prices take priority; fall back to engine cache
+                            current_price = portfolio_prices.get(t) or active_engine.get_price(t)  # type: ignore[union-attr]
+                            if current_price and current_price > 0:
+                                # Seed the engine price cache so the exit loop also
+                                # benefits from the portfolio-fresh price.
+                                if hasattr(active_engine, "set_price"):
+                                    try:
+                                        active_engine.set_price(t, current_price)  # type: ignore[union-attr]
+                                    except Exception:
+                                        pass
+                                entry = float(pos_data.get("entry_price", 0) or 0)
+                                shares = int(pos_data.get("shares", 0) or 0)
+                                direction = pos_data.get("direction", "LONG")
+                                if entry > 0 and shares > 0:
+                                    if direction == "LONG":
+                                        upnl = round((current_price - entry) * shares, 2)
+                                    else:
+                                        upnl = round((entry - current_price) * shares, 2)
+                                    pos_data["unrealized_pnl"] = upnl
+                                    updates[t] = json.dumps(pos_data)
+                        except Exception:
+                            pass
+                    if updates:
+                        await redis.hset(_POSITIONS_LIVE_KEY, mapping=updates)
+                        await redis.expire(_POSITIONS_LIVE_KEY, 300)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[PRICE_PUSH] Error: %s", exc)
+        await asyncio.sleep(_PUSH_INTERVAL)
 
 
 async def _run_heartbeat(engine: Optional[ExecutionEngine], redis: aioredis.Redis) -> None:
@@ -3701,6 +4151,7 @@ async def main() -> None:
             reconcile_done=_RECONCILE_DONE,  # _RECONCILE_DONE[0] is False at startup
         )
         _set_runtime_task("exec:heartbeat", _run_heartbeat(engine, redis))
+        _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
         _set_runtime_task("exec:trade", run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg))
         _set_runtime_task("exec:exit", run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode))
         _set_runtime_task("exec:cmd", run_command_listener(engine, redis))

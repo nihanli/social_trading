@@ -162,7 +162,19 @@ class IBKRExecutionEngine:
             await self._ib.connectAsync(self._host, self._port, clientId=self._client_id)
             await self._ib.reqPositionsAsync()
             count = len([p for p in self._ib.positions() if p.position != 0])
-            logger.info("[IBKR] Reconnected — %d open position(s) in cache", count)
+            # Prime the open-orders cache so callers (exit loop inflight reconcile,
+            # fill-callback re-registration) see a fully populated openTrades() list.
+            # Without this, openTrades() is empty right after reconnect and active
+            # exit orders are misclassified as inactive by _reconcile_inflight_orders.
+            try:
+                self._ib.reqAllOpenOrders()
+                await asyncio.sleep(2.0)  # allow IB to push openOrder callbacks
+                n_orders = len(self._ib.openTrades())
+                logger.info("[IBKR] Reconnected — %d open position(s), %d open order(s) in cache",
+                            count, n_orders)
+            except Exception as _oe:
+                logger.debug("[IBKR] reqAllOpenOrders on reconnect failed (non-fatal): %s", _oe)
+                logger.info("[IBKR] Reconnected — %d open position(s) in cache", count)
             return True
         except Exception as exc:
             logger.warning("[IBKR] Reconnect failed: %s", exc)
@@ -181,6 +193,33 @@ class IBKRExecutionEngine:
 
     def get_price(self, ticker: str) -> float | None:
         return self._prices.get(ticker)
+
+    def get_portfolio_prices(self) -> dict[str, float]:
+        """Return live market prices from the IB account subscription (portfolio feed).
+
+        ib.portfolio() is a streaming subscription pushed by IB every few seconds —
+        always current without requiring explicit market-data subscription.  Used by
+        _run_price_push to give the UI real-time unrealized PnL without waiting for
+        the 60s exit-loop price fetch cycle.
+        """
+        import math as _math  # noqa: PLC0415
+        result: dict[str, float] = {}
+        try:
+            for item in self._ib.portfolio():
+                if self._account and item.account != self._account:
+                    continue
+                sym = item.contract.symbol
+                mp = getattr(item, "marketPrice", None)
+                if mp is not None:
+                    try:
+                        p = float(mp)
+                        if p > 0 and _math.isfinite(p):
+                            result[sym] = p
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        return result
 
     def get_hwm(self) -> dict[str, float]:
         """Return a snapshot of all tracked high-water marks."""
