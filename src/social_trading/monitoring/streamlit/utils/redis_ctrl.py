@@ -230,6 +230,11 @@ def skip_reconcile() -> None:
     send_command("RECONCILE_SKIP")
 
 
+def adopt_ib_position(ticker: str) -> None:
+    """Adopt an orphaned IB position into the system (manual_ib → system tracked)."""
+    send_command("ADOPT_IB_POSITION", {"ticker": ticker.upper()})
+
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _sync_load_config() -> SystemConfig:

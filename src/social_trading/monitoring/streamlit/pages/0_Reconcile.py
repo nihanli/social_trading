@@ -10,6 +10,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
+    adopt_ib_position,
     approve_reconcile,
     delete_reconcile_position,
     get_reconcile_data,
@@ -138,6 +139,17 @@ if state == "awaiting_approval":
                 if st.button("🗑 Delete from App", key=f"reconcile_delete_{ticker}"):
                     delete_reconcile_position(ticker)
                     st.success(f"Delete command sent for {ticker}.")
+                    st.rerun()
+            if status == "manual_ib":
+                st.warning(
+                    "This position is in IB but has no system marker. "
+                    "If it was opened by this app (e.g., from a prior TWS session), "
+                    "click **Adopt** to bring it under system management. "
+                    "Otherwise ignore — it will not be tracked or auto-exited."
+                )
+                if st.button("📥 Adopt into System", key=f"reconcile_adopt_{ticker}"):
+                    adopt_ib_position(ticker)
+                    st.success(f"Adopt command sent for {ticker}. Position will be tracked after next cycle.")
                     st.rerun()
 
     st.info(

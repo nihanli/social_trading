@@ -375,8 +375,11 @@ async def run_trade_loop(
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
-                    # Skip if position already open; guard engine.open_tickers
-                    # against IB disconnection errors
+                    # Skip if position already open — three-layer guard:
+                    # 1. IB positions cache (primary)
+                    # 2. Engine in-memory params (catches positions where IB cache is stale
+                    #    after reconnect but params are already seeded)
+                    # 3. Redis position:params (ground truth — survives reconnects/restarts)
                     try:
                         already_open = signal.ticker in engine.open_tickers
                     except Exception as exc:
@@ -386,6 +389,15 @@ async def run_trade_loop(
                         )
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
+
+                    if not already_open and hasattr(engine, "get_position_params"):
+                        already_open = signal.ticker in engine.get_position_params()
+
+                    if not already_open:
+                        try:
+                            already_open = bool(await redis.hexists(_POSITION_PARAMS_KEY, signal.ticker))
+                        except Exception:
+                            pass
 
                     if already_open:
                         logger.debug("Skip %s — position already open", signal.ticker)
@@ -1452,11 +1464,22 @@ async def _collect_reconcile_data(
     app_by_ticker = {str(p.get("ticker", "")).upper(): p for p in app_positions if p.get("ticker")}
     ib_by_ticker = {str(p.get("ticker", "")).upper(): p for p in ib_positions if p.get("ticker")}
     fills_by_ticker: dict[str, dict] = {}
+    # Track which sides were seen per ticker so we can detect round-trips (BOT + SLD both today)
+    _fill_sides_by_ticker: dict[str, set[str]] = {}
     for fill in ib_trades_today:
         ticker = str(fill.get("ticker", "")).upper()
         if not ticker:
             continue
         fills_by_ticker[ticker] = fill
+        action = str(fill.get("action", "")).upper()
+        if action:
+            _fill_sides_by_ticker.setdefault(ticker, set()).add(action)
+    # Tickers that have BOTH a buy and sell fill today — they fully round-tripped.
+    # IB may still show them in positions() for a brief window; treat as closed.
+    _round_tripped_today = {
+        t for t, sides in _fill_sides_by_ticker.items()
+        if "BOT" in sides and "SLD" in sides
+    }
     system_order_tickers = {
         str(o.get("ticker", "")).upper()
         for o in app_oca_orders
@@ -1475,7 +1498,17 @@ async def _collect_reconcile_data(
             ib_direction = str(ib_entry.get("direction", "")).upper()
             app_shares = int(float(app_entry.get("shares", 0) or 0))
             ib_shares = int(float(ib_entry.get("shares", 0) or 0))
-            if app_direction == ib_direction and app_shares == ib_shares:
+            if ticker in _round_tripped_today:
+                # Position opened AND closed today — IB may still show it residually.
+                # Treat as a same-day close; do not keep it in open positions.
+                status = "closed_offline"
+                reason = (
+                    f"{ticker} has both a buy and sell fill today — "
+                    "it was fully round-tripped this session. "
+                    "IB position data may be residual."
+                )
+                auto_actions.append({"ticker": ticker, "action": "confirm_closed"})
+            elif app_direction == ib_direction and app_shares == ib_shares:
                 status = "matched"
                 reason = f"App and IB both show {ticker} {app_direction} {app_shares} shares."
             else:
@@ -1926,11 +1959,16 @@ async def _reconcile_startup(
     # reqCompletedOrdersAsync.  Used to reclassify orphaned positions that
     # have no remaining open orders (e.g. OCA failed) but were system-opened.
     _system_entry_tickers: set[str] = set()
+    # Tickers that have BOTH an entry AND a close fill today — they were already
+    # round-tripped in this TWS session.  Do NOT re-adopt these as open positions.
+    _fully_closed_today: set[str] = set()
     try:
         ib_obj = getattr(engine, "_ib", None)
         if ib_obj is not None:
             # Step 1: collect fill prices from today's server-side executions
             _fill_prices: dict[str, float] = {}
+            # Track which sides (BOT / SLD) were seen per ticker today
+            _fill_sides: dict[str, set[str]] = {}
             from ib_async import ExecutionFilter  # noqa: PLC0415
             executions = await ib_obj.reqExecutionsAsync(ExecutionFilter())
             for fill in executions:
@@ -1939,6 +1977,15 @@ async def _reconcile_startup(
                 price = getattr(getattr(fill, "execution", None), "price", 0.0)
                 if sym and price:
                     _fill_prices[f"{sym}:{side}"] = float(price)
+                    _fill_sides.setdefault(sym, set()).add(side.upper())
+
+            # Detect round-trips: tickers with BOTH a buy fill AND a sell fill today.
+            # These positions were fully closed intra-session — don't re-adopt them.
+            for _sym, _sides in _fill_sides.items():
+                if "BOT" in _sides and "SLD" in _sides:
+                    _fully_closed_today.add(_sym)
+            if _fully_closed_today:
+                logger.info("[SYNC] Detected fully-closed today (both BOT+SLD fills): %s", _fully_closed_today)
 
             # Step 2: classify by completed order type (most accurate)
             try:
@@ -2171,6 +2218,26 @@ async def _reconcile_startup(
             )
             continue
 
+        # If this ticker had BOTH an entry fill AND a close fill today, the position
+        # was already round-tripped (opened and closed) this TWS session.  IB may
+        # briefly still show it in positions() before settlement clears it.
+        # Re-adopting it would create a ghost open row in the DB.  Skip it and
+        # ensure any stale params are cleaned up.
+        if pos.ticker in _fully_closed_today:
+            logger.info(
+                "[SYNC] %s: skipping re-adoption — both BOT and SLD fills found today "
+                "(position already round-tripped; IB cache may not yet reflect close)",
+                pos.ticker,
+            )
+            # Clean up any stale params that might have been left from a prior restart
+            await redis.hdel(_POSITION_PARAMS_KEY, pos.ticker)
+            await redis.hdel(_HWM_REDIS_KEY, pos.ticker)
+            await redis.hdel(_TRAIL_ORDERS_KEY, pos.ticker)
+            await redis.hdel(_PENDING_RECONCILE_KEY, pos.ticker)
+            if hasattr(engine, "forget_position"):
+                engine.forget_position(pos.ticker)  # type: ignore[union-attr]
+            continue
+
         # Position is open in IB but has no persisted params (opened in a prior
         # session by this system).  Seed params from Redis market data so
         # the software exit loop can monitor stop-loss / take-profit.
@@ -2211,7 +2278,11 @@ async def _reconcile_startup(
             )
             # Publish position_opened so persistence_service creates a trades DB row.
             # Guard with a Redis NX key so repeated restarts don't create duplicate rows.
-            _adoption_flag = f"position:adopted:{pos.ticker}:{seeded_params['opened_at']}"
+            # Use a stable fingerprint (entry_price + shares) rather than datetime.now()
+            # since IB Position objects have no opened_at timestamp and now() changes
+            # on every restart, defeating the nx=True dedup guard.
+            _adoption_fp = f"{pos.entry_price:.4f}:{abs(pos.shares)}"
+            _adoption_flag = f"position:adopted:{pos.ticker}:{_adoption_fp}"
             if await redis.set(_adoption_flag, "1", nx=True, ex=86400 * 90):
                 await _publish_execution_event(redis, "position_opened", {
                     "ticker": pos.ticker,
@@ -2246,8 +2317,9 @@ async def _reconcile_startup(
                 }
                 engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
                 await redis.hset(_POSITION_PARAMS_KEY, pos.ticker, json.dumps(seeded_params))
-                # Publish position_opened so persistence_service creates a trades DB row.
-                _adoption_flag = f"position:adopted:{pos.ticker}:{seeded_params['opened_at']}"
+                # Use stable fingerprint so repeated restarts don't create duplicate DB rows.
+                _adoption_fp = f"{pos.entry_price:.4f}:{abs(pos.shares)}"
+                _adoption_flag = f"position:adopted:{pos.ticker}:{_adoption_fp}"
                 if await redis.set(_adoption_flag, "1", nx=True, ex=86400 * 90):
                     await _publish_execution_event(redis, "position_opened", {
                         "ticker": pos.ticker,
@@ -3256,6 +3328,78 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 logger.info("RECONCILE_DELETE: %s deleted by user at reconcile", ticker)
             except Exception as exc:
                 logger.warning("RECONCILE_DELETE_POSITION failed for %s: %s", ticker, exc)
+        elif cmd == "ADOPT_IB_POSITION":
+            # Adopt an IB position that has no system params (manual_ib / orphan).
+            # Seeds position:params from IB portfolio data + ATR; places OCA bracket.
+            ticker = str(payload.get("ticker", "")).upper()
+            if not ticker:
+                logger.warning("ADOPT_IB_POSITION missing ticker in payload")
+                continue
+            try:
+                if active_engine is None or not hasattr(active_engine, "_ib"):
+                    logger.warning("ADOPT_IB_POSITION: no IB engine available")
+                    continue
+                # Get live position data from IB
+                ib_positions = active_engine._ib.positions()  # type: ignore[union-attr]
+                ib_pos = next((p for p in ib_positions if getattr(getattr(p, "contract", None), "symbol", "") == ticker), None)
+                if ib_pos is None:
+                    logger.warning("ADOPT_IB_POSITION: %s not found in IB positions", ticker)
+                    continue
+                qty = int(ib_pos.position)
+                direction: str = "LONG" if qty > 0 else "SHORT"
+                avg_cost = float(ib_pos.avgCost)
+                entry_price = round(avg_cost, 4) if avg_cost > 0 else 0.0
+                # Get ATR for SL/TP reconstruction
+                cfg_adopt = await SystemConfig.load(redis)
+                atr = 0.0
+                try:
+                    mkt_raw = await redis.hgetall(f"market_data:{ticker}")
+                    atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
+                    if atr_val:
+                        atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
+                except Exception:
+                    pass
+                stop_loss_a = 0.0
+                take_profit_a = 0.0
+                if atr > 0 and entry_price > 0:
+                    if direction == "LONG":
+                        stop_loss_a = round(entry_price - cfg_adopt.atr_multiplier * atr, 2)
+                        take_profit_a = round(entry_price * (1.0 + cfg_adopt.take_profit_pct), 2)
+                    else:
+                        stop_loss_a = round(entry_price + cfg_adopt.atr_multiplier * atr, 2)
+                        take_profit_a = round(entry_price * (1.0 - cfg_adopt.take_profit_pct), 2)
+                opened_at = datetime.now(UTC).isoformat()
+                seeded: dict = {
+                    "stop_loss": stop_loss_a,
+                    "take_profit": take_profit_a,
+                    "opened_at": opened_at,
+                    "direction": direction,
+                    "source": "system",
+                    "entry_price": entry_price,
+                    "shares": abs(qty),
+                    "oca_group": "",
+                    "trailing_stop_pct_applied": cfg_adopt.trailing_stop_pct,
+                }
+                active_engine.seed_position_params(ticker, seeded)  # type: ignore[union-attr]
+                await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(seeded))
+                _adopt_flag = f"position:adopted:{ticker}:{opened_at}"
+                if await redis.set(_adopt_flag, "1", nx=True, ex=86400 * 90):
+                    await _publish_execution_event(redis, "position_opened", {
+                        "ticker": ticker,
+                        "direction": direction,
+                        "shares": abs(qty),
+                        "entry_price": entry_price,
+                        "stop_price": stop_loss_a,
+                        "target_price": take_profit_a,
+                        "opened_at": opened_at,
+                        "mode": await redis.get("trading:mode") or "live",
+                    })
+                logger.info(
+                    "ADOPT_IB_POSITION: %s adopted — entry=%.4f sl=%.2f tp=%.2f (user action)",
+                    ticker, entry_price, stop_loss_a, take_profit_a,
+                )
+            except Exception as exc:
+                logger.warning("ADOPT_IB_POSITION failed for %s: %s", ticker, exc)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

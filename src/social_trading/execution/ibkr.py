@@ -920,6 +920,33 @@ class IBKRExecutionEngine:
             logger.error("[IBKR] reattach_oca: could not qualify contract for %s: %s", ticker, exc)
             return False
 
+        # ── Cancel any existing bracket orders for this ticker first ──────────
+        # Prevents duplicate OCA groups when the naked check fires during a brief
+        # window after reconnect where openTrades() was empty / stale.
+        # Only cancel system-managed protective orders (ORDER_REF + bracket types).
+        _bracket_types = {"STP", "STP LMT", "TRAIL", "LMT"}
+        _cancelled_existing = 0
+        try:
+            for trade in self._ib.openTrades():
+                sym = getattr(getattr(trade, "contract", None), "symbol", "")
+                ord_obj = getattr(trade, "order", None)
+                ref = getattr(ord_obj, "orderRef", "")
+                ot = getattr(ord_obj, "orderType", "")
+                if sym == ticker and ref == ORDER_REF and ot in _bracket_types:
+                    try:
+                        self._ib.cancelOrder(ord_obj)
+                        _cancelled_existing += 1
+                    except Exception as _ce:
+                        logger.debug("[IBKR] reattach_oca: cancel existing %s order failed: %s", ot, _ce)
+            if _cancelled_existing:
+                logger.info(
+                    "[IBKR] reattach_oca: cancelled %d existing bracket order(s) for %s before reattach",
+                    _cancelled_existing, ticker,
+                )
+                await asyncio.sleep(0.3)  # brief pause so IB acks the cancels
+        except Exception as _exc:
+            logger.debug("[IBKR] reattach_oca: error during existing-order cancellation for %s: %s", ticker, _exc)
+
         placed_legs: list = []
 
         # ── Stop loss leg ─────────────────────────────────────────────────────
