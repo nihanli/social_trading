@@ -679,11 +679,6 @@ async def run_exit_loop(
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
 
-    # Reconnect backoff: only attempt reconnect once every 60 seconds to avoid
-    # hammering TWS during a prolonged outage.
-    _RECONNECT_INTERVAL_SECS = 60
-    _last_reconnect_attempt: float = 0.0
-
     # Record loop startup time so naked-position check can apply a grace period
     # while IB openOrder callbacks are still arriving after connect.
     _loop_start_ts: float = asyncio.get_event_loop().time()
@@ -703,130 +698,15 @@ async def run_exit_loop(
             _connected = await engine.health_check()
 
             if not _connected:
-                now_ts = asyncio.get_event_loop().time()
-                if hasattr(engine, "reconnect") and (now_ts - _last_reconnect_attempt) >= _RECONNECT_INTERVAL_SECS:
-                    _last_reconnect_attempt = now_ts
-                    logger.info("[SYNC] IB disconnected — attempting reconnect…")
-                    reconnected = await engine.reconnect()  # type: ignore[union-attr]
-                    if reconnected:
-                        logger.info("[SYNC] IB reconnected — resuming position evaluation")
-                        _last_ib_cache_refresh = now_ts  # mark cache as fresh
-                        _loop_start_ts = now_ts  # reset grace period for naked check
-                        # Reconstruct _pending_close from exits:inflight whose orders
-                        # are still active in IB.  This restores the in-memory state
-                        # that was lost when the exit loop task restarted on reconnect,
-                        # preventing _check_naked_positions from treating pending-close
-                        # positions as unprotected during the reconnect grace window.
-                        try:
-                            from social_trading.execution.ibkr import ORDER_REF as _ORD_REF  # noqa: PLC0415
-                            _active_oids: set[int] = {
-                                int(getattr(getattr(t, "order", None), "orderId", 0))
-                                for t in (engine._ib.openTrades() if hasattr(engine, "_ib") else [])  # type: ignore[union-attr]
-                                if getattr(getattr(t, "order", None), "orderRef", "") == _ORD_REF
-                            }
-                            _inf_exit = await redis.hgetall(_INFLIGHT_EXIT_KEY)
-                            for _k, _v in (_inf_exit or {}).items():
-                                _oid_s = _k.decode() if isinstance(_k, bytes) else str(_k)
-                                try:
-                                    _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
-                                    _tkr = _d.get("ticker", "")
-                                    if _tkr and int(_oid_s) in _active_oids:
-                                        _pending_close.add(_tkr)
-                                        logger.info("[SYNC] Restored %s to _pending_close from exits:inflight", _tkr)
-                                except Exception:
-                                    pass
-                        except Exception as _pc_exc:
-                            logger.debug("[SYNC] Could not restore _pending_close on reconnect: %s", _pc_exc)
-                        # Re-register fill callbacks for still-pending exit orders.
-                        # After reconnect the old Trade objects (and their fillEvent
-                        # handlers) are stale.  Attach fresh callbacks to the Trade
-                        # objects now in ib.openTrades() so deferred fills are not missed.
-                        if hasattr(engine, "register_order_fill_callback") and hasattr(engine, "_ib"):
-                            try:
-                                for _k, _v in (_inf_exit or {}).items():
-                                    _oid_s = _k.decode() if isinstance(_k, bytes) else str(_k)
-                                    try:
-                                        _oid_i = int(_oid_s)
-                                        if _oid_i not in _active_oids:
-                                            continue
-                                        _d = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
-                                        _cb_ticker    = _d.get("ticker", "")
-                                        _cb_opened_at = _d.get("opened_at", datetime.now(UTC).isoformat())
-                                        _cb_entry     = float(_d.get("entry_price", 0.0))
-                                        _cb_shares    = int(_d.get("shares", 0))
-                                        _cb_dir       = _d.get("direction", "unknown")
-                                        _cb_oid_str   = _oid_s
-                                        _cb_mode      = mode
-                                        if not _cb_ticker:
-                                            continue
-
-                                        async def _recon_fill_cb(
-                                            fill_price: float,
-                                            _t:   str   = _cb_ticker,
-                                            _oa:  str   = _cb_opened_at,
-                                            _ep:  float = _cb_entry,
-                                            _sh:  int   = _cb_shares,
-                                            _di:  str   = _cb_dir,
-                                            _os:  str   = _cb_oid_str,
-                                            _m:   str   = _cb_mode,
-                                        ) -> None:
-                                            try:
-                                                if hasattr(engine, "forget_position"):
-                                                    engine.forget_position(_t)
-                                                await redis.hdel(_POSITION_PARAMS_KEY, _t)
-                                                await redis.hdel(_HWM_REDIS_KEY, _t)
-                                                await redis.hdel(_TRAIL_ORDERS_KEY, _t)
-                                                await redis.hdel(_INFLIGHT_EXIT_KEY, _os)
-                                                await _publish_execution_event(redis, "position_closed", {
-                                                    "ticker":      _t,
-                                                    "exit_price":  fill_price,
-                                                    "exit_reason": "CLOSE_FILL_RECONNECT",
-                                                    "shares":      _sh,
-                                                    "direction":   _di,
-                                                    "entry_price": _ep,
-                                                    "closed_at":   datetime.now(UTC).isoformat(),
-                                                    "opened_at":   _oa,
-                                                    "mode":        _m,
-                                                })
-                                                logger.info(
-                                                    "[SYNC] Reconnect fill callback: %s filled %.4f", _t, fill_price
-                                                )
-                                            except Exception as _cbe:
-                                                logger.warning(
-                                                    "[SYNC] Reconnect fill callback failed for %s: %s", _t, _cbe
-                                                )
-
-                                        engine.register_order_fill_callback(_oid_i, _recon_fill_cb)  # type: ignore[union-attr]
-                                        logger.info(
-                                            "[SYNC] Re-registered fill callback for %s orderId=%s after reconnect",
-                                            _cb_ticker, _oid_s,
-                                        )
-                                    except Exception:
-                                        pass
-                            except Exception as _rc_exc:
-                                logger.debug("[SYNC] Could not re-register fill callbacks on reconnect: %s", _rc_exc)
-                        # Run inflight reconcile to recover any fills that arrived during
-                        # the disconnect window (fillEvent callbacks fire on dead Trade
-                        # objects and are silently dropped by ib_async after reconnect).
-                        try:
-                            _cur_tickers = engine.open_tickers if hasattr(engine, "open_tickers") else set()  # type: ignore[union-attr]
-                            await _reconcile_inflight_orders(redis, engine, _cur_tickers, mode=mode)
-                        except Exception as _ri_exc:
-                            logger.debug("[SYNC] Post-reconnect inflight reconcile failed: %s", _ri_exc)
-                        # fall through to normal cycle
-                    else:
-                        logger.warning("[SYNC] IB reconnect failed — will retry in %ds", _RECONNECT_INTERVAL_SECS)
-                        await asyncio.sleep(cfg.signal_poll_interval_sec)
-                        continue
-                else:
-                    secs_until_retry = max(0, _RECONNECT_INTERVAL_SECS - int(now_ts - _last_reconnect_attempt))
-                    logger.warning(
-                        "[SYNC] Engine not connected — skipping position evaluation "
-                        "(next reconnect attempt in %ds)",
-                        secs_until_retry,
-                    )
-                    await asyncio.sleep(cfg.signal_poll_interval_sec)
-                    continue
+                # The persistent reconnect watcher (_run_ib_reconnect_watcher) is
+                # responsible for detecting disconnects and running full reconcile.
+                # This loop simply waits — the watcher will replace this task with a
+                # fresh exit loop instance once the new IB connection is established.
+                logger.warning(
+                    "[SYNC] IB disconnected — waiting for reconnect watcher to restore connection"
+                )
+                await asyncio.sleep(cfg.signal_poll_interval_sec)
+                continue
 
             # ── 1b. Periodic IB position cache refresh ────────────────────────
             # ib_async caches positions locally and updates them via fill events.
@@ -3922,29 +3802,58 @@ async def _run_ib_reconnect_watcher(
     mode: str,
 ) -> None:
     """
-    Connect (or reconnect) to IB/TWS, then start all runtime tasks.
+    Persistent IB connection manager — runs for the lifetime of the service.
 
-    Runs as an infinite loop.  On every successful connect — including reconnects
-    after a disconnect — the full blocking reconcile UI is shown.  _RECONCILE_DONE
-    is reset to False before each attempt so the trade/exit loops block until the
-    user approves (or skips) reconcile for that IB connection session.
+    Outer loop (connect loop): attempts IB connection with 30s retries until success.
+    On every successful connect (first connect OR reconnect after disconnect):
+      1. Resets _RECONCILE_DONE[0] = False
+      2. Calls _initialize_connected_runtime — full reconcile, blocking UI
+      3. Starts/replaces exec:trade, exec:exit, exec:price_push tasks
+      4. Enters inner monitoring loop — polls ib.isConnected() every 15s
 
-    Retries every 30s on failure.  The trade/exit loops remain blocked on the
-    "awaiting_approval" reconcile state while this watcher is attempting to connect.
+    On disconnect detection: cancels current task instances by replacing them,
+    disconnects IB cleanly, and restarts the outer connect loop.
+
+    This ensures the reconcile UI is shown on every IB connection session, not
+    just once per app launch.
     """
     from ib_async import IB  # noqa: PLC0415
 
     _IB_RETRY_SECS = 30
-    while True:
+    _MONITOR_SECS = 15
+
+    while True:  # outer: reconnect on every disconnect
         ib = None
+        _RECONCILE_DONE[0] = False
+
+        # ── Connect phase (retry until success) ──────────────────────────────
+        while True:
+            try:
+                ib = IB()
+                await ib.connectAsync("127.0.0.1", port, clientId=client_id)
+                await ib.reqPositionsAsync()
+                await ib.reqAccountUpdatesAsync(account=ib_account or "")
+                logger.info("[IBKR] Reconnect watcher: connected to port %d clientId=%d", port, client_id)
+                break  # connected — proceed to initialize
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                try:
+                    if ib is not None:
+                        ib.disconnect()
+                except Exception:
+                    pass
+                ib = None
+                await redis.setex("service:heartbeat", 60, "1")
+                await redis.set("ib:connected", "0")
+                logger.warning(
+                    "[IBKR] Reconnect watcher could not connect to port %d: %s — retrying in %ds",
+                    port, exc, _IB_RETRY_SECS,
+                )
+                await asyncio.sleep(_IB_RETRY_SECS)
+
+        # ── Initialize runtime with full blocking reconcile ───────────────────
         try:
-            # Reset session reconcile flag so the full blocking reconcile UI is
-            # shown on every IB connect, not just the first one this app run.
-            _RECONCILE_DONE[0] = False
-            ib = IB()
-            await ib.connectAsync("127.0.0.1", port, clientId=client_id)
-            await ib.reqPositionsAsync()
-            await ib.reqAccountUpdatesAsync(account=ib_account or "")
             engine, market_data, exit_manager, breaker, bus, cfg = await _initialize_connected_runtime(
                 redis=redis,
                 ib=ib,
@@ -3953,32 +3862,51 @@ async def _run_ib_reconnect_watcher(
                 ib_account=ib_account,
                 mode=mode,
             )
-            _set_runtime_task(
-                "exec:trade",
-                run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg),
-            )
-            _set_runtime_task(
-                "exec:exit",
-                run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode),
-            )
-            _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
-            logger.info("[IBKR] Reconnect watcher connected — loops started, awaiting reconcile approval")
-            return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            logger.error("[IBKR] Reconnect watcher: failed to initialize runtime: %s — will retry", exc)
             try:
                 if ib is not None:
                     ib.disconnect()
             except Exception:
                 pass
-            await redis.setex("service:heartbeat", 60, "1")
-            await redis.set("ib:connected", "0")
-            logger.warning(
-                "[IBKR] Reconnect watcher could not connect to port %d: %s — retrying in %ds",
-                port, exc, _IB_RETRY_SECS,
-            )
             await asyncio.sleep(_IB_RETRY_SECS)
+            continue  # restart outer loop
+
+        # Start/replace trade and exit tasks for this IB connection session
+        _set_runtime_task(
+            "exec:trade",
+            run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg),
+        )
+        _set_runtime_task(
+            "exec:exit",
+            run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode),
+        )
+        _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
+        logger.info("[IBKR] Reconnect watcher: loops started — awaiting reconcile approval")
+
+        # ── Monitor phase: wait for disconnect ────────────────────────────────
+        while True:
+            await asyncio.sleep(_MONITOR_SECS)
+            try:
+                still_connected = ib.isConnected()
+            except Exception:
+                still_connected = False
+            if not still_connected:
+                logger.warning(
+                    "[IBKR] Reconnect watcher: IB disconnected — "
+                    "cancelling current loops and reconnecting with full reconcile"
+                )
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                # _set_runtime_task cancels the running tasks and replaces them
+                # with placeholders that will be overwritten on the next connect.
+                # The trade/exit loops block on "awaiting_approval" anyway, so
+                # there is no risk of missed signals during the reconnect window.
+                break  # exit monitor loop → restart outer connect loop
 
 
 async def _run_price_push(engine: Optional[ExecutionEngine], redis: aioredis.Redis) -> None:
@@ -4104,7 +4032,7 @@ async def main() -> None:
     # A previous session's "approved" must not suppress reconcile for this session.
     await redis.delete(_RECONCILE_STATE_KEY)
 
-    from ib_async import IB  # noqa: PLC0415
+    from ib_async import IB as _IB_unused  # noqa: PLC0415, F401 — keep import for type checks elsewhere
 
     port = int(os.getenv("IBKR_PORT", "7497"))
     client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
@@ -4119,47 +4047,16 @@ async def main() -> None:
     mode = "live"
     await redis.set("trading:mode", mode)
 
-    ib: IB | None = None
-    try:
-        ib = IB()
-        await asyncio.wait_for(ib.connectAsync("127.0.0.1", port, clientId=client_id), timeout=30)
-        await ib.reqPositionsAsync()
-        await ib.reqAccountUpdatesAsync(account=ib_account or "")
-        logger.info("[IBKR] Account data loaded — NLV=%.2f", next(
-            (float(av.value) for av in ib.accountValues()
-             if av.tag == "NetLiquidation" and av.currency in ("USD", "BASE")),
-            0.0,
-        ))
-        engine, market_data, exit_manager, breaker, bus, cfg = await _initialize_connected_runtime(
-            redis=redis,
-            ib=ib,
-            port=port,
-            client_id=client_id,
-            ib_account=ib_account,
-            mode=mode,
-            reconcile_done=_RECONCILE_DONE,  # _RECONCILE_DONE[0] is False at startup
-        )
-        _set_runtime_task("exec:heartbeat", _run_heartbeat(engine, redis))
-        _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
-        _set_runtime_task("exec:trade", run_trade_loop(bus, engine, redis, market_data, mode=mode, cfg=cfg))
-        _set_runtime_task("exec:exit", run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode))
-        _set_runtime_task("exec:cmd", run_command_listener(engine, redis))
-    except asyncio.CancelledError:
-        raise
-    except (TimeoutError, Exception) as exc:
-        try:
-            if ib is not None:
-                ib.disconnect()
-        except Exception:
-            pass
-        _ACTIVE_ENGINE = None
-        logger.warning("[IBKR] Startup connection unavailable: %s — starting in reconnect mode", exc)
-        await redis.setex("service:heartbeat", 60, "1")
-        await redis.set("ib:connected", "0")
-        await redis.set(_RECONCILE_STATE_KEY, "skipped_no_ib", ex=_RECONCILE_TTL)
-        _set_runtime_task("exec:heartbeat", _run_heartbeat(None, redis))
-        _set_runtime_task("exec:cmd", run_command_listener(None, redis))
-        _set_runtime_task("exec:reconnect", _run_ib_reconnect_watcher(redis, port, client_id, ib_account, mode))
+    # Always start the persistent reconnect watcher as the sole IB connection manager.
+    # It handles first connect, full blocking reconcile, and all future reconnects.
+    # heartbeat and cmd listener start immediately (heartbeat shows "disconnected"
+    # until the watcher establishes the first connection).
+    await redis.setex("service:heartbeat", 60, "1")
+    await redis.set("ib:connected", "0")
+    await redis.set(_RECONCILE_STATE_KEY, "skipped_no_ib", ex=_RECONCILE_TTL)
+    _set_runtime_task("exec:heartbeat", _run_heartbeat(None, redis))
+    _set_runtime_task("exec:cmd", run_command_listener(None, redis))
+    _set_runtime_task("exec:reconnect", _run_ib_reconnect_watcher(redis, port, client_id, ib_account, mode))
 
     def _shutdown(sig: int, _frame: object) -> None:
         logger.info("Signal %d received — shutting down execution service", sig)
