@@ -3847,8 +3847,19 @@ async def _initialize_connected_runtime(
     client_id: int,
     ib_account: str,
     mode: str,
-    reconcile_done: list[bool] | None = None,
 ) -> tuple[ExecutionEngine, MarketDataProvider, PositionExitManager, CircuitBreaker, TradingEventBus, SystemConfig]:
+    """
+    Build and initialise all runtime components for a live IB connection.
+
+    Called on EVERY successful IB connect (including reconnects after a disconnect).
+    Always runs the full startup reconcile: collects a snapshot of app vs IB state,
+    persists it for the UI, and sets reconcile:state to "awaiting_approval" so the
+    trade and exit loops block until the user approves (or skips) reconcile.
+
+    This means the user sees the reconcile screen once per IB connection session,
+    not just once per app launch.  _RECONCILE_DONE is reset to False by the
+    reconnect watcher before each connect attempt.
+    """
     global _ACTIVE_ENGINE
 
     from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
@@ -3880,42 +3891,21 @@ async def _initialize_connected_runtime(
     await _load_position_params_from_redis(redis, engine)
     await _load_trail_orders_from_redis(redis, engine)
 
-    # Determine whether this is the first IB connection this session or a
-    # mid-session reconnect after a disconnect.
-    #   First connect  → run full startup reconcile + collect data for UI review
-    #   Reconnect      → run lightweight inflight-only reconcile; skip blocking UI
-    _is_first_connect = (reconcile_done is None) or (not reconcile_done[0])
-    if _is_first_connect:
-        await redis.set(_RECONCILE_STATE_KEY, "collecting", ex=_RECONCILE_TTL)
-        # Prime open orders cache BEFORE collecting reconcile data so that
-        # openTrades() is fully populated when _collect_reconcile_data runs.
-        # Without this, OCA bracket orders for orphaned positions are missing
-        # from the cache and they are misclassified as manual_ib.
-        await _prime_ib_open_orders(ib)
-        reconcile_data = await _collect_reconcile_data(redis, engine, ib_account=ib_account)
-        await _persist_reconcile_snapshot(redis, reconcile_data)
-        logger.info(
-            "[RECONCILE] Data collected — %d app positions, %d IB positions, %d matches",
-            len(reconcile_data.get("app_positions", [])),
-            len(reconcile_data.get("ib_positions", [])),
-            len(reconcile_data.get("matches", [])),
-        )
-    else:
-        # Mid-session reconnect: IB cache was cleared on disconnect; reseed and run
-        # inflight reconcile to recover any fill prices missed during the outage.
-        # Also refresh reconcile:data so the reconcile page shows an up-to-date
-        # snapshot of the post-reconnect state (without re-blocking trading).
-        logger.info("[RECONCILE] Mid-session reconnect — skipping blocking UI, running inflight reconcile")
-        # _reconcile_startup internally calls _reconcile_inflight_orders (fix 1) —
-        # no need to call it again here.
-        await _reconcile_startup(redis, engine, mode=mode)
-        try:
-            fresh_data = await _collect_reconcile_data(redis, engine, ib_account=ib_account)
-            fresh_data["state"] = "approved"  # non-blocking — don't re-show the UI
-            await redis.set(_RECONCILE_DATA_KEY, json.dumps(fresh_data, default=str), ex=_RECONCILE_TTL)
-            logger.info("[RECONCILE] Refreshed reconcile:data after mid-session reconnect")
-        except Exception as _rd_exc:
-            logger.debug("[RECONCILE] Could not refresh reconcile:data on reconnect: %s", _rd_exc)
+    # Always run the full reconcile flow on every IB connect/reconnect.
+    # Prime open orders cache BEFORE collecting reconcile data so that
+    # openTrades() is fully populated when _collect_reconcile_data runs.
+    # Without this, OCA bracket orders for orphaned positions are missing
+    # from the cache and they are misclassified as manual_ib.
+    await redis.set(_RECONCILE_STATE_KEY, "collecting", ex=_RECONCILE_TTL)
+    await _prime_ib_open_orders(ib)
+    reconcile_data = await _collect_reconcile_data(redis, engine, ib_account=ib_account)
+    await _persist_reconcile_snapshot(redis, reconcile_data)
+    logger.info(
+        "[RECONCILE] Data collected — %d app positions, %d IB positions, %d matches",
+        len(reconcile_data.get("app_positions", [])),
+        len(reconcile_data.get("ib_positions", [])),
+        len(reconcile_data.get("matches", [])),
+    )
 
     await _prune_old_data()
     asyncio.create_task(_warmup_market_data_task(redis, market_data), name="exec:market_warmup")
@@ -3932,15 +3922,15 @@ async def _run_ib_reconnect_watcher(
     mode: str,
 ) -> None:
     """
-    Retry IB connection every 30s until success.
+    Connect (or reconnect) to IB/TWS, then start all runtime tasks.
 
-    On first successful connect this session (_RECONCILE_DONE[0] is False):
-      → run _initialize_connected_runtime with full reconcile data collection
-      → trade/exit loops self-block until the UI approves reconcile
+    Runs as an infinite loop.  On every successful connect — including reconnects
+    after a disconnect — the full blocking reconcile UI is shown.  _RECONCILE_DONE
+    is reset to False before each attempt so the trade/exit loops block until the
+    user approves (or skips) reconcile for that IB connection session.
 
-    If IB connects but reconcile was already approved this session:
-      → run _initialize_connected_runtime in "reconnect" mode (lightweight)
-      → loops resume immediately (no reconcile blocking)
+    Retries every 30s on failure.  The trade/exit loops remain blocked on the
+    "awaiting_approval" reconcile state while this watcher is attempting to connect.
     """
     from ib_async import IB  # noqa: PLC0415
 
@@ -3948,6 +3938,9 @@ async def _run_ib_reconnect_watcher(
     while True:
         ib = None
         try:
+            # Reset session reconcile flag so the full blocking reconcile UI is
+            # shown on every IB connect, not just the first one this app run.
+            _RECONCILE_DONE[0] = False
             ib = IB()
             await ib.connectAsync("127.0.0.1", port, clientId=client_id)
             await ib.reqPositionsAsync()
@@ -3959,7 +3952,6 @@ async def _run_ib_reconnect_watcher(
                 client_id=client_id,
                 ib_account=ib_account,
                 mode=mode,
-                reconcile_done=_RECONCILE_DONE,  # pass session flag
             )
             _set_runtime_task(
                 "exec:trade",
@@ -3970,10 +3962,7 @@ async def _run_ib_reconnect_watcher(
                 run_exit_loop(engine, exit_manager, market_data, breaker, redis, mode=mode),
             )
             _set_runtime_task("exec:price_push", _run_price_push(engine, redis))
-            if _RECONCILE_DONE[0]:
-                logger.info("[IBKR] Reconnect watcher connected (mid-session) — loops resuming immediately")
-            else:
-                logger.info("[IBKR] Reconnect watcher connected (first connect) — loops started, awaiting reconcile approval")
+            logger.info("[IBKR] Reconnect watcher connected — loops started, awaiting reconcile approval")
             return
         except asyncio.CancelledError:
             raise
