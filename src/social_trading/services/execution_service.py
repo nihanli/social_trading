@@ -1488,6 +1488,10 @@ async def _collect_reconcile_data(
     app_by_ticker = {str(p.get("ticker", "")).upper(): p for p in app_positions if p.get("ticker")}
     ib_by_ticker = {str(p.get("ticker", "")).upper(): p for p in ib_positions if p.get("ticker")}
     fills_by_ticker: dict[str, dict] = {}
+    # Close fills only (SLD for LONG, BOT for SHORT) — keyed by ticker.
+    # Used for "closed_offline" classification and timestamp checks.
+    # Storing separately from fills_by_ticker so entry fills don't mask close fills.
+    _close_fills_by_ticker: dict[str, dict] = {}
     # Track which sides were seen per ticker so we can detect round-trips (BOT + SLD both today)
     _fill_sides_by_ticker: dict[str, set[str]] = {}
     for fill in ib_trades_today:
@@ -1498,6 +1502,12 @@ async def _collect_reconcile_data(
         action = str(fill.get("action", "")).upper()
         if action:
             _fill_sides_by_ticker.setdefault(ticker, set()).add(action)
+            # SLD = a sell execution (close for LONG, short entry — treat as potential close)
+            # BOT = a buy execution (close for SHORT, long entry)
+            # We store whichever represents a close.  For the timestamp guard we use
+            # the most recent close-side fill; overwrite so the newest wins.
+            if action == "SLD":
+                _close_fills_by_ticker[ticker] = fill
     # Tickers that have BOTH a buy and sell fill today — they fully round-tripped.
     # IB may still show them in positions() for a brief window; treat as closed.
     _round_tripped_today = {
@@ -1561,9 +1571,39 @@ async def _collect_reconcile_data(
                 )
         elif app_entry and not ib_entry:
             if fill_entry:
-                status = "closed_offline"
-                reason = f"{ticker} is missing from IB positions but has a same-day IB fill record."
-                auto_actions.append({"ticker": ticker, "action": "confirm_closed"})
+                # Guard: if the fill time predates the position's opened_at, the fill
+                # belongs to a PRIOR position (same ticker re-entered after a close).
+                # Don't classify this new position as "closed_offline" — the fill is stale.
+                # Use the close-side fill (SLD for LONG) specifically so an entry fill
+                # (BOT) from a re-entry doesn't mask the stale close fill check.
+                _close_fill = _close_fills_by_ticker.get(ticker, fill_entry)
+                _fill_time_str = str(_close_fill.get("time", "") or "")
+                _app_opened_at = str(app_entry.get("opened_at", "") or "")
+                _fill_predates_open = False
+                if _fill_time_str and _app_opened_at:
+                    try:
+                        from datetime import timezone as _tz  # noqa: PLC0415
+                        _ft = datetime.fromisoformat(_fill_time_str)
+                        _oa = datetime.fromisoformat(_app_opened_at)
+                        if _ft.tzinfo is None:
+                            _ft = _ft.replace(tzinfo=_tz.utc)
+                        if _oa.tzinfo is None:
+                            _oa = _oa.replace(tzinfo=_tz.utc)
+                        if _ft < _oa:
+                            _fill_predates_open = True
+                    except Exception:
+                        pass
+                if _fill_predates_open:
+                    status = "pending_manual"
+                    reason = (
+                        f"{ticker} is tracked by the app but the only IB fill record "
+                        f"({_fill_time_str}) predates the position's opened_at ({_app_opened_at}). "
+                        "This fill is likely from a prior same-day trade. Manual review required."
+                    )
+                else:
+                    status = "closed_offline"
+                    reason = f"{ticker} is missing from IB positions but has a same-day IB fill record."
+                    auto_actions.append({"ticker": ticker, "action": "confirm_closed"})
             else:
                 status = "pending_manual"
                 reason = f"{ticker} is tracked by the app but no IB position or same-day fill was found."
@@ -2029,8 +2069,10 @@ async def _reconcile_startup(
     # complete than ib.fills() for same-day offline gaps).
     # reqCompletedOrdersAsync() fetches filled/cancelled orders from the current
     # TWS session — may include recently filled bracket legs.
-    # Both keyed by symbol → (exit_price, exit_reason).
-    _offline_exit: dict[str, tuple[float, str]] = {}
+    # Both keyed by symbol → (exit_price, exit_reason, fill_time_utc).
+    # fill_time_utc is stored so that fills that pre-date the position's opened_at
+    # are not mistakenly used as the close of a NEW position opened after that fill.
+    _offline_exit: dict[str, tuple[float, str, datetime | None]] = {}
     # Tickers where this system placed an entry (MKT) order, confirmed via
     # reqCompletedOrdersAsync.  Used to reclassify orphaned positions that
     # have no remaining open orders (e.g. OCA failed) but were system-opened.
@@ -2041,8 +2083,9 @@ async def _reconcile_startup(
     try:
         ib_obj = getattr(engine, "_ib", None)
         if ib_obj is not None:
-            # Step 1: collect fill prices from today's server-side executions
+            # Step 1: collect fill prices + timestamps from today's server-side executions
             _fill_prices: dict[str, float] = {}
+            _fill_times: dict[str, datetime | None] = {}   # sym:side → fill time (UTC)
             # Track which sides (BOT / SLD) were seen per ticker today
             _fill_sides: dict[str, set[str]] = {}
             from ib_async import ExecutionFilter  # noqa: PLC0415
@@ -2051,8 +2094,20 @@ async def _reconcile_startup(
                 sym = getattr(getattr(fill, "contract", None), "symbol", "")
                 side = getattr(getattr(fill, "execution", None), "side", "")
                 price = getattr(getattr(fill, "execution", None), "price", 0.0)
+                fill_time_raw = getattr(getattr(fill, "execution", None), "time", None)
+                fill_dt: datetime | None = None
+                if fill_time_raw:
+                    try:
+                        if isinstance(fill_time_raw, datetime):
+                            fill_dt = fill_time_raw if fill_time_raw.tzinfo else fill_time_raw.replace(tzinfo=UTC)
+                        else:
+                            _ft = datetime.fromisoformat(str(fill_time_raw))
+                            fill_dt = _ft if _ft.tzinfo else _ft.replace(tzinfo=UTC)
+                    except Exception:
+                        pass
                 if sym and price:
                     _fill_prices[f"{sym}:{side}"] = float(price)
+                    _fill_times[f"{sym}:{side}"] = fill_dt
                     _fill_sides.setdefault(sym, set()).add(side.upper())
 
             # Detect round-trips: tickers with BOTH a buy fill AND a sell fill today.
@@ -2063,7 +2118,7 @@ async def _reconcile_startup(
             if _fully_closed_today:
                 logger.info("[SYNC] Detected fully-closed today (both BOT+SLD fills): %s", _fully_closed_today)
 
-            # Step 2: classify by completed order type (most accurate)
+            # Step 2: classify by completed order type (most accurate); store fill time
             try:
                 completed = await ib_obj.reqCompletedOrdersAsync(apiOnly=False)
                 for order_state in completed:
@@ -2074,12 +2129,26 @@ async def _reconcile_startup(
                     if ref != "social_trading" or status != "Filled" or not sym:
                         continue
                     avg_fill = getattr(getattr(order_state, "orderStatus", None), "avgFillPrice", 0.0)
+                    # Try to extract the fill time from completedOrder (not always available)
+                    _co_time_raw = getattr(getattr(order_state, "orderStatus", None), "lastFillTime", None)
+                    _co_dt: datetime | None = None
+                    if _co_time_raw:
+                        try:
+                            _co_t = datetime.fromisoformat(str(_co_time_raw))
+                            _co_dt = _co_t if _co_t.tzinfo else _co_t.replace(tzinfo=UTC)
+                        except Exception:
+                            pass
+                    # Fall back to reqExecutionsAsync timestamp for this symbol+side
+                    if _co_dt is None:
+                        _close_side = "SLD" if ot not in ("MKT",) else None
+                        if _close_side:
+                            _co_dt = _fill_times.get(f"{sym}:{_close_side}")
                     if ot in ("STP", "STP LMT"):
-                        _offline_exit[sym] = (float(avg_fill), "STOP_LOSS")
+                        _offline_exit[sym] = (float(avg_fill), "STOP_LOSS", _co_dt)
                     elif ot == "LMT":
-                        _offline_exit[sym] = (float(avg_fill), "TAKE_PROFIT")
+                        _offline_exit[sym] = (float(avg_fill), "TAKE_PROFIT", _co_dt)
                     elif ot == "TRAIL":
-                        _offline_exit[sym] = (float(avg_fill), "TRAILING_STOP")
+                        _offline_exit[sym] = (float(avg_fill), "TRAILING_STOP", _co_dt)
                     elif ot == "MKT":
                         # Entry market order placed by this system — remember the symbol
                         # so orphaned positions with no open orders are not misclassified
@@ -2088,12 +2157,12 @@ async def _reconcile_startup(
             except Exception as exc:
                 logger.debug("[SYNC] reqCompletedOrders unavailable: %s", exc)
 
-            # Step 3: for symbols not classified by order type, use fill price
+            # Step 3: for symbols not classified by order type, use fill price + time
             # from executions but don't guess exit reason beyond SL/TP
             for key, price in _fill_prices.items():
                 sym, side = key.split(":", 1)
                 if sym not in _offline_exit and price > 0:
-                    _offline_exit[sym] = (price, "")  # price known, reason unknown
+                    _offline_exit[sym] = (price, "", _fill_times.get(key))  # price known, reason unknown
     except Exception as exc:
         logger.debug("[SYNC] Could not prefetch today's executions: %s", exc)
 
@@ -2114,7 +2183,30 @@ async def _reconcile_startup(
         take_profit = float(p.get("take_profit", 0.0))
 
         # Try to get exit price + reason from IB records
-        exit_price, exit_reason = _offline_exit.get(ticker, (0.0, ""))
+        exit_price, exit_reason, exit_fill_dt = _offline_exit.get(ticker, (0.0, "", None))
+
+        # Guard: if the fill time is known and predates the position's opened_at,
+        # the fill belongs to a PREVIOUS position with the same ticker (e.g. same
+        # ticker re-entered right after a close during a reconnect window).
+        # Using that fill as the close of the NEW position would incorrectly kill
+        # a just-opened trade (it would be classified as "closed_offline" even
+        # though the entry order is still working in IB).
+        if exit_fill_dt is not None and exit_price > 0:
+            try:
+                _pos_opened_dt = datetime.fromisoformat(opened_at)
+                if _pos_opened_dt.tzinfo is None:
+                    _pos_opened_dt = _pos_opened_dt.replace(tzinfo=UTC)
+                if exit_fill_dt < _pos_opened_dt:
+                    logger.info(
+                        "[SYNC] %s: fill at %s predates position opened_at %s — "
+                        "fill is from a prior position; treating as no fill record",
+                        ticker, exit_fill_dt.isoformat(), opened_at,
+                    )
+                    exit_price = 0.0
+                    exit_reason = ""
+            except Exception:
+                pass  # If timestamp parse fails, keep the fill (conservative)
+
         if exit_price > 0 and not exit_reason:
             # Have fill price but no order-type classification.
             # Only classify against ATR SL / TP — don't guess TRAILING_STOP.
