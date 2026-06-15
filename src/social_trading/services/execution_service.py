@@ -1510,6 +1510,24 @@ async def _collect_reconcile_data(
         if o.get("ticker")
     }
 
+    # Extend system_order_tickers with tickers that had a system MKT entry order
+    # filled in the current TWS session (reqCompletedOrdersAsync).  This catches
+    # positions opened by this system whose OCA orders are fully filled/cancelled —
+    # openTrades() shows nothing for them, so without this check they are
+    # misclassified as "manual_ib" instead of "adopted".
+    if ib_obj is not None:
+        try:
+            completed = await ib_obj.reqCompletedOrdersAsync(apiOnly=False)
+            for order_state in (completed or []):
+                sym = getattr(getattr(order_state, "contract", None), "symbol", "")
+                ref = getattr(getattr(order_state, "order", None), "orderRef", "")
+                ot  = getattr(getattr(order_state, "order", None), "orderType", "")
+                st  = getattr(getattr(order_state, "orderStatus", None), "status", "")
+                if sym and ref == "social_trading" and st == "Filled" and ot == "MKT":
+                    system_order_tickers.add(sym.upper())
+        except Exception as _coe:
+            logger.debug("[RECONCILE] reqCompletedOrders unavailable for system_order check: %s", _coe)
+
     matches: list[dict] = []
     pending_manual: list[dict] = []
     auto_actions: list[dict] = []
@@ -3436,6 +3454,12 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                     await _reconcile_inflight_orders(redis, active_engine, _skip_tickers, mode=_skip_mode)
                 except Exception as _se:
                     logger.debug("RECONCILE_SKIP: inflight reconcile failed: %s", _se)
+                # Immediately refresh positions:live so positions appear without
+                # waiting for the first exit-loop cycle (up to 60s).
+                try:
+                    await _write_positions_to_redis(redis, active_engine)
+                except Exception as _wp_exc:
+                    logger.debug("RECONCILE_SKIP: positions:live refresh failed: %s", _wp_exc)
             logger.info("Reconcile skipped by user — session flag set, trading unblocked")
         elif cmd == "RECONCILE_APPROVE":
             if active_engine is None:
@@ -3450,6 +3474,15 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 mode_raw = await redis.get("trading:mode") or "live"
                 mode_value = mode_raw.decode() if isinstance(mode_raw, bytes) else mode_raw
                 adoption_needed = False
+                # Build set of tickers confirmed to have live OCA orders in IB
+                # (from reconcile_data collected at startup).  Used below to clear
+                # stale oca_group for matched positions with no live bracket —
+                # prevents the naked-check grace period from skipping reattach.
+                _live_oca_tickers: set[str] = {
+                    str(o.get("ticker", "")).upper()
+                    for o in (reconcile_data.get("app_oca_orders") or [])
+                    if o.get("ticker")
+                }
                 for match in matches:
                     if not isinstance(match, dict):
                         continue
@@ -3491,6 +3524,29 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                         await redis.hset(_PENDING_RECONCILE_KEY, ticker, json.dumps(pending_payload, default=str))
                     elif status == "adopted":
                         adoption_needed = True
+                    elif status == "matched":
+                        # If reconcile confirmed this position has NO live OCA orders in IB,
+                        # clear the stale oca_group from params so that _check_naked_positions
+                        # can reattach bracket orders immediately without being blocked by the
+                        # startup grace period (which skips reattach when oca_group is set,
+                        # assuming the bracket orders are there but openTrades() is incomplete).
+                        if ticker not in _live_oca_tickers:
+                            try:
+                                params_raw_m = await redis.hget(_POSITION_PARAMS_KEY, ticker)
+                                if params_raw_m:
+                                    _pm = json.loads(params_raw_m.decode() if isinstance(params_raw_m, bytes) else params_raw_m)
+                                    if _pm.get("oca_group"):
+                                        _pm["oca_group"] = ""
+                                        await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(_pm))
+                                        if hasattr(active_engine, "_position_params") and ticker in active_engine._position_params:  # type: ignore[union-attr]
+                                            active_engine._position_params[ticker]["oca_group"] = ""  # type: ignore[union-attr]
+                                        logger.info(
+                                            "[RECONCILE] %s: matched but no live OCA orders — "
+                                            "cleared stale oca_group so naked check will reattach",
+                                            ticker,
+                                        )
+                            except Exception as _mc_exc:
+                                logger.debug("[RECONCILE] matched oca_group clear failed for %s: %s", ticker, _mc_exc)
                     elif status == "shares_mismatch":
                         # IB is the source of truth for share counts.
                         # Update app params and engine to match IB so PnL and
@@ -3538,6 +3594,12 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                     reconcile_data["state"] = "approved"
                     await redis.set(_RECONCILE_DATA_KEY, json.dumps(reconcile_data, default=str), ex=_RECONCILE_TTL)
                 _RECONCILE_DONE[0] = True  # mark reconcile done for this session
+                # Immediately refresh positions:live so the UI shows open positions
+                # without waiting for the first exit-loop cycle (up to 60s).
+                try:
+                    await _write_positions_to_redis(redis, active_engine)
+                except Exception as _wp_exc:
+                    logger.debug("RECONCILE_APPROVE: positions:live refresh failed: %s", _wp_exc)
                 logger.info("Reconcile approved by user")
             except Exception as exc:
                 logger.warning("RECONCILE_APPROVE failed: %s", exc)
@@ -3790,6 +3852,11 @@ async def _initialize_connected_runtime(
     await _prune_old_data()
     asyncio.create_task(_warmup_market_data_task(redis, market_data), name="exec:market_warmup")
     await _write_account_state(redis, engine)
+    # Write positions:live immediately at startup so the UI shows open positions
+    # during the reconcile screen and immediately after approval.  Without this,
+    # positions:live (5-min TTL) can expire while the service is offline and only
+    # gets re-written after the first exit-loop cycle (up to 60s after approval).
+    await _write_positions_to_redis(redis, engine)
     _ACTIVE_ENGINE = engine
     return engine, market_data, exit_manager, breaker, bus, cfg
 
