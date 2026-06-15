@@ -159,6 +159,10 @@ async def _publish_execution_event(
     Returns the Redis stream message ID on success, or None on failure.
     The message ID is useful for correction events that need to reference the
     original trade row (e.g. position_entry_updated, position_exit_corrected).
+
+    Side-effect: for position_opened and position_closed events, also writes
+    trade:last_at:{ticker} so the risk service can enforce the per-ticker
+    cooldown window (reject new signals for a ticker traded within the last hour).
     """
     try:
         fields = {"event": event_type}
@@ -168,6 +172,20 @@ async def _publish_execution_event(
             maxlen=STREAM_MAXLEN.get(_EXEC_EVENTS_STREAM, 50_000),
             approximate=True,
         )
+        # Keep a lightweight per-ticker "last traded at" marker so the risk
+        # service can enforce the cooldown without scanning the full event stream.
+        # TTL = 2 hours (well beyond the 1-hour cooldown window) so the key
+        # is automatically cleaned up after it can no longer affect decisions.
+        if event_type in ("position_opened", "position_closed"):
+            _ticker = data.get("ticker", "")
+            _ts = data.get("opened_at") or data.get("closed_at") or ""
+            if not _ts:
+                _ts = datetime.now(UTC).isoformat()
+            if _ticker:
+                try:
+                    await redis.set(f"trade:last_at:{_ticker}", str(_ts), ex=7200)
+                except Exception:
+                    pass
         return msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id) if msg_id else None
     except Exception as exc:
         logger.warning("[EVENTS] Failed to publish %s event: %s", event_type, exc)

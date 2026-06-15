@@ -104,6 +104,50 @@ def _signal_is_stale(signal: Signal, max_age_minutes: int) -> tuple[bool, float]
     return age_sec > max_age_minutes * 60, age_sec
 
 
+_TRADE_COOLDOWN_SECS = 3600  # 1 hour
+
+
+async def _ticker_in_cooldown(
+    redis: aioredis.Redis,
+    signal: Signal,
+    cooldown_secs: int = _TRADE_COOLDOWN_SECS,
+) -> tuple[bool, str]:
+    """Return (in_cooldown, reason).
+
+    A ticker is in cooldown if a position was opened or closed within
+    cooldown_secs of the signal's generated_at time.  This prevents
+    approving a re-entry signal for a ticker that was just traded,
+    giving the market time to settle before taking a fresh position.
+
+    The check compares the last trade timestamp (stored in Redis key
+    trade:last_at:{ticker} by the execution service) against the
+    signal's generated_at, not against wall-clock time, so stale
+    signals that pile up in the queue don't bypass the cooldown.
+    """
+    try:
+        raw = await redis.get(f"trade:last_at:{signal.ticker}")
+        if not raw:
+            return False, ""
+        last_at_str = raw.decode() if isinstance(raw, bytes) else raw
+        last_at = datetime.fromisoformat(last_at_str)
+        if last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=UTC)
+        sig_time = signal.generated_at
+        if sig_time.tzinfo is None:
+            sig_time = sig_time.replace(tzinfo=UTC)
+        elapsed = (sig_time - last_at).total_seconds()
+        if elapsed < cooldown_secs:
+            remaining = int(cooldown_secs - elapsed)
+            return True, (
+                f"last trade at {last_at.strftime('%H:%M:%S')} UTC — "
+                f"{int(elapsed)}s ago (cooldown {cooldown_secs}s, "
+                f"{remaining}s remaining)"
+            )
+    except Exception as exc:
+        logger.debug("[RISK] Cooldown check failed for %s: %s", signal.ticker, exc)
+    return False, ""
+
+
 def _approved_signal_to_stream_dict(
     signal: Signal,
     quantity: int,
@@ -306,6 +350,20 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="stale").inc()
+                    await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
+                    continue
+
+                # ── Ticker cooldown check ──────────────────────────────────────
+                # Reject signals for tickers traded within the last hour.
+                # Prevents rapid re-entries that may chase the same move or
+                # re-enter a position that was just stopped out.
+                in_cooldown, cooldown_reason = await _ticker_in_cooldown(redis, signal)
+                if in_cooldown:
+                    logger.info(
+                        "REJECTED (cooldown) %s: %s", signal.ticker, cooldown_reason,
+                    )
+                    rejected_total += 1
+                    SIGNALS_REJECTED.labels(reason="cooldown").inc()
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
