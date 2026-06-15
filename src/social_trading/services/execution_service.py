@@ -1494,6 +1494,12 @@ async def _collect_reconcile_data(
     _close_fills_by_ticker: dict[str, dict] = {}
     # Track which sides were seen per ticker so we can detect round-trips (BOT + SLD both today)
     _fill_sides_by_ticker: dict[str, set[str]] = {}
+    # Most-recent fill time per (ticker, side) for round-trip ordering.
+    # A "round-trip" is only genuine if the SLD fill is NEWER than the BOT fill.
+    # When a ticker is closed and then re-entered the same day, both sides exist but
+    # the BOT fill (re-entry) is more recent than the SLD fill (prior close).
+    # In that case the final state is an OPEN position, not a closed one.
+    _latest_fill_time: dict[str, datetime | None] = {}   # f"{ticker}:{side}" → datetime
     for fill in ib_trades_today:
         ticker = str(fill.get("ticker", "")).upper()
         if not ticker:
@@ -1502,18 +1508,52 @@ async def _collect_reconcile_data(
         action = str(fill.get("action", "")).upper()
         if action:
             _fill_sides_by_ticker.setdefault(ticker, set()).add(action)
+            # Parse and store the fill time for ordering detection
+            _ft_raw = str(fill.get("time", "") or "")
+            _ft_dt: datetime | None = None
+            if _ft_raw:
+                try:
+                    _ft_parsed = datetime.fromisoformat(_ft_raw)
+                    _ft_dt = _ft_parsed if _ft_parsed.tzinfo else _ft_parsed.replace(tzinfo=UTC)
+                except Exception:
+                    pass
+            _key = f"{ticker}:{action}"
+            # Keep the LATEST fill time for each ticker:side combination
+            if _ft_dt is not None:
+                _prev = _latest_fill_time.get(_key)
+                if _prev is None or _ft_dt > _prev:
+                    _latest_fill_time[_key] = _ft_dt
             # SLD = a sell execution (close for LONG, short entry — treat as potential close)
             # BOT = a buy execution (close for SHORT, long entry)
             # We store whichever represents a close.  For the timestamp guard we use
             # the most recent close-side fill; overwrite so the newest wins.
             if action == "SLD":
                 _close_fills_by_ticker[ticker] = fill
-    # Tickers that have BOTH a buy and sell fill today — they fully round-tripped.
-    # IB may still show them in positions() for a brief window; treat as closed.
-    _round_tripped_today = {
-        t for t, sides in _fill_sides_by_ticker.items()
-        if "BOT" in sides and "SLD" in sides
-    }
+    # Tickers that have BOTH a buy and sell fill today where the CLOSE (SLD) fill is
+    # more recent than the ENTRY (BOT) fill — these genuinely round-tripped.
+    # If SLD < BOT (close happened before re-entry), the final state is an open
+    # position; do NOT mark as round-tripped to avoid wrongly closing a live position.
+    _round_tripped_today: set[str] = set()
+    for t, sides in _fill_sides_by_ticker.items():
+        if "BOT" not in sides or "SLD" not in sides:
+            continue
+        _bot_time = _latest_fill_time.get(f"{t}:BOT")
+        _sld_time = _latest_fill_time.get(f"{t}:SLD")
+        if _bot_time is None or _sld_time is None:
+            # No timestamps available — assume NOT round-tripped (conservative)
+            logger.debug("[RECONCILE] %s: BOT+SLD fills but no timestamps — not marking as round-tripped", t)
+            continue
+        if _sld_time > _bot_time:
+            # Close happened after entry → genuine round-trip
+            _round_tripped_today.add(t)
+            logger.debug("[RECONCILE] %s: round-tripped (SLD %s > BOT %s)", t, _sld_time, _bot_time)
+        else:
+            # Entry is more recent than close → re-entry after earlier close; position is still open
+            logger.info(
+                "[RECONCILE] %s: BOT+SLD fills today but BOT (%s) is more recent than SLD (%s) — "
+                "position re-entered after close; NOT marking as round-tripped",
+                t, _bot_time, _sld_time,
+            )
     system_order_tickers = {
         str(o.get("ticker", "")).upper()
         for o in app_oca_orders
@@ -1550,17 +1590,12 @@ async def _collect_reconcile_data(
             ib_direction = str(ib_entry.get("direction", "")).upper()
             app_shares = int(float(app_entry.get("shares", 0) or 0))
             ib_shares = int(float(ib_entry.get("shares", 0) or 0))
-            if ticker in _round_tripped_today:
-                # Position opened AND closed today — IB may still show it residually.
-                # Treat as a same-day close; do not keep it in open positions.
-                status = "closed_offline"
-                reason = (
-                    f"{ticker} has both a buy and sell fill today — "
-                    "it was fully round-tripped this session. "
-                    "IB position data may be residual."
-                )
-                auto_actions.append({"ticker": ticker, "action": "confirm_closed"})
-            elif app_direction == ib_direction and app_shares == ib_shares:
+            # IB is the source of truth for open positions.  When IB reports a non-zero
+            # position matching the app record, the position IS open regardless of fill
+            # history.  Do NOT let the round-trip detection override a live IB position:
+            # a re-entry on the same day produces both BOT and SLD fills but the IB
+            # position reflects the current (new) entry, not a residual of the closed one.
+            if app_direction == ib_direction and app_shares == ib_shares:
                 status = "matched"
                 reason = f"App and IB both show {ticker} {app_direction} {app_shares} shares."
             else:
@@ -1703,6 +1738,13 @@ async def _persist_position_params_to_redis(
     Performs a diff-and-delete: after writing current params, removes any Redis
     hash fields for tickers that are no longer in engine memory (i.e. closed
     positions whose hdel may have been missed due to a crash or command path gap).
+
+    Safety rule: stale pruning is ONLY performed when the engine has at least one
+    position in memory.  If the engine shows zero params (e.g. a loading failure
+    after a crash), we skip pruning to avoid silently wiping persisted positions
+    that the engine hasn't loaded yet.  This preserves the invariant that
+    position:params can only shrink when IB confirms a close (via reconcile or
+    inflight callback), not due to an engine memory miss.
     """
     import json as _json  # noqa: PLC0415
     try:
@@ -1714,12 +1756,18 @@ async def _persist_position_params_to_redis(
         # should be removed.  This catches positions closed via commands (CLOSE_ALL,
         # CLOSE_TICKER) that skip the explicit hdel, or any path where the engine
         # forgets the position but hdel was not called.
-        redis_keys_raw = await redis.hkeys(_POSITION_PARAMS_KEY)
-        redis_keys = {(k.decode() if isinstance(k, bytes) else k) for k in redis_keys_raw}
-        stale = redis_keys - set(params or {})
-        if stale:
-            await redis.hdel(_POSITION_PARAMS_KEY, *stale)
-            logger.info("[PARAMS] Pruned %d stale ticker(s) from position:params: %s", len(stale), stale)
+        #
+        # Guard: only prune when engine params is non-empty.  An empty params dict
+        # from a freshly-loaded engine that lost its state would otherwise wipe all
+        # persisted positions.  If params is genuinely empty (all positions closed),
+        # the individual hdel calls in the close paths have already removed the keys.
+        if params:
+            redis_keys_raw = await redis.hkeys(_POSITION_PARAMS_KEY)
+            redis_keys = {(k.decode() if isinstance(k, bytes) else k) for k in redis_keys_raw}
+            stale = redis_keys - set(params)
+            if stale:
+                await redis.hdel(_POSITION_PARAMS_KEY, *stale)
+                logger.info("[PARAMS] Pruned %d stale ticker(s) from position:params: %s", len(stale), stale)
     except Exception as exc:
         logger.warning("[PARAMS] Failed to persist to Redis: %s", exc)
 
@@ -2110,13 +2158,33 @@ async def _reconcile_startup(
                     _fill_times[f"{sym}:{side}"] = fill_dt
                     _fill_sides.setdefault(sym, set()).add(side.upper())
 
-            # Detect round-trips: tickers with BOTH a buy fill AND a sell fill today.
-            # These positions were fully closed intra-session — don't re-adopt them.
+            # Detect round-trips: tickers with BOTH a buy fill AND a sell fill today
+            # where the CLOSE (SLD) fill is MORE RECENT than the ENTRY (BOT) fill.
+            # This correctly handles same-day re-entries: if a position was closed (SLD)
+            # earlier and then re-entered (BOT) later, both sides exist but the final
+            # state is an OPEN position — do NOT mark it as fully closed.
             for _sym, _sides in _fill_sides.items():
-                if "BOT" in _sides and "SLD" in _sides:
+                if "BOT" not in _sides or "SLD" not in _sides:
+                    continue
+                _bot_t = _fill_times.get(f"{_sym}:BOT")
+                _sld_t = _fill_times.get(f"{_sym}:SLD")
+                if _bot_t is None or _sld_t is None:
+                    # No timestamps — cannot determine ordering; assume NOT round-tripped (conservative)
+                    logger.debug("[SYNC] %s: BOT+SLD fills but missing timestamps — skipping round-trip mark", _sym)
+                    continue
+                if _sld_t > _bot_t:
+                    # Close happened after entry → genuine complete round-trip
                     _fully_closed_today.add(_sym)
+                else:
+                    # Entry is more recent than close → re-entered after earlier close;
+                    # current IB position is the NEW entry, not a stale residual
+                    logger.info(
+                        "[SYNC] %s: BOT+SLD fills today but BOT (%s) is newer than SLD (%s) — "
+                        "position was re-entered after close; NOT marking as fully-closed",
+                        _sym, _bot_t.isoformat(), _sld_t.isoformat(),
+                    )
             if _fully_closed_today:
-                logger.info("[SYNC] Detected fully-closed today (both BOT+SLD fills): %s", _fully_closed_today)
+                logger.info("[SYNC] Detected fully-closed today (SLD>BOT timestamps): %s", _fully_closed_today)
 
             # Step 2: classify by completed order type (most accurate); store fill time
             try:
@@ -3700,8 +3768,15 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
             if not ticker:
                 logger.warning("RECONCILE_DELETE_POSITION missing ticker in payload")
                 continue
+            # Require IB engine: positions must only be modified when IB is available
+            # so the deletion can be confirmed against live IB state (cancel open orders).
+            # Without this guard, the user could silently wipe app state while offline
+            # and leave an open IB position with no app tracking after reconnect.
+            if active_engine is None:
+                logger.warning("Command %s ignored — no IB engine available", cmd)
+                continue
             try:
-                if active_engine is not None and hasattr(active_engine, "_ib"):
+                if hasattr(active_engine, "_ib"):
                     from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
                     for trade in active_engine._ib.openTrades() or []:  # type: ignore[union-attr]
                         contract = getattr(trade, "contract", None)
@@ -3722,7 +3797,7 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 await _delete_hash_entries_for_ticker(redis, _FILL_SYNC_ALERTS_KEY, ticker)
                 await _delete_hash_entries_for_ticker(redis, _INFLIGHT_ENTRY_KEY, ticker)
                 await _delete_hash_entries_for_ticker(redis, _INFLIGHT_EXIT_KEY, ticker)
-                if active_engine is not None and hasattr(active_engine, "forget_position"):
+                if hasattr(active_engine, "forget_position"):
                     active_engine.forget_position(ticker)  # type: ignore[union-attr]
                 await _publish_execution_event(redis, "position_deleted", {
                     "ticker": ticker,
