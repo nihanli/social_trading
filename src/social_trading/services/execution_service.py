@@ -645,9 +645,14 @@ async def run_exit_loop(
     # Used to detect positions closed externally by IB between cycles.
     # Pre-seeded from startup positions so the first cycle can detect external closures
     # that happened while the service was offline (Fix 4).
+    # NOTE: only seed tickers that are in _sys_params (system-managed).  Orphaned IB
+    # positions (in IB but position:params deleted) must NOT enter _prev_open_tickers —
+    # they would appear in externally_closed on the first cycle and trigger false
+    # position_closed events even though the position is still open in IB.
     try:
         _initial_positions = await engine.get_positions()
-        _prev_open_tickers: set[str] = {p.ticker for p in _initial_positions}
+        _initial_sys_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}
+        _prev_open_tickers: set[str] = {p.ticker for p in _initial_positions if p.ticker in _initial_sys_params}
     except Exception:
         _prev_open_tickers = set()
     # Tracks the last trailing_stop_pct applied per ticker (for change detection).
@@ -687,6 +692,78 @@ async def run_exit_loop(
                             "[EXIT] Startup: restored %s to _pending_close (exits:inflight orderId=%s still active)",
                             _su_tkr, _su_oid,
                         )
+                        # Re-register fill callback so cleanup fires when the fill arrives.
+                        # The original callback was defined as a closure inside run_exit_loop
+                        # and is lost on restart.  Without re-registration, _pending_close
+                        # blocks _reconcile_external_closes forever and the position is
+                        # silently orphaned in app tracking after IB closes it.
+                        if hasattr(engine, "register_order_fill_callback"):
+                            _rs_oid    = _su_oid
+                            _rs_ticker = _su_tkr
+                            _rs_entry  = float(_su_d.get("entry_price", 0))
+                            _rs_shares = int(_su_d.get("shares", 0))
+                            _rs_dir    = _su_d.get("direction", "")
+
+                            async def _su_fill_cb(
+                                fill: float,
+                                _t:  str   = _rs_ticker,
+                                _oi: str   = _rs_oid,
+                                _en: float = _rs_entry,
+                                _sh: int   = _rs_shares,
+                                _dr: str   = _rs_dir,
+                            ) -> None:
+                                """Startup-restored fill callback for a persisted exits:inflight order."""
+                                logger.info(
+                                    "[EXIT] Startup fill confirmed: %s orderId=%s fill=%.4f",
+                                    _t, _oi, fill,
+                                )
+                                try:
+                                    # Read current position params from Redis — authoritative
+                                    # for the live position (may differ from stale inflight entry
+                                    # if a re-entry happened after the original close was submitted).
+                                    _cur: dict = {}
+                                    try:
+                                        _pr = await redis.hget(_POSITION_PARAMS_KEY, _t)
+                                        if _pr:
+                                            _cur = json.loads(_pr.decode() if isinstance(_pr, bytes) else _pr)
+                                    except Exception:
+                                        pass
+                                    _oa  = _cur.get("opened_at", datetime.now(UTC).isoformat())
+                                    if hasattr(engine, "forget_position"):
+                                        engine.forget_position(_t)
+                                    _pending_close.discard(_t)
+                                    await _publish_execution_event(redis, "position_closed", {
+                                        "ticker":      _t,
+                                        "exit_price":  fill,
+                                        "exit_reason": "IB_EXTERNAL",
+                                        "shares":      _cur.get("shares", _sh),
+                                        "direction":   _cur.get("direction", _dr),
+                                        "entry_price": _cur.get("entry_price", _en),
+                                        "closed_at":   datetime.now(UTC).isoformat(),
+                                        "opened_at":   _oa,
+                                        "mode":        mode,
+                                    })
+                                    await redis.hdel(_HWM_REDIS_KEY, _t)
+                                    await redis.hdel(_POSITION_PARAMS_KEY, _t)
+                                    await redis.hdel(_TRAIL_ORDERS_KEY, _t)
+                                    await redis.hdel(_INFLIGHT_EXIT_KEY, _oi)
+                                    POSITIONS_CLOSED.labels(reason="IB_EXTERNAL").inc()
+                                except Exception as _cbe:
+                                    logger.warning(
+                                        "[EXIT] Startup fill callback error for %s: %s", _t, _cbe,
+                                    )
+
+                            try:
+                                engine.register_order_fill_callback(int(_su_oid), _su_fill_cb)  # type: ignore[union-attr]
+                                logger.info(
+                                    "[EXIT] Startup: re-registered fill callback for %s orderId=%s",
+                                    _su_tkr, _su_oid,
+                                )
+                            except Exception as _reg_exc:
+                                logger.warning(
+                                    "[EXIT] Startup: could not re-register fill callback for %s: %s",
+                                    _su_tkr, _reg_exc,
+                                )
                 except Exception:
                     pass
     except Exception as _su_exc:
@@ -696,6 +773,16 @@ async def run_exit_loop(
     # reqPositionsAsync() periodically to prevent cache drift.
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
+
+    # Periodic inflight-order fill check.
+    # During market hours, poll IB fills every 5 minutes so that pending close
+    # orders (exits:inflight) are resolved even when fill callbacks are unavailable
+    # (e.g. after a service restart where callbacks are not re-registered).
+    # This is the fallback safety net on top of fill callbacks: if reqExecutionsAsync
+    # returns a fill for a tracked inflight order, _reconcile_inflight_orders cleans
+    # up the position and publishes position_closed.
+    _INFLIGHT_POLL_SECS = 300  # 5 minutes
+    _last_inflight_poll: float = 0.0
 
     # Record loop startup time so naked-position check can apply a grace period
     # while IB openOrder callbacks are still arriving after connect.
@@ -738,6 +825,30 @@ async def run_exit_loop(
                     logger.debug("[SYNC] IB position cache refreshed")
                 except Exception as exc:
                     logger.debug("[SYNC] IB position cache refresh failed: %s", exc)
+
+            # ── 1c. Periodic inflight-order fill poll ─────────────────────────
+            # Even without fill callbacks (e.g. after a service restart), we detect
+            # filled close/entry orders by querying IB's server-side execution log
+            # (reqExecutionsAsync).  Run every 5 minutes so _pending_close entries
+            # are resolved without waiting for a manual reconcile.
+            # Also covers AFTER-HOURS: MKT orders queued at EOD fill at next open.
+            if (now_ts - _last_inflight_poll) > _INFLIGHT_POLL_SECS and _connected:
+                try:
+                    _inf_keys = await redis.hkeys(_INFLIGHT_EXIT_KEY)
+                    _entry_inf_keys = await redis.hkeys(_INFLIGHT_ENTRY_KEY)
+                    if _inf_keys or _entry_inf_keys:
+                        _cur_tickers = {p.ticker for p in await engine.get_positions()}
+                        _ef, _xf = await _reconcile_inflight_orders(
+                            redis, engine, _cur_tickers, mode=mode,
+                        )
+                        if _ef or _xf:
+                            logger.info(
+                                "[SYNC] Periodic inflight poll: %d entry fix(es), %d exit fix(es)",
+                                _ef, _xf,
+                            )
+                    _last_inflight_poll = now_ts
+                except Exception as _ipoll_exc:
+                    logger.debug("[SYNC] Periodic inflight poll error: %s", _ipoll_exc)
 
             # Fetch VIX once per cycle (shared across all ticker snapshots)
             vix = await market_data.get_vix()
@@ -1063,6 +1174,7 @@ async def run_exit_loop(
                     just_closed=just_closed,
                     mode=mode,
                     pending_close=_pending_close,
+                    all_ib_tickers={p.ticker for p in all_ib_positions},
                 )
                 # Immediately remove externally-closed tickers from positions:live
                 # so the UI reflects the change without waiting for the next cycle.
@@ -2150,16 +2262,22 @@ async def _reconcile_startup(
         ib_obj = getattr(engine, "_ib", None)
         if ib_obj is not None:
             # Step 1: collect fill prices + timestamps from today's server-side executions
+            # An order may be split into multiple partial fills.  Accumulate
+            # shares × price per (sym, side) to compute a proper VWAP, and
+            # keep the LATEST fill timestamp (last partial completes the position).
             _fill_prices: dict[str, float] = {}
             _fill_times: dict[str, datetime | None] = {}   # sym:side → fill time (UTC)
             # Track which sides (BOT / SLD) were seen per ticker today
             _fill_sides: dict[str, set[str]] = {}
+            # Accumulators for VWAP: sym:side → (total_value, total_shares)
+            _fill_accum_startup: dict[str, tuple[float, float]] = {}
             from ib_async import ExecutionFilter  # noqa: PLC0415
             executions = await ib_obj.reqExecutionsAsync(ExecutionFilter())
             for fill in executions:
                 sym = getattr(getattr(fill, "contract", None), "symbol", "")
                 side = getattr(getattr(fill, "execution", None), "side", "")
                 price = getattr(getattr(fill, "execution", None), "price", 0.0)
+                qty   = float(getattr(getattr(fill, "execution", None), "shares", 0) or 0)
                 fill_time_raw = getattr(getattr(fill, "execution", None), "time", None)
                 fill_dt: datetime | None = None
                 if fill_time_raw:
@@ -2171,10 +2289,20 @@ async def _reconcile_startup(
                             fill_dt = _ft if _ft.tzinfo else _ft.replace(tzinfo=UTC)
                     except Exception:
                         pass
-                if sym and price:
-                    _fill_prices[f"{sym}:{side}"] = float(price)
-                    _fill_times[f"{sym}:{side}"] = fill_dt
+                if sym and price > 0:
+                    key = f"{sym}:{side}"
+                    # Accumulate for VWAP
+                    _pv, _ps = _fill_accum_startup.get(key, (0.0, 0.0))
+                    _fill_accum_startup[key] = (_pv + price * max(qty, 1.0), _ps + max(qty, 1.0))
+                    # Track latest fill time (last partial determines ordering)
+                    _prev_dt = _fill_times.get(key)
+                    if fill_dt is not None and (_prev_dt is None or fill_dt > _prev_dt):
+                        _fill_times[key] = fill_dt
+                    elif fill_dt is not None and key not in _fill_times:
+                        _fill_times[key] = fill_dt
                     _fill_sides.setdefault(sym, set()).add(side.upper())
+            # Compute VWAP for each sym:side
+            _fill_prices = {k: v / s for k, (v, s) in _fill_accum_startup.items() if s > 0}
 
             # Detect round-trips: tickers with BOTH a buy fill AND a sell fill today
             # where the CLOSE (SLD) fill is MORE RECENT than the ENTRY (BOT) fill.
@@ -2645,23 +2773,34 @@ async def _reconcile_inflight_orders(
 
     # ── Build fill price map from IB with retries ──────────────────────────────
     # Primary: reqExecutionsAsync — server-side fills for today's session.
-    # Fallback: reqCompletedOrdersAsync — completed orders (may include OCA legs).
+    #   An order may execute as multiple partial fills (same orderId, different
+    #   execIds).  Accumulate shares × price per orderId and compute VWAP.
+    # Fallback: reqCompletedOrdersAsync — avgFillPrice is IB's own VWAP across
+    #   all partials and is preferred over our manual accumulation when available.
     _all_fills: dict[int, float] = {}
     for _attempt in range(max_retries):
         try:
             from ib_async import ExecutionFilter as _EF  # noqa: PLC0415
+            # Accumulate partial fills: orderId → (total_value, total_shares)
+            _fill_accum: dict[int, tuple[float, float]] = {}
             for _f in await ib_obj.reqExecutionsAsync(_EF()):
                 _oid = getattr(getattr(_f, "execution", None), "orderId", 0)
                 _px  = getattr(getattr(_f, "execution", None), "price", 0.0)
-                if _oid and _px:
-                    _all_fills[int(_oid)] = float(_px)
-            # Supplement with avgFillPrice from completed orders
+                _sh  = float(getattr(getattr(_f, "execution", None), "shares", 0) or 0)
+                if _oid and _px > 0:
+                    _pv, _ps = _fill_accum.get(int(_oid), (0.0, 0.0))
+                    _fill_accum[int(_oid)] = (_pv + _px * max(_sh, 1.0), _ps + max(_sh, 1.0))
+            # Compute VWAP from accumulated partials
+            _all_fills = {oid: v / s for oid, (v, s) in _fill_accum.items() if s > 0}
+            # Override with avgFillPrice from completed orders — IB's own VWAP is
+            # more accurate than our manual accumulation (handles edge cases like
+            # lot-size rounding) and should be preferred when available.
             try:
                 for _co in (await ib_obj.reqCompletedOrdersAsync(apiOnly=False) or []):
                     _oid = getattr(getattr(_co, "order", None), "orderId", 0)
                     _px  = getattr(getattr(_co, "orderStatus", None), "avgFillPrice", 0.0)
-                    if _oid and _px:
-                        _all_fills.setdefault(int(_oid), float(_px))
+                    if _oid and _px > 0:
+                        _all_fills[int(_oid)] = float(_px)  # prefer IB's computed avg
             except Exception:
                 pass
             break  # success
@@ -3062,6 +3201,7 @@ async def _reconcile_external_closes(
     just_closed: set[str],
     mode: str = "live",
     pending_close: set[str] | None = None,
+    all_ib_tickers: set[str] | None = None,
 ) -> None:
     """
     Detect tickers that disappeared from IB positions without this service closing them.
@@ -3085,6 +3225,17 @@ async def _reconcile_external_closes(
     _excluded = just_closed | (pending_close or set()) | _cmd_closed
     externally_closed = prev_open - now_open - _excluded
     for ticker in externally_closed:
+        # Safety check: if IB still shows this position as open, it was NOT externally
+        # closed — params may have been deleted without a close (e.g. bug or manual edit).
+        # Skip cleanup and log a warning so the operator can run reconcile to re-adopt.
+        if all_ib_tickers is not None and ticker in all_ib_tickers:
+            logger.warning(
+                "[SYNC] %s appears in externally_closed but is still open in IB — "
+                "skipping cleanup to avoid false position_closed event; "
+                "run Reconcile to re-adopt this position",
+                ticker,
+            )
+            continue
         # Read params BEFORE cleanup so we can include them in the close event
         opened_at = datetime.now(UTC).isoformat()
         direction = "unknown"
@@ -3139,7 +3290,17 @@ async def _reconcile_external_closes(
                     ot = getattr(getattr(trade, "order", None), "orderType", "")
                     trade_fills = getattr(trade, "fills", [])
                     if trade_fills:
-                        exit_price = float(trade_fills[-1].execution.price)
+                        # Compute VWAP across all partial fills
+                        _tv = sum(
+                            float(getattr(getattr(f, "execution", None), "price", 0)) *
+                            max(float(getattr(getattr(f, "execution", None), "shares", 0) or 0), 1.0)
+                            for f in trade_fills
+                        )
+                        _tq = sum(
+                            max(float(getattr(getattr(f, "execution", None), "shares", 0) or 0), 1.0)
+                            for f in trade_fills
+                        )
+                        exit_price = _tv / _tq if _tq > 0 else float(trade_fills[-1].execution.price)
                     if ot in ("STP", "STP LMT"):
                         exit_reason = "STOP_LOSS"
                     elif ot == "LMT":
@@ -3159,8 +3320,17 @@ async def _reconcile_external_closes(
                         and getattr(getattr(f, "execution", None), "side", "") == close_side
                     ]
                     if fills:
-                        latest = max(fills, key=lambda f: getattr(f, "time", 0))
-                        exit_price = float(latest.execution.price)
+                        # Compute VWAP across all partial fills for this ticker+side
+                        _fv = sum(
+                            float(getattr(getattr(f, "execution", None), "price", 0)) *
+                            max(float(getattr(getattr(f, "execution", None), "shares", 0) or 0), 1.0)
+                            for f in fills
+                        )
+                        _fq = sum(
+                            max(float(getattr(getattr(f, "execution", None), "shares", 0) or 0), 1.0)
+                            for f in fills
+                        )
+                        exit_price = _fv / _fq if _fq > 0 else float(fills[-1].execution.price)
                         # Only classify against ATR SL / TP — avoid TRAILING_STOP
                         # as a catch-all since the trail level is not stored in params.
                         if stop_loss > 0 and take_profit > 0:
@@ -3183,13 +3353,19 @@ async def _reconcile_external_closes(
                     try:
                         from ib_async import ExecutionFilter  # noqa: PLC0415
                         executions = await ib_obj.reqExecutionsAsync(ExecutionFilter())
+                        # Accumulate partial fills for this ticker+close_side → VWAP
+                        _ev, _eq = 0.0, 0.0
                         for fill in executions:
                             sym = getattr(getattr(fill, "contract", None), "symbol", "")
                             side = getattr(getattr(fill, "execution", None), "side", "")
                             price = getattr(getattr(fill, "execution", None), "price", 0.0)
+                            qty   = float(getattr(getattr(fill, "execution", None), "shares", 0) or 0)
                             if sym != ticker or side != close_side or not price:
                                 continue
-                            exit_price = float(price)
+                            _ev += price * max(qty, 1.0)
+                            _eq += max(qty, 1.0)
+                        if _eq > 0:
+                            exit_price = _ev / _eq
                             # Also try to classify via order type from completed orders
                             try:
                                 completed = await ib_obj.reqCompletedOrdersAsync(apiOnly=False)
@@ -3212,7 +3388,6 @@ async def _reconcile_external_closes(
                                     break
                             except Exception:
                                 pass
-                            break
                         if exit_price > 0:
                             logger.info(
                                 "[SYNC] %s exit price recovered via reqExecutionsAsync: %.4f (%s)",
