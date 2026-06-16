@@ -28,6 +28,7 @@
 | 15 | [UI Monitoring — Grafana + Streamlit](15-ui-monitoring.md) |
 | 16 | [System Configuration — All Tunable Parameters](16-system-config.md) |
 | 17 | [Parameter Optimization & Continuous Improvement](17-parameter-optimization.md) |
+| 18 | [Execution Service Refactor — Periodic Reconcile Architecture](18-execution-reconcile-refactor.md) *(Proposed)* |
 
 ---
 

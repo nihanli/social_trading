@@ -25,7 +25,7 @@ All orders stamped with `orderRef = "social_trading"` so the system can identify
 
 ### 7b. Service Architecture
 
-The execution layer runs as a single async process (`execution_service.py`) with five concurrent asyncio tasks:
+The execution layer runs as a single async process (`execution_service.py`) with six concurrent asyncio tasks:
 
 | Task name | Purpose |
 |-----------|---------|
@@ -33,14 +33,14 @@ The execution layer runs as a single async process (`execution_service.py`) with
 | `exec:heartbeat` | Writes `service:heartbeat` and `ib:connected` to Redis every 10s |
 | `exec:cmd` | Redis pub/sub command listener (`trading:commands`) |
 | `exec:trade` | Consumes approved signals from `selected_signals` stream and submits orders |
-| `exec:exit` | Every 60s: evaluates exit rules for all open positions |
+| `exec:price_eval` | Every ~60s: evaluates exit rules for all open positions, updates trailing stops |
+| `exec:reconcile` | Every 60s: queries IB ground truth; auto-resolves all position/fill discrepancies |
 | `exec:price_push` | Every 5s: updates `unrealized_pnl` in `positions:live` from live IB portfolio feed |
 
-The `exec:trade` and `exec:exit` tasks are created/replaced by `exec:reconnect` on every IB connection session. The other three tasks run for the lifetime of the service.
+The `exec:trade`, `exec:price_eval`, and `exec:reconcile` tasks are created/replaced by `exec:reconnect` on every IB connection session. The other tasks run for the lifetime of the service.
 
 **Key global state:**
 - `_ACTIVE_ENGINE` — the current `IBKRExecutionEngine` instance; accessed by heartbeat and cmd tasks
-- `_RECONCILE_DONE[0]` — mutable flag, `True` after user approves reconcile for the current IB session
 - `_halt_flag` — asyncio.Event; set by `HALT_NEW` command, cleared by `RESUME`
 
 ---
@@ -51,14 +51,13 @@ The reconnect watcher is a **persistent daemon** (never returns) that owns 100% 
 
 ```
 Outer loop (runs forever):
-  1. Reset _RECONCILE_DONE[0] = False
-  2. Connect loop (retry every 30s until success):
+  1. Connect loop (retry every 30s until success):
        ib.connectAsync() → reqPositionsAsync() → reqAccountUpdatesAsync()
-  3. _initialize_connected_runtime() — full blocking reconcile (see §7f)
-  4. Start/replace exec:trade, exec:exit, exec:price_push tasks
-  5. Inner monitor loop (check ib.isConnected() every 15s):
+  2. _initialize_connected_runtime() — runs _reconcile_ib_state() immediately (see §7f)
+  3. Start/replace exec:trade, exec:price_eval, exec:reconcile, exec:price_push tasks
+  4. Inner monitor loop (check ib.isConnected() every 15s):
        On disconnect → break inner loop
-  6. ib.disconnect(), cancel tasks, restart outer loop
+  5. ib.disconnect(), cancel tasks, restart outer loop
 ```
 
 This guarantees that **every IB connection session** (startup or mid-session reconnect after a TWS restart or network drop) always runs a full reconcile before any trading resumes.
@@ -81,7 +80,7 @@ Called by `run_trade_loop` for each approved signal. Full sequence:
 
 **Step 1 — Guard checks (in trade loop before calling engine):**
 - Market hours: skip if NYSE is closed
-- Reconcile state: block if `reconcile:state == "awaiting_approval"`
+- Reconcile conflicts: block if `reconcile:conflicts` is non-empty (unresolved conflicts halt new entries)
 - Halt flag: skip if `_halt_flag` is set
 - Duplicate position: three-layer check — IB cache → engine `_position_params` → Redis `position:params`
 - Signal expiry: discard if `hours_elapsed > cfg.signal_age_max_hours`
@@ -120,11 +119,11 @@ All three use `ocaGroup = f"oca_{entry_order_id}"` and `ocaType=1` (cancel sibli
 - `trades:recent` (Redis list, max 1000): last 1000 trades for UI
 
 **Async entry fill tracking:**
-If fill price was not known at submission (slow paper fill), a fill callback is registered on the IB `Trade` object. When the fill arrives, it corrects `entry_price` in both `position:params` and `positions:live`, and publishes a `position_entry_updated` event for DB correction. The pending entry is tracked in `orders:inflight` (Redis hash) with a TTL.
+If fill price was not known at submission (slow paper fill), `_reconcile_ib_state()` corrects `entry_price` on the next 60-second reconcile cycle via the `fill_pending` state. The pending entry is tracked in `orders:inflight` (Redis hash) as a fallback until reconcile picks it up.
 
 ---
 
-### 7e. Exit Loop (`run_exit_loop`)
+### 7e. Price Eval Loop (`run_price_eval_loop`)
 
 Runs every `cfg.signal_poll_interval_sec` (default 60s). Full cycle:
 
@@ -156,61 +155,60 @@ Before exit evaluation, detects positions with no live STP or TRAIL orders in IB
 
 **Mention-decay trail tightening (Rule 6):** When `mention_ratio < cfg.mention_decay_threshold`, `_effective_trailing_pct()` linearly tightens the trail percentage based on how far below threshold. The tightened trail is passed to the exit manager via a `dataclasses.replace(cfg)` copy — the base config is never mutated. If tightening changes the pct, `update_trailing_stop()` is called to replace the live TRAIL order anchored from HWM.
 
-**Pending close guard:** Positions with a close order submitted but not yet fill-confirmed (`_pending_close` set) are skipped during exit evaluation to prevent duplicate orders.
+**Pending close guard:** Positions with a close order submitted but not yet fill-confirmed (`_closing_tickers` in-memory set) are skipped during exit evaluation to prevent duplicate orders.
 
 **6. Position close (`close_position`):**
 - Cancels all open bracket orders for the ticker (filtered by `orderRef`)
 - Submits a market close order
 - Waits 0.5s for immediate fill
 - If fill confirmed immediately: cleans up `position:params`, `hwm`, `trail:orders`, publishes `position_closed` event, writes trade to DB
-- If fill pending: adds ticker to `_pending_close`, registers fill callback, writes to `exits:inflight` (persisted across restarts)
+- If fill pending: adds ticker to `_closing_tickers` (in-memory); `run_reconcile_loop` detects fill via `closed_offline` state on the next 60s cycle
 
-**Deferred close (after-hours):** If close is triggered outside NYSE hours (`allow_after_hours=False`), the close is deferred to the `exits:deferred` Redis set. At next market open, deferred closes are submitted.
-
-**7. External close detection (`_reconcile_external_closes`):**
-Each cycle compares the current IB position set against the previous cycle's set. Tickers that disappeared from IB (bracket fill or manual TWS close) generate a `position_closed` event. The `positions:cmd_closed` Redis set (120s TTL) is checked first — tickers the software just closed are excluded to prevent double-close events.
-
-**8. Persistence:** After each cycle, writes `position:params` and HWM to Redis; writes `account:state` to Redis hash.
+**7. Persistence:** After each cycle, writes `position:params` and HWM to Redis; writes `account:state` to Redis hash.
 
 ---
 
-### 7f. Startup Reconcile (`_reconcile_startup` + `_initialize_connected_runtime`)
+### 7f. Reconcile Loop (`run_reconcile_loop` + `_reconcile_ib_state`)
 
-Runs on every IB connection session (first connect or any reconnect). Blocks `exec:trade` and `exec:exit` until the user approves or skips.
+Runs every 60 seconds when IB is connected. Replaces the old blocking startup reconcile and inflight-order polling. When IB is disconnected the loop skips entirely — app state is frozen (read-only).
 
-**Phase 1 — Data collection (`_collect_reconcile_data`):**
-- Fetches `position:params` from Redis (app state)
-- Fetches live positions from IB (`reqPositionsAsync`)
-- Fetches today's execution history from IB (`reqExecutionsAsync`)
-- Fetches completed orders from IB (`reqCompletedOrdersAsync`)
-- Builds a snapshot including: match status, fill prices, open orders, OCA groups
+**`_reconcile_ib_state()` — per cycle:**
+1. Refreshes IB position cache (`reqPositionsAsync`) and open orders (`reqAllOpenOrders`)
+2. Fetches fills (`reqExecutionsAsync`), completed orders (`reqCompletedOrdersAsync`), and all open trades
+3. Classifies every tracked ticker into one of 9 states:
 
-**Phase 2 — Snapshot persistence:**
-Writes to Redis key `reconcile:data` and sets `reconcile:state = "awaiting_approval"`. The UI reads these keys and blocks on the reconcile screen.
+| State | Condition | Resolved |
+|-------|-----------|---------|
+| `matched` | IB ✓, app ✓, direction + shares agree | Sync entry_price/shares if needed |
+| `fill_pending` | matched, `entry_price=0` | Look up fill VWAP, update params |
+| `naked` | matched, no STP/TRAIL orders | `_check_naked_positions()` — reattach or close |
+| `shares_synced` | matched, share count differs | IB is source of truth; app params updated |
+| `adopted` | IB ✓, app ✗, system orderRef | Seed params + OCA; publish `position_opened` |
+| `manual_ib` | IB ✓, app ✗, no system orderRef | Log only; no action |
+| `closed_offline` | IB ✗, app ✓, close fill found | Publish `position_closed`; clean up params |
+| `missing` | IB ✗, app ✓, no fill | **Conflict** — writes to `reconcile:conflicts`; halts trade loop |
+| `direction_mismatch` | IB/app direction differ | **Conflict** — writes to `reconcile:conflicts`; halts trade loop |
 
-**Phase 3 — Match classification (one per tracked ticker):**
+4. Writes `reconcile:conflicts` hash — non-empty halts the trade loop (new entries blocked)
+5. Writes `reconcile:full` JSON snapshot (UI display) and `reconcile:last_run` timestamp
+6. Refreshes `positions:live`
 
-| Status | Condition | Action on Approve |
-|--------|-----------|-------------------|
-| `matched` | App and IB agree | None |
-| `shares_mismatch` | Share count differs | IB is source of truth; app params updated |
-| `closed_offline` | In app but not IB; fill record found | `position_closed` event published, params cleaned |
-| `pending_manual` | In app but not IB; no fill record | Moved to `positions:pending_reconcile` for manual review |
-| `adopted` | In IB but not app; system orderRef | `seed_position_params` from ATR; `position_opened` event |
-| `manual_ib` | In IB but not app; no system orderRef | Ignored (user's own position) |
+**Conflict resolution (`RESOLVE_CONFLICT` command):**
+- `mark_closed` — treat app position as closed (no fill price); publish `position_closed`
+- `remove_app` — silently remove from app state (no event)
+- `use_ib_direction` — override app direction with IB's direction
+- All actions clear the ticker from `reconcile:conflicts`, unblocking the trade loop
 
-**Orphaned pending entry orders:** If IB has a still-pending MKT order that is not tracked in app state, it is cancelled to prevent an unprotected fill from opening a ghost position.
+**First run on IB connect:** `_initialize_connected_runtime()` calls `_reconcile_ib_state()` directly (no approval gate). Conflicts halt the trade loop immediately but do not prevent the service from starting.
 
-**Inflight order reconciliation (`_reconcile_inflight_orders`):**
-Runs as part of every reconcile. Fetches IB execution history and matches against `orders:inflight` and `exits:inflight` Redis ledgers:
-- Entry fills: corrects `entry_price=0` in params and DB
-- Exit fills: completes pending close events, removes from `exits:inflight`
-- Unresolvable after 3 retries: writes to `alerts:fill_sync` for manual UI action
+**UI command changes vs. old reconcile flow:**
 
-**User actions during reconcile:**
-- **Approve** (`RECONCILE_APPROVE`): processes all match statuses, runs `_reconcile_startup` for adopted positions, unblocks trading
-- **Skip** (`RECONCILE_SKIP`): unblocks trading without reviewing; still runs inflight fill recovery
-- **Delete position** (`RECONCILE_DELETE_POSITION`): removes all Redis/in-memory state for a ticker; cancels any open IB orders; publishes `position_deleted` event
+| Command | Status | Notes |
+|---|---|---|
+| `FULL_RECONCILE` | Kept | Now calls `_reconcile_ib_state()` directly |
+| `RECONCILE_APPROVE` | Legacy no-op | Reconcile is now automatic |
+| `RECONCILE_SKIP` | Legacy no-op | No approval gate in new flow |
+| `RESOLVE_CONFLICT {ticker} {action}` | **New** | Resolves a conflict; clears from `reconcile:conflicts` |
 
 ---
 

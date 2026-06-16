@@ -187,9 +187,56 @@ def resolve_pending_position(ticker: str, action: str) -> None:
         send_command("RESOLVE_PENDING_DELETE", {"ticker": ticker.upper()})
 
 
-def trigger_full_reconcile() -> None:
-    """Ask the execution service to re-run the full startup reconcile on demand."""
+def get_reconcile_full() -> dict:
+    """Return full reconcile snapshot from reconcile:full (written by _reconcile_ib_state)."""
+    r = _get_redis()
+    try:
+        raw = r.get("reconcile:full")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+
+
+def get_reconcile_last_run() -> str:
+    """Return ISO timestamp of last successful reconcile, or empty string."""
+    r = _get_redis()
+    try:
+        v = r.get("reconcile:last_run")
+        return v or ""
+    except Exception:
+        return ""
+
+
+def get_reconcile_conflicts() -> dict[str, dict]:
+    """Return active reconcile conflicts as {ticker: conflict_data}."""
+    r = _get_redis()
+    result: dict[str, dict] = {}
+    try:
+        raw = r.hgetall("reconcile:conflicts") or {}
+        for k, v in raw.items():
+            try:
+                result[k] = json.loads(v)
+            except Exception:
+                result[k] = {"state": "unknown", "reason": str(v)}
+    except Exception:
+        pass
+    return result
+
+
+def resolve_conflict(ticker: str, action: str) -> None:
+    """Send RESOLVE_CONFLICT command: action = mark_closed | remove_app | use_ib_direction."""
+    send_command("RESOLVE_CONFLICT", {"ticker": ticker.upper(), "action": action})
+
+
+def trigger_reconcile_now() -> None:
+    """Trigger an immediate reconcile cycle via FULL_RECONCILE command."""
     send_command("FULL_RECONCILE")
+
+
+# Backward-compatible alias used by older pages
+trigger_full_reconcile = trigger_reconcile_now
 
 
 def get_reconcile_state() -> str:
