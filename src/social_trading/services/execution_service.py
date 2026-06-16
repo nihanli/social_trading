@@ -550,46 +550,108 @@ async def run_trade_loop(
                                             "direction": signal.direction,
                                             "quantity": quantity,
                                             "opened_at": _entry_opened_at,
+                                            # Store sl/tp so params can be reconstructed
+                                            # if they are deleted before the fill arrives
+                                            # (e.g. by a reconcile cycle between pre-market
+                                            # order submission and market-open fill).
+                                            "stop_loss": stop_loss,
+                                            "take_profit": take_profit,
+                                            "mode": mode,
                                         }),
                                     )
                                     await redis.expire(_INFLIGHT_ENTRY_KEY, _INFLIGHT_TTL_SEC)
                                 except Exception as _inf_exc:
                                     logger.debug("[EXEC] Failed to write inflight entry for %s: %s", _entry_ticker, _inf_exc)
 
-                                async def _on_entry_fill_async(
-                                    actual_fill: float,
-                                    _t: str = _entry_ticker,
-                                    _oa: str = _entry_opened_at,
-                                    _oid: str = str(_entry_order_id),
-                                ) -> None:
-                                    logger.info("[EXEC] Async entry fill received for %s: %.4f (orderId=%s)", _t, actual_fill, _oid)
-                                    try:
-                                        # Correct Redis position:params entry_price
-                                        _pr = await redis.hget(_POSITION_PARAMS_KEY, _t)
-                                        if _pr:
-                                            _pd = json.loads(_pr.decode() if isinstance(_pr, bytes) else _pr)
-                                            if _pd.get("entry_price", 0) == 0:
-                                                _pd["entry_price"] = actual_fill
-                                                await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps(_pd))
-                                        # Correct positions:live entry_price
-                                        _lr = await redis.hget(_POSITIONS_LIVE_KEY, _t)
-                                        if _lr:
-                                            _ld = json.loads(_lr.decode() if isinstance(_lr, bytes) else _lr)
-                                            if _ld.get("entry_price", 0) == 0:
-                                                _ld["entry_price"] = actual_fill
-                                                _ld["high_water_mark"] = max(actual_fill, _ld.get("high_water_mark") or 0)
-                                                await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps(_ld))
-                                        # Publish DB correction event
-                                        await _publish_execution_event(redis, "position_entry_updated", {
-                                            "ticker": _t,
-                                            "entry_price": actual_fill,
+                            async def _on_entry_fill_async(
+                                actual_fill: float,
+                                _t: str = _entry_ticker,
+                                _oa: str = _entry_opened_at,
+                                _oid: str = str(_entry_order_id),
+                                _dir: str = signal.direction,
+                                _qty: int = quantity,
+                                _sl: float = stop_loss,
+                                _tp: float = take_profit,
+                                _md: str = mode,
+                            ) -> None:
+                                logger.info("[EXEC] Async entry fill received for %s: %.4f (orderId=%s)", _t, actual_fill, _oid)
+                                try:
+                                    # Correct Redis position:params entry_price.
+                                    # If params were deleted (e.g. by reconcile between
+                                    # pre-market submission and market-open fill), reconstruct
+                                    # them here so the exit loop can track the position.
+                                    _pr = await redis.hget(_POSITION_PARAMS_KEY, _t)
+                                    if _pr:
+                                        _pd = json.loads(_pr.decode() if isinstance(_pr, bytes) else _pr)
+                                        if _pd.get("entry_price", 0) == 0:
+                                            _pd["entry_price"] = actual_fill
+                                            await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps(_pd))
+                                    else:
+                                        # params were deleted — reconstruct from closure values
+                                        # so the exit loop can monitor this position.
+                                        logger.warning(
+                                            "[EXEC] %s: position:params missing at fill time — "
+                                            "reconstructing from inflight data (sl=%.4f tp=%.4f)",
+                                            _t, _sl, _tp,
+                                        )
+                                        _pd = {
+                                            "stop_loss": _sl,
+                                            "take_profit": _tp,
                                             "opened_at": _oa,
-                                            "order_id": _oid,
+                                            "direction": _dir,
+                                            "source": "system",
+                                            "entry_price": actual_fill,
+                                            "shares": _qty,
+                                        }
+                                        await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps(_pd))
+                                        # Also seed positions:live so the UI shows this position
+                                        await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps({
+                                            "ticker": _t,
+                                            "direction": _dir,
+                                            "shares": _qty,
+                                            "entry_price": actual_fill,
+                                            "stop_loss": _sl,
+                                            "take_profit": _tp,
+                                            "unrealized_pnl": 0.0,
+                                            "high_water_mark": actual_fill,
+                                            "opened_at": _oa,
+                                            "source": "system",
+                                        }))
+                                        # Publish position_opened so the DB service records
+                                        # this trade and the signal is marked as executed.
+                                        await _publish_execution_event(redis, "position_opened", {
+                                            "ticker": _t,
+                                            "direction": _dir,
+                                            "shares": _qty,
+                                            "entry_price": actual_fill,
+                                            "stop_loss": _sl,
+                                            "take_profit": _tp,
+                                            "opened_at": _oa,
+                                            "mode": _md,
                                         })
-                                        # Remove from inflight ledger
-                                        await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid)
-                                    except Exception as _cb_exc:
-                                        logger.warning("[EXEC] Error in entry fill callback for %s: %s", _t, _cb_exc)
+                                        logger.warning(
+                                            "[EXEC] %s: position_opened published from delayed fill (params reconstructed)",
+                                            _t,
+                                        )
+                                    # Correct positions:live entry_price when params existed
+                                    _lr = await redis.hget(_POSITIONS_LIVE_KEY, _t)
+                                    if _lr:
+                                        _ld = json.loads(_lr.decode() if isinstance(_lr, bytes) else _lr)
+                                        if _ld.get("entry_price", 0) == 0:
+                                            _ld["entry_price"] = actual_fill
+                                            _ld["high_water_mark"] = max(actual_fill, _ld.get("high_water_mark") or 0)
+                                            await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps(_ld))
+                                    # Publish DB correction event (corrects entry_price=0 if params existed)
+                                    await _publish_execution_event(redis, "position_entry_updated", {
+                                        "ticker": _t,
+                                        "entry_price": actual_fill,
+                                        "opened_at": _oa,
+                                        "order_id": _oid,
+                                    })
+                                    # Remove from inflight ledger
+                                    await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid)
+                                except Exception as _cb_exc:
+                                    logger.warning("[EXEC] Error in entry fill callback for %s: %s", _t, _cb_exc)
 
                                 engine.register_order_fill_callback(_entry_order_id, _on_entry_fill_async)  # type: ignore[union-attr]
                     else:
@@ -769,8 +831,120 @@ async def run_exit_loop(
     except Exception as _su_exc:
         logger.debug("[EXIT] Could not seed _pending_close from exits:inflight at startup: %s", _su_exc)
 
-    # Track when the IB position cache was last refreshed so we can force a
-    # reqPositionsAsync() periodically to prevent cache drift.
+    # Re-register entry fill callbacks for pre-market pending orders.
+    # When the service restarts while an entry MKT order is queued in IB (e.g.
+    # submitted pre-market, waiting for regular-hours fill), the in-memory
+    # callback is lost.  Re-register here so the fill is captured correctly.
+    # We only re-register for orders still active in IB openTrades; completed
+    # fills are picked up by _reconcile_inflight_orders / periodic poll instead.
+    try:
+        _startup_inf_entry = await redis.hgetall(_INFLIGHT_ENTRY_KEY)
+        if _startup_inf_entry and hasattr(engine, "_ib") and hasattr(engine, "register_order_fill_callback"):
+            from social_trading.execution.ibkr import ORDER_REF as _SU_ENTRY_ORD_REF  # noqa: PLC0415
+            _startup_entry_active_oids: dict[int, str] = {}
+            try:
+                for _t_e in (engine._ib.openTrades() if hasattr(engine, "_ib") else []):  # type: ignore[union-attr]
+                    _oid_e = int(getattr(getattr(_t_e, "order", None), "orderId", 0))
+                    _ref_e = getattr(getattr(_t_e, "order", None), "orderRef", "")
+                    _ot_e  = getattr(getattr(_t_e, "order", None), "orderType", "")
+                    _st_e  = getattr(getattr(_t_e, "orderStatus", None), "status", "")
+                    _sym_e = getattr(getattr(_t_e, "contract", None), "symbol", "")
+                    if _oid_e and _ref_e == _SU_ENTRY_ORD_REF and _ot_e == "MKT":
+                        _startup_entry_active_oids[_oid_e] = _sym_e
+            except Exception:
+                pass
+
+            for _se_k, _se_v in _startup_inf_entry.items():
+                _se_oid = _se_k.decode() if isinstance(_se_k, bytes) else str(_se_k)
+                try:
+                    _se_d   = json.loads(_se_v.decode() if isinstance(_se_v, bytes) else _se_v)
+                    _se_tkr = _se_d.get("ticker", "")
+                    _se_oa  = _se_d.get("opened_at", "")
+                    _se_dir = _se_d.get("direction", "")
+                    _se_qty = int(_se_d.get("quantity", 0) or 0)
+                    _se_sl  = float(_se_d.get("stop_loss", 0) or 0)
+                    _se_tp  = float(_se_d.get("take_profit", 0) or 0)
+                    _se_md  = str(_se_d.get("mode", "live") or "live")
+                    if not _se_tkr or int(_se_oid) not in _startup_entry_active_oids:
+                        continue
+
+                    logger.info(
+                        "[EXIT] Startup: re-registering entry fill callback for %s orderId=%s (pre-market pending)",
+                        _se_tkr, _se_oid,
+                    )
+
+                    async def _su_entry_fill_cb(
+                        fill: float,
+                        _t:   str   = _se_tkr,
+                        _oi:  str   = _se_oid,
+                        _oa:  str   = _se_oa,
+                        _dir: str   = _se_dir,
+                        _qty: int   = _se_qty,
+                        _sl:  float = _se_sl,
+                        _tp:  float = _se_tp,
+                        _md:  str   = _se_md,
+                    ) -> None:
+                        """Startup-restored fill callback for a persisted orders:inflight entry."""
+                        logger.info("[EXIT] Startup entry fill confirmed: %s orderId=%s fill=%.4f", _t, _oi, fill)
+                        try:
+                            _pr_su = await redis.hget(_POSITION_PARAMS_KEY, _t)
+                            if _pr_su:
+                                _pd_su = json.loads(_pr_su.decode() if isinstance(_pr_su, bytes) else _pr_su)
+                                if _pd_su.get("entry_price", 0) == 0:
+                                    _pd_su["entry_price"] = fill
+                                    await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps(_pd_su))
+                            else:
+                                # params deleted before fill — reconstruct
+                                logger.warning(
+                                    "[EXIT] %s: params missing at startup entry fill — reconstructing",
+                                    _t,
+                                )
+                                await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps({
+                                    "stop_loss": _sl, "take_profit": _tp,
+                                    "opened_at": _oa, "direction": _dir,
+                                    "source": "system", "entry_price": fill, "shares": _qty,
+                                }))
+                                await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps({
+                                    "ticker": _t, "direction": _dir, "shares": _qty,
+                                    "entry_price": fill, "stop_loss": _sl, "take_profit": _tp,
+                                    "unrealized_pnl": 0.0, "high_water_mark": fill,
+                                    "opened_at": _oa, "source": "system",
+                                }))
+                                await _publish_execution_event(redis, "position_opened", {
+                                    "ticker": _t, "direction": _dir, "shares": _qty,
+                                    "entry_price": fill, "stop_loss": _sl, "take_profit": _tp,
+                                    "opened_at": _oa, "mode": _md,
+                                })
+                            _lr_su = await redis.hget(_POSITIONS_LIVE_KEY, _t)
+                            if _lr_su:
+                                _ld_su = json.loads(_lr_su.decode() if isinstance(_lr_su, bytes) else _lr_su)
+                                if _ld_su.get("entry_price", 0) == 0:
+                                    _ld_su["entry_price"] = fill
+                                    _ld_su["high_water_mark"] = max(fill, _ld_su.get("high_water_mark") or 0)
+                                    await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps(_ld_su))
+                            await _publish_execution_event(redis, "position_entry_updated", {
+                                "ticker": _t, "entry_price": fill,
+                                "opened_at": _oa, "order_id": _oi,
+                            })
+                            await redis.hdel(_INFLIGHT_ENTRY_KEY, _oi)
+                        except Exception as _se_cb_exc:
+                            logger.warning("[EXIT] Startup entry fill callback error for %s: %s", _t, _se_cb_exc)
+
+                    try:
+                        engine.register_order_fill_callback(int(_se_oid), _su_entry_fill_cb)  # type: ignore[union-attr]
+                        logger.info(
+                            "[EXIT] Startup: re-registered entry fill callback for %s orderId=%s",
+                            _se_tkr, _se_oid,
+                        )
+                    except Exception as _se_reg_exc:
+                        logger.warning(
+                            "[EXIT] Startup: could not re-register entry fill callback for %s: %s",
+                            _se_tkr, _se_reg_exc,
+                        )
+                except Exception:
+                    pass
+    except Exception as _su_entry_exc:
+        logger.debug("[EXIT] Could not re-register entry fill callbacks at startup: %s", _su_entry_exc)
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
 
@@ -2197,6 +2371,91 @@ async def _check_naked_positions(
     return just_closed, just_reattached
 
 
+async def _close_adopted_no_oca(
+    redis: "aioredis.Redis",
+    engine: "ExecutionEngine",
+    ticker: str,
+    direction: str,
+    entry_price: float,
+    shares: int,
+    opened_at: str,
+    mode: str,
+) -> None:
+    """Close an adopted system position that cannot be protected with OCA orders.
+
+    Submits a market close order and writes the orderId to exits:inflight so the
+    periodic inflight poll can detect the fill and publish position_closed + clean
+    up all tracking keys.  For immediate fills the event is published inline.
+
+    This helper must only be called for positions opened by this system (source=system)
+    — manual IB positions are never adopted and never reach this path.
+    """
+    logger.error(
+        "[SYNC] %s: adopted position has no OCA protection — closing for safety "
+        "(sl/tp unavailable; direction=%s entry=%.4f shares=%d)",
+        ticker, direction, entry_price, shares,
+    )
+    current_price = engine.get_price(ticker) or entry_price  # type: ignore[union-attr]
+    result = None
+    try:
+        result = await engine.close_position(ticker, reason="NO_OCA_ON_ADOPT")  # type: ignore[union-attr]
+    except Exception as exc:
+        logger.error("[SYNC] %s: close_position failed during adoption cleanup: %s", ticker, exc)
+        return
+
+    if result is None or result.status == "rejected":
+        logger.warning("[SYNC] %s: close_position returned rejected/None — position may be already flat", ticker)
+        # Clean up Redis params regardless so the exit loop doesn't track a ghost
+        await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        await redis.hdel(_HWM_REDIS_KEY, ticker)
+        await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
+        return
+
+    fill_price = result.fill_price or 0.0
+
+    if fill_price > 0:
+        # Immediate fill — publish closed event and wipe all tracking keys
+        await _publish_execution_event(redis, "position_closed", {
+            "ticker": ticker,
+            "exit_price": fill_price,
+            "exit_reason": "NO_OCA_ON_ADOPT",
+            "shares": shares,
+            "direction": direction,
+            "entry_price": entry_price,
+            "closed_at": datetime.now(UTC).isoformat(),
+            "opened_at": opened_at,
+            "mode": mode,
+        })
+        await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+        await redis.hdel(_HWM_REDIS_KEY, ticker)
+        await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
+        logger.warning("[SYNC] %s: closed immediately (fill=%.4f) — all tracking keys removed", ticker, fill_price)
+    else:
+        # Deferred fill — write to exits:inflight so the periodic poll tracks it.
+        # The params written before this call are intentionally kept in Redis until
+        # the fill confirmation arrives via _reconcile_inflight_orders.
+        order_id = str(result.order_id) if result.order_id else ""
+        if order_id:
+            await redis.hset(_INFLIGHT_EXIT_KEY, order_id, json.dumps({
+                "ticker": ticker,
+                "direction": direction,
+                "entry_price": entry_price,
+                "shares": shares,
+                "provisional_exit": current_price,
+                "opened_at": opened_at,
+            }))
+            await redis.expire(_INFLIGHT_EXIT_KEY, _INFLIGHT_TTL_SEC)
+            logger.warning(
+                "[SYNC] %s: MKT close submitted (deferred fill, orderId=%s) — "
+                "exits:inflight written; periodic poll will publish position_closed on fill",
+                ticker, order_id,
+            )
+        else:
+            logger.warning("[SYNC] %s: close submitted but no orderId — cannot write exits:inflight; "
+                           "manual intervention may be required", ticker)
+
+
+
 async def _reconcile_startup(
     redis: aioredis.Redis,
     engine: ExecutionEngine,
@@ -2688,6 +2947,55 @@ async def _reconcile_startup(
                 "[SYNC] %s: prior-session system position — seeded sl=%.2f tp=%.2f from ATR=%.4f oca_group=%r",
                 pos.ticker, stop_loss, take_profit, atr, seeded_params["oca_group"],
             )
+            # If the position has no live OCA bracket (no open STP/TRAIL orders),
+            # submit one now rather than waiting for the next exit-loop cycle.
+            # This satisfies the requirement that app-submitted adopted positions
+            # must always have IB-side risk protection immediately after adoption.
+            if not seeded_params["oca_group"] and hasattr(engine, "reattach_oca_orders"):
+                _ra_ok = False
+                try:
+                    _ra_ok = await engine.reattach_oca_orders(  # type: ignore[union-attr]
+                        ticker=pos.ticker,
+                        direction=pos.direction,
+                        quantity=pos.shares,
+                        current_price=pos.entry_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        trailing_stop_pct=cfg.trailing_stop_pct,
+                    )
+                except Exception as _roa_exc:
+                    logger.error("[SYNC] %s: OCA reattach exception during adoption: %s", pos.ticker, _roa_exc)
+                if _ra_ok:
+                    # Persist the new OCA group and TRAIL order ID so the exit loop
+                    # and any restart within this cycle has the full bracket context.
+                    if hasattr(engine, "_position_params") and pos.ticker in engine._position_params:  # type: ignore[union-attr]
+                        _new_ocag = engine._position_params[pos.ticker].get("oca_group", "")  # type: ignore[union-attr]
+                        if _new_ocag:
+                            seeded_params["oca_group"] = _new_ocag
+                    await redis.hset(_POSITION_PARAMS_KEY, pos.ticker, json.dumps(seeded_params))
+                    if hasattr(engine, "_ts_order_id") and pos.ticker in engine._ts_order_id:  # type: ignore[union-attr]
+                        await redis.hset(_TRAIL_ORDERS_KEY, pos.ticker, str(engine._ts_order_id[pos.ticker]))  # type: ignore[union-attr]
+                    logger.warning(
+                        "[SYNC] %s: OCA bracket submitted during adoption — sl=%.4f tp=%.4f",
+                        pos.ticker, stop_loss, take_profit,
+                    )
+                else:
+                    # Reattach failed — close the position to avoid running unprotected.
+                    # _close_adopted_no_oca writes exits:inflight for deferred fills and
+                    # publishes position_closed for immediate fills.
+                    logger.error(
+                        "[SYNC] %s: OCA reattach failed during adoption — closing for safety",
+                        pos.ticker,
+                    )
+                    await _close_adopted_no_oca(
+                        redis, engine,
+                        ticker=pos.ticker,
+                        direction=pos.direction,
+                        entry_price=pos.entry_price,
+                        shares=pos.shares,
+                        opened_at=seeded_params["opened_at"],
+                        mode=mode,
+                    )
         else:
             # Fix 2: Before closing, check whether IB still has live bracket orders
             # protecting this position.  If yes, let IB handle stops and defer to the
@@ -2727,16 +3035,30 @@ async def _reconcile_startup(
                     pos.ticker, seeded_params["oca_group"],
                 )
             else:
-                # Truly unprotected (no ATR, no IB bracket) — close immediately.
-                logger.error(
-                    "[SYNC] %s: prior-session system position with no ATR and no IB bracket — "
-                    "closing to avoid running unprotected",
-                    pos.ticker,
+                # Truly unprotected (no ATR, no IB bracket) — must close.
+                # Seed minimal params first so exits:inflight processing has
+                # context (opened_at / direction / entry_price) when the fill arrives.
+                seeded_params = {
+                    "stop_loss": 0.0,
+                    "take_profit": 0.0,
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
+                    "direction": pos.direction,
+                    "source": "system",
+                    "entry_price": pos.entry_price,
+                    "shares": pos.shares,
+                    "oca_group": "",
+                }
+                engine.seed_position_params(pos.ticker, seeded_params)  # type: ignore[union-attr]
+                await redis.hset(_POSITION_PARAMS_KEY, pos.ticker, json.dumps(seeded_params))
+                await _close_adopted_no_oca(
+                    redis, engine,
+                    ticker=pos.ticker,
+                    direction=pos.direction,
+                    entry_price=pos.entry_price,
+                    shares=pos.shares,
+                    opened_at=seeded_params["opened_at"],
+                    mode=mode,
                 )
-                try:
-                    await engine.close_position(pos.ticker, reason="NO_STOP_ON_RESTART")  # type: ignore[union-attr]
-                except Exception as exc:
-                    logger.error("[SYNC] Failed to close unprotected position %s: %s", pos.ticker, exc)
 
 
 async def _reconcile_inflight_orders(
@@ -2834,6 +3156,53 @@ async def _reconcile_inflight_orders(
 
                 if _fp > 0:
                     logger.info("[SYNC] Inflight entry %s orderId=%s: recovered fill %.4f", _t, _oid_str, _fp)
+                    # If position:params are missing (e.g. deleted by a reconcile cycle
+                    # between pre-market order submission and market-open fill), reconstruct
+                    # them from the inflight data so the exit loop can track the position.
+                    _pr_sync = await redis.hget(_POSITION_PARAMS_KEY, _t)
+                    if not _pr_sync:
+                        _sl_sync = float(_d.get("stop_loss", 0) or 0)
+                        _tp_sync = float(_d.get("take_profit", 0) or 0)
+                        _dir_sync = str(_d.get("direction", "") or "")
+                        _qty_sync = int(_d.get("quantity", 0) or 0)
+                        _md_sync = str(_d.get("mode", "live") or "live")
+                        if _dir_sync and _qty_sync:
+                            logger.warning(
+                                "[SYNC] %s: position:params missing at fill recovery — "
+                                "reconstructing (sl=%.4f tp=%.4f) and publishing position_opened",
+                                _t, _sl_sync, _tp_sync,
+                            )
+                            await redis.hset(_POSITION_PARAMS_KEY, _t, json.dumps({
+                                "stop_loss": _sl_sync,
+                                "take_profit": _tp_sync,
+                                "opened_at": _oa,
+                                "direction": _dir_sync,
+                                "source": "system",
+                                "entry_price": _fp,
+                                "shares": _qty_sync,
+                            }))
+                            await redis.hset(_POSITIONS_LIVE_KEY, _t, json.dumps({
+                                "ticker": _t,
+                                "direction": _dir_sync,
+                                "shares": _qty_sync,
+                                "entry_price": _fp,
+                                "stop_loss": _sl_sync,
+                                "take_profit": _tp_sync,
+                                "unrealized_pnl": 0.0,
+                                "high_water_mark": _fp,
+                                "opened_at": _oa,
+                                "source": "system",
+                            }))
+                            await _publish_execution_event(redis, "position_opened", {
+                                "ticker": _t,
+                                "direction": _dir_sync,
+                                "shares": _qty_sync,
+                                "entry_price": _fp,
+                                "stop_loss": _sl_sync,
+                                "take_profit": _tp_sync,
+                                "opened_at": _oa,
+                                "mode": _md_sync,
+                            })
                     await _publish_execution_event(redis, "position_entry_updated", {
                         "ticker": _t, "entry_price": _fp,
                         "opened_at": _oa, "order_id": _oid_str,
@@ -2843,13 +3212,26 @@ async def _reconcile_inflight_orders(
                     entry_fixes += 1
 
                 elif _t not in current_tickers:
-                    # Position gone AND no fill found — discard stale ledger entry
-                    logger.debug(
-                        "[SYNC] Inflight entry %s orderId=%s: no position + no fill — discarding",
-                        _t, _oid_str,
-                    )
-                    await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid_str)
-                    await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
+                    # No fill found AND ticker not in IB positions.
+                    # Before discarding, check if position:params still exists — if so,
+                    # this is likely a pre-market order queued for market open (submitted
+                    # MKT order not yet an IB position).  Keep the inflight entry so the
+                    # fill callback and periodic poll can handle it on fill.
+                    _has_params_sync = await redis.hexists(_POSITION_PARAMS_KEY, _t)
+                    if _has_params_sync:
+                        logger.debug(
+                            "[SYNC] Inflight entry %s orderId=%s: no IB position yet but "
+                            "position:params exists — keeping (likely pre-market pending order)",
+                            _t, _oid_str,
+                        )
+                    else:
+                        # No params AND no IB position AND no fill — truly stale; discard.
+                        logger.debug(
+                            "[SYNC] Inflight entry %s orderId=%s: no position + no fill + no params — discarding",
+                            _t, _oid_str,
+                        )
+                        await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid_str)
+                        await redis.hdel(_FILL_SYNC_ALERTS_KEY, _oid_str)
 
                 else:
                     # Position still open but fill unconfirmed — escalate to alert
