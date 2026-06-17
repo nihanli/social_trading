@@ -213,19 +213,30 @@ async def _write_positions_to_redis(
         # Safety guard: if the engine reports 0 positions but position:params
         # still has entries, IB may have returned an empty cache due to a
         # transient disconnect (e.g. TWS nightly auto-restart at ~11:45 PM ET).
-        # Preserve the existing positions:live key rather than wiping it and
-        # making positions vanish from the UI until the reconnect handler
-        # reseeds the IB cache via reqPositionsAsync().
+        # If positions:live already exists, preserve it (don't wipe live data).
+        # If positions:live has expired, fall through to rebuild it from params
+        # so the UI never shows a blank positions panel while IB is disconnected.
         if not positions:
             params_raw = await redis.hgetall(_POSITION_PARAMS_KEY)
             if params_raw:
+                live_exists = await redis.exists(_POSITIONS_LIVE_KEY)
+                if live_exists:
+                    logger.warning(
+                        "[POSITIONS] IB returned 0 open positions but %d ticker(s) in "
+                        "position:params — possible transient disconnect; preserving "
+                        "positions:live until IB cache is reseeded",
+                        len(params_raw),
+                    )
+                    return
+                # positions:live has expired — rebuild from params so the UI
+                # doesn't show a blank panel while IB is disconnected.
                 logger.warning(
-                    "[POSITIONS] IB returned 0 open positions but %d ticker(s) in "
-                    "position:params — possible transient disconnect; preserving "
-                    "positions:live until IB cache is reseeded",
+                    "[POSITIONS] IB returned 0 positions and positions:live expired — "
+                    "rebuilding from position:params (%d ticker(s))",
                     len(params_raw),
                 )
-                return
+                # Fall through: ib_by_ticker will be empty; the else branch below
+                # writes each ticker using params data (ib_cache_missing=True).
 
         # Build index of IB positions for O(1) lookup.
         ib_by_ticker = {pos.ticker: pos for pos in positions}
@@ -307,17 +318,15 @@ async def _write_positions_to_redis(
                     "ib_cache_missing": True,
                     **({"close_pending": True} if _is_close_pending else {}),
                 }))
-        # Set TTL on the temp key, then atomically rename to live key.
-        # If there are no system positions, replace live key with an empty hash
-        # so the UI correctly shows "No open positions" rather than stale data.
-        if all_system_tickers:
-            pipe.expire(_POSITIONS_LIVE_TMP, 300)  # 5-minute TTL refreshed each cycle
         await pipe.execute()
         # RENAME is atomic in Redis — readers see either the old complete key or the
         # new complete key, never an empty intermediate state.
         if all_system_tickers:
             await redis.rename(_POSITIONS_LIVE_TMP, _POSITIONS_LIVE_KEY)
-            await redis.expire(_POSITIONS_LIVE_KEY, 300)
+            # No TTL — positions:live is explicitly managed (deleted when positions
+            # close or when the service confirms there are none).  A TTL caused
+            # positions to silently disappear from the UI when IB disconnected
+            # after market close and the price-eval loop stopped refreshing the key.
         else:
             # No system positions — explicitly clear the live key so stale entries
             # from a prior session don't linger if the execution service restarts
@@ -744,9 +753,49 @@ async def run_exit_loop(
                 # responsible for detecting disconnects and running full reconcile.
                 # This loop simply waits — the watcher will replace this task with a
                 # fresh exit loop instance once the new IB connection is established.
+                #
+                # While disconnected, refresh positions:live from position:params so
+                # the UI always shows current positions even when IB is offline.
+                # Without this, positions:live would silently expire (its TTL was
+                # refreshed only by this loop) and the positions panel would go blank.
                 logger.warning(
                     "[SYNC] IB disconnected — waiting for reconnect watcher to restore connection"
                 )
+                try:
+                    params_raw = await redis.hgetall(_POSITION_PARAMS_KEY)
+                    if params_raw and not await redis.exists(_POSITIONS_LIVE_KEY):
+                        pipe = redis.pipeline()
+                        _tmp = _POSITIONS_LIVE_KEY + ":tmp"
+                        pipe.delete(_tmp)
+                        for _k, _v in params_raw.items():
+                            _ticker = _k.decode() if isinstance(_k, bytes) else _k
+                            try:
+                                _p = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                                if _p.get("source", "system") == "system":
+                                    pipe.hset(_tmp, _ticker, json.dumps({
+                                        "ticker": _ticker,
+                                        "direction": _p.get("direction", "LONG"),
+                                        "shares": int(_p.get("shares", 0)),
+                                        "entry_price": float(_p.get("entry_price", 0.0)),
+                                        "stop_loss": float(_p.get("stop_loss", 0.0)),
+                                        "take_profit": float(_p.get("take_profit", 0.0)),
+                                        "unrealized_pnl": None,
+                                        "high_water_mark": None,
+                                        "opened_at": _p.get("opened_at"),
+                                        "source": "system",
+                                        "ib_disconnected": True,
+                                    }))
+                            except Exception:
+                                pass
+                        await pipe.execute()
+                        if await redis.exists(_tmp):
+                            await redis.rename(_tmp, _POSITIONS_LIVE_KEY)
+                            logger.info(
+                                "[SYNC] positions:live rebuilt from position:params (%d ticker(s)) while IB disconnected",
+                                len(params_raw),
+                            )
+                except Exception as _rebuild_exc:
+                    logger.debug("[SYNC] positions:live rebuild from params failed: %s", _rebuild_exc)
                 await asyncio.sleep(cfg.signal_poll_interval_sec)
                 continue
 
@@ -1701,11 +1750,26 @@ async def _reconcile_ib_state(
         raw = str(value or "")
         if not raw:
             return None
+        # Normalise IB's double-space format: "20250617  09:31:00" → "20250617 09:31:00"
+        raw = " ".join(raw.split())
         try:
             parsed = datetime.fromisoformat(raw)
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
         except Exception:
-            return None
+            pass
+        # Handle IB's compact YYYYMMDD HH:MM:SS format after normalisation
+        try:
+            import re as _re  # noqa: PLC0415
+            m = _re.match(r"^(\d{4})(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$", raw)
+            if m:
+                return datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                    tzinfo=UTC,
+                )
+        except Exception:
+            pass
+        return None
 
     def _update_latest_fill(
         store: dict[str, dict] | dict[str, dict[str, dict]],
@@ -2273,22 +2337,45 @@ async def _reconcile_ib_state(
                     reason = f"{ticker} was closed while the service was offline; IB close fill confirmed."
                     auto_actions.append({"ticker": ticker, "action": "confirm_closed"})
                 else:
-                    state = "missing"
-                    new_conflicts[ticker] = {
-                        "state": "missing",
-                        "ticker": ticker,
-                        "direction": app_entry.get("direction"),
-                        "entry_price": app_entry.get("entry_price"),
-                        "shares": app_entry.get("shares"),
-                        "opened_at": app_entry.get("opened_at"),
-                        "reason": (
-                            f"{ticker}: tracked by app but absent from IB with no close fill record. "
-                            "May be a prior-day close."
-                        ),
-                        "options": ["mark_closed", "force_adopt", "remove_app"],
-                        "detected_at": datetime.now(UTC).isoformat(),
-                    }
-                    reason = new_conflicts[ticker]["reason"]
+                    # No IB position AND no close fill found.
+                    # For positions opened very recently (< 5 min), the close fill
+                    # might not have propagated to reqExecutionsAsync yet (IB latency).
+                    # Classify as "fill_pending" for now and re-check next cycle
+                    # rather than immediately raising a trading-halting conflict.
+                    _recent_threshold_secs = 300  # 5 minutes
+                    _is_recent = False
+                    if opened_dt is not None:
+                        _age_secs = (datetime.now(UTC) - opened_dt).total_seconds()
+                        _is_recent = 0 < _age_secs < _recent_threshold_secs
+                    if _is_recent:
+                        state = "fill_pending"
+                        reason = (
+                            f"{ticker}: tracked by app, absent from IB, and no close fill yet — "
+                            f"position is < 5 min old ({int((datetime.now(UTC) - opened_dt).total_seconds())}s); "  # type: ignore[operator]
+                            "waiting for IB executions to propagate."
+                        )
+                        logger.info(
+                            "[RECONCILE] %s: no IB position or close fill yet but position is recent (%ds old) — "
+                            "classifying as fill_pending, will re-check next cycle",
+                            ticker, int((datetime.now(UTC) - opened_dt).total_seconds()),  # type: ignore[operator]
+                        )
+                    else:
+                        state = "missing"
+                        new_conflicts[ticker] = {
+                            "state": "missing",
+                            "ticker": ticker,
+                            "direction": app_entry.get("direction"),
+                            "entry_price": app_entry.get("entry_price"),
+                            "shares": app_entry.get("shares"),
+                            "opened_at": app_entry.get("opened_at"),
+                            "reason": (
+                                f"{ticker}: tracked by app but absent from IB with no close fill record. "
+                                "May be a prior-day close."
+                            ),
+                            "options": ["mark_closed", "force_adopt", "remove_app"],
+                            "detected_at": datetime.now(UTC).isoformat(),
+                        }
+                        reason = new_conflicts[ticker]["reason"]
             else:
                 continue
 
@@ -5148,7 +5235,6 @@ async def _run_price_push(engine: Optional[ExecutionEngine], redis: aioredis.Red
                             pass
                     if updates:
                         await redis.hset(_POSITIONS_LIVE_KEY, mapping=updates)
-                        await redis.expire(_POSITIONS_LIVE_KEY, 300)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
