@@ -832,29 +832,40 @@ async def run_exit_loop(
                 if now_ts - _watchlist_last_refresh.get(t, 0) >= WATCHLIST_REFRESH_SECS
             }
 
-            # ── 2a. Open position prices: batch-fetch from IB ─────────────────
-            # Use engine.get_market_prices() for a single concurrent IB snapshot
-            # of all open positions.  This gives real-time prices without the
-            # per-ticker 1.5s sleep of the yfinance/reqMktData approach.
-            # Tickers where IB returns no price fall back to yfinance below.
-            ib_prices: dict[str, float] = {}
-            if open_tickers:
+            # ── 2a. Open position prices: portfolio feed first, then batch IB ──
+            # get_portfolio_prices() reads ib.portfolio() — a streaming account
+            # subscription pushed by IB every few seconds.  It requires NO market
+            # data subscription and is always available for positions in the account.
+            # This avoids error 10089 (subscription required) for the common case
+            # where live market data API access hasn't been separately enabled.
+            # Tickers not covered by the portfolio feed fall back to
+            # get_market_prices() then yfinance.
+            portfolio_prices: dict[str, float] = {}
+            if open_tickers and hasattr(engine, "get_portfolio_prices"):
                 try:
-                    ib_prices = await engine.get_market_prices(list(open_tickers))
+                    portfolio_prices = engine.get_portfolio_prices()  # type: ignore[union-attr]
+                except Exception as exc:
+                    logger.debug("Portfolio price fetch failed: %s", exc)
+
+            ib_prices: dict[str, float] = {}
+            remaining_tickers = open_tickers - set(portfolio_prices)
+            if remaining_tickers:
+                try:
+                    ib_prices = await engine.get_market_prices(list(remaining_tickers))
                 except Exception as exc:
                     logger.debug("IB batch price fetch failed: %s", exc)
 
             for ticker in open_tickers:
-                if ticker in ib_prices:
+                price = portfolio_prices.get(ticker) or ib_prices.get(ticker)
+                if price:
                     # IB returned a live price — update engine cache and Redis
-                    engine.set_price(ticker, ib_prices[ticker])
-                    # Write just the price fields to Redis (fast path).
-                    # Full snapshot (ATR/OHLCV) runs on a slower cadence below.
+                    engine.set_price(ticker, price)
+                    source = "ib_portfolio" if ticker in portfolio_prices else "ib"
                     try:
                         await redis.hset(f"market_data:{ticker}", mapping={
-                            "last": str(ib_prices[ticker]),
+                            "last": str(price),
                             "updated_at": datetime.now(UTC).isoformat(),
-                            "source": "ib",
+                            "source": source,
                         })
                         await redis.expire(f"market_data:{ticker}", 4 * 3600)
                     except Exception:
@@ -2297,13 +2308,15 @@ async def _reconcile_ib_state(
             elif app_entry and not ib_entry:
                 app_dir = str(app_entry.get("direction", "")).upper() or "LONG"
                 close_fill = _close_fill_for_ticker(ticker, app_dir)
-                close_dt = _as_dt(close_fill.get("time")) if close_fill else None
-                opened_dt = _as_dt(app_entry.get("opened_at"))
+                # close_is_valid: any close fill found today is authoritative.
+                # We deliberately do NOT compare close_dt > opened_dt because IB fill
+                # timestamps are wall-clock Eastern Time while opened_at is UTC —
+                # mixing them would cause "09:35 ET" (treated as 09:35 UTC) to appear
+                # earlier than "13:35 UTC" (the actual submission time), making every
+                # OCA-fired close invisible to reconcile.
+                # reqExecutionsAsync(ExecutionFilter()) already returns only today's fills
+                # so there is no risk of a stale fill from a prior session being reused.
                 close_is_valid = close_fill is not None
-                if ticker in _round_tripped_today:
-                    close_is_valid = close_fill is not None and close_dt is not None and opened_dt is not None and close_dt > opened_dt
-                elif close_fill and close_dt is not None and opened_dt is not None:
-                    close_is_valid = close_dt > opened_dt
                 if close_is_valid:
                     exit_price = _to_float(close_fill.get("fill_price", 0.0)) if close_fill else 0.0
                     exit_reason = close_fill.get("exit_reason", "STARTUP_RECONCILE_CLOSED") if close_fill else "STARTUP_RECONCILE_CLOSED"
