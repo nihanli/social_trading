@@ -407,8 +407,10 @@ def _prune_old_data() -> dict[str, int]:
     deleted: dict[str, int] = {}
     statements = [
         (
+            # signals are only pruned when no trade references them (FK RESTRICT).
+            # Signals linked to trades are intentionally retained for optimization.
             "signals",
-            f"DELETE FROM signals WHERE generated_at < NOW() - INTERVAL '{_RETAIN_SIGNALS_DAYS} days'",
+            f"DELETE FROM signals WHERE generated_at < NOW() - INTERVAL '{_RETAIN_SIGNALS_DAYS} days' AND id NOT IN (SELECT signal_id FROM trades WHERE signal_id IS NOT NULL)",
         ),
         (
             "sentiment_aggregates",

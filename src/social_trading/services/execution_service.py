@@ -974,6 +974,25 @@ async def run_exit_loop(
                     now=now,
                 )
                 if decision.should_exit:
+                    # ── SENTIMENT_REVERSAL: tighten trail to min, don't exit immediately ──
+                    # Rather than a hard market close, snap the IB TRAIL order to the
+                    # tightest setting (trailing_stop_min_pct).  The position then exits
+                    # on its own once price retraces by that amount from the HWM.
+                    # This avoids exiting into a momentary dip in sentiment score while
+                    # still locking in most of the profit that has been captured.
+                    if decision.reason == "SENTIMENT_REVERSAL":
+                        min_pct = cfg.trailing_stop_min_pct
+                        if abs(last_applied - min_pct) >= 0.005:  # not already at min
+                            if hasattr(engine, "update_trailing_stop"):
+                                await engine.update_trailing_stop(pos.ticker, min_pct)
+                            _trailing_pct_applied[pos.ticker] = min_pct
+                            logger.info(
+                                "[EXIT] %s SENTIMENT_REVERSAL — tightening trail to min %.1f%% "
+                                "(sentiment=%.3f); letting tightened trail manage exit",
+                                pos.ticker, min_pct * 100, sentiment,
+                            )
+                        continue  # do not close — tightened trail handles the exit
+
                     # Capture position metadata before close_position may clear state.
                     _pos_opened_at = pos.opened_at.isoformat() if pos.opened_at else ""
                     _pos_entry_price = pos.entry_price

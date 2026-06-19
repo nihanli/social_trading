@@ -759,10 +759,11 @@ with tab_risk:
             "Sentiment reversal threshold", -0.8, -0.05,
             float(cfg.signal_reversal_threshold), 0.05,
             help=(
-                "Sentiment-based exit: the position is closed when the aggregated "
-                "sentiment score for the ticker drops below this value. A value of -0.20 "
-                "means the crowd has turned clearly bearish. More negative = requires "
-                "stronger reversal to exit; less negative = exits on mild negativity. "
+                "Sentiment-based exit: closes the position when sentiment reverses "
+                "strongly against the trade direction. "
+                "LONG: exits when sentiment drops below this value (e.g. -0.20 = crowd turned bearish). "
+                "SHORT: exits when sentiment rises above the absolute value (e.g. -0.20 → exits above +0.20 = crowd turned bullish). "
+                "More negative = requires stronger reversal to exit; less negative = exits on mild reversal. "
                 "Default: -0.20."
             ),
         )

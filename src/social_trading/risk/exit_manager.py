@@ -7,13 +7,14 @@ Exit rules (design §6b, evaluated in priority order):
   3. Take-profit target hit   → TAKE_PROFIT close
   4. Trailing stop triggered  → TRAILING_STOP close
      (trailing_stop_pct may be tightened by mention decay in execution_service)
-  5. Sentiment reversal       → SENTIMENT_REVERSAL close
+  5. Sentiment reversal       → SENTIMENT_REVERSAL — tightens trail to min_pct (no immediate close)
   6. Hard time stop           → TIME_STOP close
 
 If multiple rules fire, the highest-priority one wins.
 
-Note: mention decay no longer produces a hard exit. Instead execution_service
-dynamically tightens trailing_stop_pct in the cfg passed to evaluate().
+Note: SENTIMENT_REVERSAL does not produce an immediate close. Instead, execution_service
+snaps the IB TRAIL order to trailing_stop_min_pct and lets the tightened trail manage the
+exit. Mention decay similarly tightens the trail (linearly) without a hard exit.
 
 Usage:
     manager = PositionExitManager()
