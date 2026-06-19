@@ -309,7 +309,6 @@ def test_mention_decay_tightens_trailing_stop_exit(
     pos = make_long(entry_price=100.0, hwm=104.0, stop_loss=96.0, take_profit=110.0)
     tightened_cfg = SystemConfig(
         trailing_stop_pct=0.02,        # tightened by mention decay
-        trailing_stop_activation_pct=0.0,  # activation cleared when decaying
         take_profit_pct=0.04,
         max_hold_trading_days=3,
         loss_limit_single_trade=0.01,

@@ -724,17 +724,7 @@ with tab_risk:
                 "Trailing stop distance from the position's high-water mark. "
                 "The stop moves up with price but never down. If price retraces "
                 "this percentage from the peak, the stop triggers a market sell. "
-                "Only activates once the position is in profit by the activation "
-                "threshold below. Default: 8%."
-            ),
-        ) / 100
-        cfg.trailing_stop_activation_pct = st.slider(
-            "Trailing stop activation (%)", 0.0, 5.0, float(cfg.trailing_stop_activation_pct * 100), 0.25,
-            help=(
-                "The trailing stop only activates once the position has moved this "
-                "far into profit from entry. This prevents the trailing stop from "
-                "acting as a parallel stop-loss on positions that never became "
-                "profitable — the ATR stop handles those. Default: 1%."
+                "Default: 8%."
             ),
         ) / 100
         cfg.trailing_stop_min_pct = st.slider(

@@ -212,10 +212,10 @@ def _breaches_trailing_stop(
     For SHORT: trails the minimum price seen since entry.
     HWM of 0.0 means not yet initialised — skip check.
 
-    The trailing stop only activates once the position has moved into profit by
-    at least cfg.trailing_stop_activation_pct (default 1%).  This prevents the
-    trailing stop from acting as an alternative first stop-loss on positions that
-    never moved in the intended direction — the ATR stop handles those.
+    The IB TRAIL order (placed immediately at entry) is the primary trailing-stop
+    authority; this software check is a fallback for when the IB order is absent or
+    failed (e.g. naked position, OCA placement error).  No activation gate is applied
+    here — IB's TRAIL order has no such gate either.
     """
     hwm = position.high_water_mark
     if hwm == 0.0:
@@ -226,16 +226,10 @@ def _breaches_trailing_stop(
         return False
 
     if position.direction == "LONG":
-        # Only activate once price has risen at least activation_pct above entry
-        if hwm < entry * (1.0 + cfg.trailing_stop_activation_pct):
-            return False
         trailing_stop = hwm * (1.0 - cfg.trailing_stop_pct)
         return current_price <= trailing_stop
 
-    # SHORT: HWM is the lowest price seen; only activate once price dropped
-    # at least activation_pct below entry
-    if hwm > entry * (1.0 - cfg.trailing_stop_activation_pct):
-        return False
+    # SHORT
     trailing_stop = hwm * (1.0 + cfg.trailing_stop_pct)
     return current_price >= trailing_stop
 

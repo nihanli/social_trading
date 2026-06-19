@@ -95,7 +95,6 @@ class SystemConfig:
     atr_multiplier: float = 2.0             # stop: entry ± N × ATR
     max_hold_trading_days: int = 3          # hard time stop in NYSE trading days
     trailing_stop_pct: float = 0.08        # trailing stop from high-water mark
-    trailing_stop_activation_pct: float = 0.01  # trailing stop only activates once position is this % in profit
     trailing_stop_min_pct: float = 0.02    # floor for ATR stop distance and tightened trailing stop (mention decay)
     take_profit_pct: float = 0.04          # take profit target
     signal_reversal_threshold: float = -0.20

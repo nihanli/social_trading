@@ -958,16 +958,11 @@ async def run_exit_loop(
                 last_applied = _trailing_pct_applied.get(pos.ticker, cfg.trailing_stop_pct)
 
                 # Build effective cfg with tightened trailing stop for exit manager.
-                # When decaying, also clear the activation gate so the tightened
-                # trail fires unconditionally without requiring a profit threshold.
                 decaying = mention_ratio < cfg.mention_decay_threshold
                 if abs(effective_pct - cfg.trailing_stop_pct) > 1e-9:
                     effective_cfg = dataclasses.replace(
                         cfg,
                         trailing_stop_pct=effective_pct,
-                        trailing_stop_activation_pct=(
-                            0.0 if decaying else cfg.trailing_stop_activation_pct
-                        ),
                     )
                 else:
                     effective_cfg = cfg
