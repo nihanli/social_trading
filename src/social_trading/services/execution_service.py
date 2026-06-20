@@ -1092,11 +1092,13 @@ async def run_exit_loop(
             # Guard with a Redis key so restarts don't duplicate the write.
             # Window: market closed AND hour ≥ 20 UTC (≥ 16:00 ET / 15:00 CT)
             # — deliberately wide so we don't miss it even if the loop was slow.
+            # Skip entirely on weekends and holidays (is_session_day = False).
             _eod_key = f"eod_snapshot_done:{datetime.now(UTC).date().isoformat()}:{mode}"
             if not _NYSE.is_open() and not await redis.exists(_eod_key):
                 now_dt = datetime.now(UTC)
                 # Avoid pre-market false trigger: only after 20:00 UTC (16:00 ET)
-                if now_dt.hour >= 20:
+                # and only on actual NYSE trading days (not weekends / holidays).
+                if now_dt.hour >= 20 and _NYSE.is_session_day(now_dt):
                     await _save_eod_snapshot(cfg, mode)
                     await _prune_old_data()
                     await redis.setex(_eod_key, 86400, "1")  # expire after 24h

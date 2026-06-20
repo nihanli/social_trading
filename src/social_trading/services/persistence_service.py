@@ -72,7 +72,7 @@ _EXEC_EVENTS_STREAM = "execution:events"
 _RETAIN_SOCIAL_RAW_HOURS = 48
 _RETAIN_SENTIMENT_SCORES_HOURS = 48
 _RETAIN_SENTIMENT_AGGREGATES_DAYS = 7
-_RETAIN_SIGNALS_DAYS = 7          # was 24h — extended for analytics UI
+_RETAIN_SIGNALS_DAYS = 90          # unexecuted signals kept 90d for backtest; trade-linked kept forever
 _RETAIN_ACCOUNT_EQUITY_DAYS = 365  # one year of equity history
 _RETAIN_CONFIG_RUNS_DAYS = 365    # one year of parameter tuning history
 
@@ -213,12 +213,13 @@ def _write_signals(rows: list[dict]) -> int:
                                 (timestamp, ticker, strategy, direction,
                                  confidence, sentiment_score, mention_zscore,
                                  quality_score, signal_phase, generated_at,
-                                 momentum, convergence, proactivity)
+                                 momentum, convergence, proactivity, atr)
                             VALUES (%(ts)s, %(ticker)s, %(strategy)s,
                                     %(direction)s, %(confidence)s,
                                     %(sentiment_score)s, %(mention_zscore)s,
                                     %(quality_score)s, %(signal_phase)s, %(ts)s,
-                                    %(momentum)s, %(convergence)s, %(proactivity)s)
+                                    %(momentum)s, %(convergence)s, %(proactivity)s,
+                                    %(atr)s)
                             """,
                             {
                                 "ts": r.get("generated_at") or datetime.now(UTC).isoformat(),
@@ -236,6 +237,7 @@ def _write_signals(rows: list[dict]) -> int:
                                 "momentum": _float(r.get("momentum")) or None,
                                 "convergence": _float(r.get("convergence")),
                                 "proactivity": _float(r.get("proactivity"), default=1.0),
+                                "atr": _float(r.get("atr")) or None,
                             },
                         )
                         cur.execute("RELEASE SAVEPOINT row_sp")
@@ -445,6 +447,19 @@ def _prune_old_data() -> dict[str, int]:
             "config_runs",
             f"DELETE FROM config_runs WHERE created_at < NOW() - INTERVAL '{_RETAIN_CONFIG_RUNS_DAYS} days'",
         ),
+        (
+            # price_ohlc: prune any ticker that has no signal within the retention
+            # window.  Tickers with live signals retain all bars for backtest.
+            "price_ohlc",
+            f"""
+            DELETE FROM price_ohlc
+            WHERE ticker NOT IN (
+                SELECT DISTINCT ticker FROM signals
+                WHERE generated_at > NOW() - INTERVAL '{_RETAIN_SIGNALS_DAYS} days'
+            )
+            OR bar_datetime < NOW() - INTERVAL '{_RETAIN_SIGNALS_DAYS} days'
+            """,
+        ),
     ]
     try:
         with conn:
@@ -476,12 +491,16 @@ def _write_trade_opened(data: dict) -> None:
                     INSERT INTO trades
                         (ticker, direction, shares, entry_price, stop_price,
                          target_price, opened_at, status, mode, stream_event_id,
-                         signal_id)
+                         signal_id, atr_at_entry)
                     VALUES
                         (%(ticker)s, %(direction)s, %(shares)s, %(entry_price)s,
                          %(stop_price)s, %(target_price)s, %(opened_at)s,
                          'open', %(mode)s, %(stream_event_id)s,
                          (SELECT id FROM signals
+                          WHERE ticker = %(ticker)s
+                            AND generated_at = %(signal_generated_at)s::timestamptz
+                          ORDER BY id DESC LIMIT 1),
+                         (SELECT atr FROM signals
                           WHERE ticker = %(ticker)s
                             AND generated_at = %(signal_generated_at)s::timestamptz
                           ORDER BY id DESC LIMIT 1))
@@ -1137,7 +1156,401 @@ async def run_positions_sync_task(redis: aioredis.Redis) -> None:
             await asyncio.sleep(10.0)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Price history task ─────────────────────────────────────────────────────────
+
+_PRICE_TASK_POLL_SEC = 300          # check queue every 5 min during market hours
+_MARKET_CLOSE_HOUR_ET = 16          # 4 PM Eastern = end-of-day sweep trigger
+_MARKET_CLOSE_MINUTE_ET = 30        # 4:30 PM ET
+
+
+def _upsert_ohlc_bars(ticker: str, bars: list[dict], timeframe: str, source: str) -> int:
+    """
+    Upsert OHLC bars into price_ohlc table.
+    ON CONFLICT: update if new source is 'ib' (overwrite yfinance with higher-quality data).
+    Returns number of rows inserted/updated.
+    """
+    if not bars:
+        return 0
+    conn = _get_conn()
+    upserted = 0
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for bar in bars:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO price_ohlc
+                                (ticker, bar_datetime, timeframe, open, high, low,
+                                 close, volume, source, fetched_at)
+                            VALUES
+                                (%(ticker)s, %(bar_datetime)s, %(timeframe)s,
+                                 %(open)s, %(high)s, %(low)s, %(close)s,
+                                 %(volume)s, %(source)s, NOW())
+                            ON CONFLICT (ticker, bar_datetime, timeframe) DO UPDATE
+                                SET open      = EXCLUDED.open,
+                                    high      = EXCLUDED.high,
+                                    low       = EXCLUDED.low,
+                                    close     = EXCLUDED.close,
+                                    volume    = EXCLUDED.volume,
+                                    source    = EXCLUDED.source,
+                                    fetched_at = EXCLUDED.fetched_at
+                                WHERE EXCLUDED.source = 'ib'
+                                   OR price_ohlc.source != 'ib'
+                            """,
+                            {
+                                "ticker": ticker,
+                                "bar_datetime": bar["datetime"],
+                                "timeframe": timeframe,
+                                "open":   bar.get("open"),
+                                "high":   bar.get("high"),
+                                "low":    bar.get("low"),
+                                "close":  bar.get("close"),
+                                "volume": bar.get("volume"),
+                                "source": source,
+                            },
+                        )
+                        upserted += cur.rowcount
+                    except psycopg2.Error as exc:
+                        logger.debug("[PRICE] bar upsert error %s: %s", ticker, exc)
+                        conn.rollback()
+    finally:
+        conn.close()
+    return upserted
+
+
+def _get_signal_tickers_last_90d() -> list[str]:
+    """Return distinct tickers that had a signal in the last 90 days."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ticker FROM signals "
+                "WHERE generated_at > NOW() - INTERVAL '90 days'"
+            )
+            return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _get_missing_intraday_dates() -> list[tuple[str, datetime]]:
+    """
+    Return (ticker, signal_date_utc_close) pairs that have a signal in the
+    last 90 days but no 5-min bars stored for that calendar date.
+
+    signal_date_utc_close is set to 21:00 UTC (= 5 PM ET) on the signal date
+    so IB ``endDateTime`` captures the full RTH session.
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT
+                    s.ticker,
+                    s.generated_at::date AS sig_date
+                FROM signals s
+                WHERE s.generated_at > NOW() - INTERVAL '90 days'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM price_ohlc p
+                      WHERE p.ticker    = s.ticker
+                        AND p.timeframe = '5m'
+                        AND p.bar_datetime::date = s.generated_at::date
+                  )
+                ORDER BY sig_date
+            """)
+            rows = cur.fetchall()
+        result = []
+        from datetime import timezone as _tz  # noqa: PLC0415
+        for ticker, sig_date in rows:
+            # IB endDateTime = 21:00 UTC on the signal date (covers full 9:30–16:00 ET session)
+            end_dt = datetime(
+                sig_date.year, sig_date.month, sig_date.day,
+                21, 0, 0, tzinfo=_tz.utc,
+            )
+            result.append((ticker, end_dt))
+        return result
+    finally:
+        conn.close()
+
+
+async def _backfill_missing_intraday(ib_engine) -> None:
+    """
+    For every (ticker, signal_date) pair that has no 5-min bars, fetch a
+    single day of 5-min RTH bars from IB using the precise endDateTime.
+    Falls back to yfinance recent data if IB is unavailable.
+
+    Runs as part of the daily sweep so historical gaps are filled
+    automatically without manual intervention.
+    """
+    import yfinance as yf  # noqa: PLC0415
+    from datetime import timezone as _tz  # noqa: PLC0415
+
+    missing = await _run_db(_get_missing_intraday_dates)
+    if not missing:
+        return
+
+    logger.info("[PRICE] Intraday backfill: %d (ticker, date) pairs missing 5m bars", len(missing))
+
+    for ticker, end_dt in missing:
+        bars: list[dict] = []
+        source = "yfinance"
+
+        # ── IB: fetch exactly 1 day ending at end_dt ────────────────────
+        if ib_engine is not None:
+            try:
+                bars = await ib_engine.get_historical_bars(
+                    ticker, "5 mins", "1 D",
+                    end_datetime=end_dt,
+                )
+                if bars:
+                    source = "ib"
+            except Exception as exc:
+                logger.debug("[PRICE] IB intraday backfill failed %s %s: %s",
+                             ticker, end_dt.date(), exc)
+
+        # ── yfinance fallback: only useful for recent dates (≤7 days) ───
+        if not bars:
+            today_utc = datetime.now(_tz.utc).date()
+            age_days = (today_utc - end_dt.date()).days
+            if age_days <= 7:
+                try:
+                    df = yf.download(ticker, period="7d", interval="5m",
+                                     progress=False, auto_adjust=True)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    target_date = end_dt.date()
+                    for ts, row in df.iterrows():
+                        dt = ts.to_pydatetime()
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_tz.utc)
+                        if dt.date() != target_date:
+                            continue
+                        try:
+                            bars.append({
+                                "datetime": dt,
+                                "open":   float(row["Open"]),
+                                "high":   float(row["High"]),
+                                "low":    float(row["Low"]),
+                                "close":  float(row["Close"]),
+                                "volume": int(row["Volume"]) if row.get("Volume") else None,
+                            })
+                        except (TypeError, ValueError):
+                            continue
+                except Exception as exc:
+                    logger.debug("[PRICE] yfinance intraday backfill failed %s: %s", ticker, exc)
+
+        if bars:
+            n = await _run_db(_upsert_ohlc_bars, ticker, bars, "5m", source)
+            logger.debug("[PRICE] backfill %s %s: %d bars (source=%s)",
+                         ticker, end_dt.date(), n, source)
+        else:
+            logger.debug("[PRICE] backfill %s %s: no bars available (IB unavailable + too old for yfinance)",
+                         ticker, end_dt.date())
+
+
+async def _fetch_and_store_bars(
+    ticker: str,
+    ib_engine,          # IBKRExecutionEngine | None
+    do_intraday: bool,
+) -> None:
+    """
+    Fetch 5-min (intraday, entry-day) and/or daily bars for *ticker* and
+    store in price_ohlc.  IB is tried first; yfinance is the fallback.
+
+    Args:
+        ticker:      Stock symbol.
+        ib_engine:   IBKRExecutionEngine instance (or None if IB unavailable).
+        do_intraday: True = also fetch 5-min bars for today.
+    """
+    import yfinance as yf  # noqa: PLC0415
+    from datetime import timezone as _tz  # noqa: PLC0415
+
+    # ── Daily bars (90 days) ────────────────────────────────────────────────
+    daily_bars: list[dict] = []
+    daily_source = "yfinance"
+
+    if ib_engine is not None:
+        try:
+            daily_bars = await ib_engine.get_historical_bars(ticker, "1 day", "90 D")
+            if daily_bars:
+                daily_source = "ib"
+        except Exception as exc:
+            logger.debug("[PRICE] IB daily fetch failed for %s: %s", ticker, exc)
+
+    if not daily_bars:
+        try:
+            df = yf.download(ticker, period="90d", interval="1d",
+                             progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if not df.empty:
+                for ts, row in df.iterrows():
+                    dt = ts.to_pydatetime()
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    try:
+                        daily_bars.append({
+                            "datetime": dt,
+                            "open":  float(row["Open"]),
+                            "high":  float(row["High"]),
+                            "low":   float(row["Low"]),
+                            "close": float(row["Close"]),
+                            "volume": int(row["Volume"]) if row.get("Volume") else None,
+                        })
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:
+            logger.warning("[PRICE] yfinance daily fetch failed for %s: %s", ticker, exc)
+
+    if daily_bars:
+        n = await _run_db(_upsert_ohlc_bars, ticker, daily_bars, "1d", daily_source)
+        logger.debug("[PRICE] %s: upserted %d daily bars (source=%s)", ticker, n, daily_source)
+
+    # ── Intraday 5-min bars (today only) ───────────────────────────────────
+    if not do_intraday:
+        return
+
+    intra_bars: list[dict] = []
+    intra_source = "yfinance"
+
+    if ib_engine is not None:
+        try:
+            intra_bars = await ib_engine.get_historical_bars(ticker, "5 mins", "1 D")
+            if intra_bars:
+                intra_source = "ib"
+        except Exception as exc:
+            logger.debug("[PRICE] IB intraday fetch failed for %s: %s", ticker, exc)
+
+    if not intra_bars:
+        try:
+            df = yf.download(ticker, period="1d", interval="5m",
+                             progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if not df.empty:
+                for ts, row in df.iterrows():
+                    dt = ts.to_pydatetime()
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    try:
+                        intra_bars.append({
+                            "datetime": dt,
+                            "open":  float(row["Open"]),
+                            "high":  float(row["High"]),
+                            "low":   float(row["Low"]),
+                            "close": float(row["Close"]),
+                            "volume": int(row["Volume"]) if row.get("Volume") else None,
+                        })
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:
+            logger.warning("[PRICE] yfinance intraday fetch failed for %s: %s", ticker, exc)
+
+    if intra_bars:
+        n = await _run_db(_upsert_ohlc_bars, ticker, intra_bars, "5m", intra_source)
+        logger.debug("[PRICE] %s: upserted %d intraday bars (source=%s)", ticker, n, intra_source)
+
+
+async def run_price_history_task(redis: aioredis.Redis) -> None:
+    """
+    Background task that pre-stores OHLC bars so the backtest engine never
+    needs to hit an external API at query time.
+
+    Two behaviours per tick:
+
+    1. **Entry-day intraday sweep** (4:30 PM ET only):
+       Pop all tickers from `price_fetch:queue` (populated by signal_service
+       when a signal fires) and fetch complete entry-day 5-min bars.
+
+    2. **Daily bar sweep** (every tick, ~5 min):
+       Fetch daily OHLC for all tickers that have a signal in the last 90
+       days, keeping the price_ohlc table up-to-date for multi-day backtest
+       simulation.
+
+    IB is the primary source; yfinance is the fallback for both.
+    """
+    from datetime import timezone as _tz  # noqa: PLC0415
+
+    import pytz  # noqa: PLC0415
+
+    _ET = pytz.timezone("America/New_York")
+    _last_daily_sweep: datetime | None = None
+    _daily_sweep_interval = 3600  # run daily sweep at most once per hour
+
+    logger.info("[PRICE] Price history task started")
+
+    # Lazy-import IB engine — only available at runtime, not in tests.
+    ib_engine = None
+    try:
+        from social_trading.execution.ibkr import IBKRExecutionEngine  # noqa: PLC0415
+        # Access shared IB connection via Redis key that holds connectivity state.
+        # If no IB connection is available, ib_engine stays None and we use yfinance.
+        ib_raw = await redis.get("ib:connected")
+        if ib_raw and (ib_raw.decode() if isinstance(ib_raw, bytes) else ib_raw) == "1":
+            # Re-use the execution service's IB connection via module-level reference.
+            from social_trading.services import execution_service as _es  # noqa: PLC0415
+            ib_engine = getattr(_es, "_ib_engine", None)
+    except Exception as exc:
+        logger.debug("[PRICE] IB engine not available: %s", exc)
+
+    while True:
+        try:
+            await asyncio.sleep(_PRICE_TASK_POLL_SEC)
+
+            now_et = datetime.now(_ET)
+            is_eod = (
+                now_et.hour == _MARKET_CLOSE_HOUR_ET
+                and now_et.minute >= _MARKET_CLOSE_MINUTE_ET
+            )
+
+            # ── Entry-day intraday sweep (4:30 PM ET) ──────────────────────
+            if is_eod:
+                queued_raw = await redis.smembers("price_fetch:queue")
+                queued = [
+                    (t.decode() if isinstance(t, bytes) else t)
+                    for t in queued_raw
+                ]
+                if queued:
+                    logger.info(
+                        "[PRICE] EOD intraday sweep: %d tickers in queue", len(queued)
+                    )
+                    for ticker in queued:
+                        try:
+                            await _fetch_and_store_bars(ticker, ib_engine, do_intraday=True)
+                        except Exception as exc:
+                            logger.warning("[PRICE] intraday fetch error %s: %s", ticker, exc)
+                    await redis.delete("price_fetch:queue")
+
+            # ── Daily bar sweep (every hour) ────────────────────────────────
+            now_utc = datetime.now(tz=_tz.utc)
+            if (
+                _last_daily_sweep is None
+                or (now_utc - _last_daily_sweep).total_seconds() >= _daily_sweep_interval
+            ):
+                tickers = await _run_db(_get_signal_tickers_last_90d)
+                if tickers:
+                    logger.info("[PRICE] Daily sweep: %d tickers", len(tickers))
+                    for ticker in tickers:
+                        try:
+                            await _fetch_and_store_bars(ticker, ib_engine, do_intraday=False)
+                        except Exception as exc:
+                            logger.warning("[PRICE] daily fetch error %s: %s", ticker, exc)
+
+                # Fill any (ticker, date) gaps in 5m intraday coverage using IB.
+                try:
+                    await _backfill_missing_intraday(ib_engine)
+                except Exception as exc:
+                    logger.warning("[PRICE] intraday backfill error: %s", exc)
+
+                _last_daily_sweep = now_utc
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[PRICE] Unhandled error: %s", exc, exc_info=True)
+            await asyncio.sleep(30.0)
+
+
 
 async def main() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -1172,6 +1585,7 @@ async def main() -> None:
         asyncio.create_task(run_prune_task(), name="prune"),
         asyncio.create_task(run_execution_events_task(bus), name="exec_events"),
         asyncio.create_task(run_positions_sync_task(redis), name="positions_sync"),
+        asyncio.create_task(run_price_history_task(redis), name="price_history"),
     ]
 
     try:

@@ -1301,3 +1301,84 @@ class IBKRExecutionEngine:
             len(tickers), len(prices),
         )
         return prices
+
+    async def get_historical_bars(
+        self,
+        ticker: str,
+        bar_size: str,
+        duration: str,
+        use_rth: bool = True,
+        end_datetime: datetime | None = None,
+    ) -> list[dict]:
+        """
+        Fetch historical OHLCV bars from IB for a single ticker.
+
+        Args:
+            ticker:       e.g. "AAPL"
+            bar_size:     IB bar size string — "5 mins" | "1 day"
+            duration:     IB duration string — "1 D" | "90 D"
+            use_rth:      True = regular trading hours only
+            end_datetime: End of the requested window (tz-aware UTC).
+                          ``None`` means "now" (IB default ``""``).
+                          Pass a historical date to retrieve past data.
+
+        Returns:
+            List of dicts with keys: datetime (tz-aware), open, high, low,
+            close, volume.  Empty list on any error or if IB unavailable.
+        """
+        if not _IB_AVAILABLE:
+            return []
+
+        from ib_async import Stock  # noqa: PLC0415
+
+        # IB endDateTime format: "YYYYMMDD HH:MM:SS UTC" or "" for now.
+        if end_datetime is not None:
+            from datetime import timezone  # noqa: PLC0415
+            utc_dt = end_datetime.astimezone(timezone.utc)
+            end_dt_str = utc_dt.strftime("%Y%m%d %H:%M:%S UTC")
+        else:
+            end_dt_str = ""
+
+        try:
+            contract = Stock(ticker, "SMART", "USD")
+            bars = await self._ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=end_dt_str,
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=use_rth,
+                formatDate=2,   # return UTC epoch seconds
+                keepUpToDate=False,
+            )
+        except Exception as exc:
+            logger.warning("[IBKR] get_historical_bars %s failed: %s", ticker, exc)
+            return []
+
+        if not bars:
+            return []
+
+        from datetime import timezone  # noqa: PLC0415
+
+        result = []
+        for bar in bars:
+            try:
+                # bar.date is an int (epoch seconds) when formatDate=2
+                dt = datetime.fromtimestamp(int(bar.date), tz=timezone.utc)
+                result.append({
+                    "datetime": dt,
+                    "open":   float(bar.open),
+                    "high":   float(bar.high),
+                    "low":    float(bar.low),
+                    "close":  float(bar.close),
+                    "volume": int(bar.volume) if bar.volume else None,
+                })
+            except Exception as exc:
+                logger.debug("[IBKR] bar parse error for %s: %s", ticker, exc)
+                continue
+
+        logger.debug(
+            "[IBKR] get_historical_bars %s bar_size=%s duration=%s → %d bars",
+            ticker, bar_size, duration, len(result),
+        )
+        return result

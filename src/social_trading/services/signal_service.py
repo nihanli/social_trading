@@ -131,6 +131,7 @@ def _signal_to_stream_dict(sig: Signal) -> dict[str, str]:
         "source_post_count": str(sig.source_post_count),
         "generated_at": sig.generated_at.isoformat(),
         "signal_phase": sig.signal_phase or "",
+        "atr": str(sig.atr) if sig.atr is not None else "",
     }
 
 
@@ -301,10 +302,13 @@ async def run_evaluate_task(
                 # extended move).  Falls back to _REACTIVE_THRESHOLD when ATR data
                 # is absent (e.g. execution_service snapshot not yet written).
                 reactive_threshold = _REACTIVE_THRESHOLD
+                ticker_atr: float | None = None
                 if mkt_raw:
                     try:
                         atr_14 = float(mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14") or 0.0)
                         last_px = float(mkt_raw.get(b"last") or mkt_raw.get("last") or 0.0)
+                        if atr_14 > 0:
+                            ticker_atr = atr_14
                         if atr_14 > 0 and last_px > 0:
                             reactive_threshold = 1.5 * (atr_14 / last_px)
                     except (ValueError, TypeError):
@@ -331,7 +335,7 @@ async def run_evaluate_task(
                         is_reactive=is_reactive,
                     )
                     if sig is not None:
-                        sig = sig.model_copy(update={"signal_phase": "phase2"})
+                        sig = sig.model_copy(update={"signal_phase": "phase2", "atr": ticker_atr})
                         batch_signals.append(sig)
                         SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
                         SIGNAL_QUALITY.observe(sig.quality_score)
@@ -365,7 +369,7 @@ async def run_evaluate_task(
 
                         if not tier2_configured:
                             # No paid sources — Phase 1 IS the final signal.
-                            sig = sig.model_copy(update={"signal_phase": "phase1"})
+                            sig = sig.model_copy(update={"signal_phase": "phase1", "atr": ticker_atr})
                             batch_signals.append(sig)
                             phase1_direct += 1
                             SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
@@ -383,7 +387,7 @@ async def run_evaluate_task(
                             enrichment_failed = await redis.exists(fallback_key)
                             if enrichment_failed:
                                 await redis.delete(fallback_key)
-                                sig = sig.model_copy(update={"signal_phase": "phase1"})
+                                sig = sig.model_copy(update={"signal_phase": "phase1", "atr": ticker_atr})
                                 batch_signals.append(sig)
                                 phase1_direct += 1
                                 SIGNALS_GENERATED.labels(ticker=ticker, direction=sig.direction).inc()
@@ -420,6 +424,9 @@ async def run_evaluate_task(
                     maxlen=STREAM_MAXLEN.get(STREAM_STRATEGY_SIGNALS),
                     approximate=True,
                 )
+                # Queue ticker for OHLC pre-fetch (price history task picks this up
+                # at 4:30 PM ET to store complete entry-day intraday bars).
+                await redis.sadd("price_fetch:queue", sig.ticker)
             signals_generated += len(batch_signals)
 
         logger.info(

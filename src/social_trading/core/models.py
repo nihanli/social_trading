@@ -80,6 +80,7 @@ class Signal(BaseModel):
     convergence: float               # fraction of sources agreeing [0, 1]
     proactivity: float = 1.0         # 1.0 = signal led price; 0.0 = reactive (price moved first)
     source_post_count: int
+    atr: float | None = None          # ATR-14 at signal generation time (absolute $); None if unavailable
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = Field(default_factory=dict)
     signal_phase: str | None = None  # "phase1" (free sources) or "phase2" (all sources)

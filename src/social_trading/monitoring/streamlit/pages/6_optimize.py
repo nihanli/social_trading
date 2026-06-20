@@ -42,7 +42,15 @@ with st.expander("💾 Force Save Today's Snapshot", expanded=False):
     )
     snap_mode = "live"
     st.caption("Mode: live")
-    if st.button("Save Snapshot Now"):
+
+    # Warn if today is not a NYSE trading day
+    from social_trading.core.market_hours import NYSE as _NYSE_ui  # noqa: E402
+    from datetime import datetime, timezone as _tz  # noqa: E402
+    _today_is_session = _NYSE_ui.is_session_day(datetime.now(_tz.utc))
+    if not _today_is_session:
+        st.warning("⚠️ Today is not a NYSE trading day (weekend or holiday). Saving a snapshot will record zero-trade metrics and pollute run history.")
+
+    if st.button("Save Snapshot Now", disabled=not _today_is_session):
         try:
             import os, json as _json, hashlib  # noqa: E401
             from datetime import datetime, timezone
@@ -187,8 +195,17 @@ runs_df = query("""
 _no_data = runs_df.empty
 
 # Flatten config JSON into columns for analysis
+def _safe_json(v):
+    try:
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
 try:
-    cfg_cols = pd.json_normalize(runs_df["config_snapshot"].apply(json.loads))
+    parsed = runs_df["config_snapshot"].apply(_safe_json)
+    cfg_cols = pd.json_normalize(parsed)
+    if cfg_cols.columns.empty:
+        cfg_cols = pd.DataFrame()
 except Exception:
     cfg_cols = pd.DataFrame()
 
@@ -425,154 +442,679 @@ with tab_suggest:
 
 
 # ════════════════════════════════════════════════════════════════
-# TAB 4 — GRID SEARCH
+# TAB 4 — WALK-FORWARD BACKTEST (replaces old grid search)
 # ════════════════════════════════════════════════════════════════
 with tab_grid:
-    st.subheader("Walk-Forward Grid Search")
-    st.caption(
-        "Re-simulates recently executed trades with different stop/take-profit settings. "
-        "Only uses trades that were actually executed — no look-ahead bias. "
-        "Design §17d."
+    import itertools  # noqa: E402
+
+    from social_trading.monitoring.streamlit.utils.backtest import (  # noqa: E402
+        PARAM_DEFS,
+        BacktestResult,
+        count_combinations,
+        load_ohlc,
+        results_to_dataframe,
+        run_fast_backtest,
+        run_full_backtest,
     )
 
-    col_gf1, col_gf2 = st.columns(2)
-    days_grid = col_gf1.slider("Use last N days of trades", 7, 90, 30, key="grid_days")
-    grid_mode = col_gf2.radio("Mode", ["live", "All"], horizontal=True, key="grid_mode")
+    st.subheader("Walk-Forward Backtest")
+    st.caption(
+        "Re-simulates trades using pre-stored OHLC bars and real ATR. "
+        "**Fast Mode** replays executed trades only. "
+        "**Full Mode** replays all signals through an entry filter and exit simulation."
+    )
 
-    mode_clause = "" if grid_mode == "All" else f"AND mode = '{grid_mode}'"
-    trades_df = query(f"""
-        SELECT ticker, direction, shares, entry_price,
-               exit_price, net_pnl, opened_at, closed_at
-        FROM trades
-        WHERE closed_at IS NOT NULL
-          AND exit_price IS NOT NULL
-          AND closed_at > NOW() - INTERVAL '{days_grid} days'
-          {mode_clause}
-        ORDER BY closed_at
+    # Pre-compute OHLC coverage (needed by expander expanded= and coverage bar)
+    ohlc_count_df = query("""
+        SELECT COUNT(DISTINCT ticker) AS n FROM price_ohlc WHERE timeframe = '1d'
     """)
+    ohlc_tickers = int(ohlc_count_df.iloc[0]["n"]) if not ohlc_count_df.empty else 0
 
-    if trades_df.empty or len(trades_df) < 5:
-        st.info(f"Need at least 5 trades in the last {days_grid} days to run grid search")
-    else:
-        st.write(f"Base dataset: **{len(trades_df)} trades**")
+    # ── OHLC backfill ─────────────────────────────────────────────────────────
+    with st.expander("📥 Backfill OHLC price data", expanded=(ohlc_tickers == 0)):
+        st.caption(
+            "The background price task populates OHLC bars for new signals automatically. "
+            "Use this to backfill historical tickers that existed before this feature was added."
+        )
+        if st.button("Fetch OHLC for all signal tickers (last 90 days)", key="bt_backfill"):
+            with st.spinner("Checking coverage and fetching missing OHLC data…"):
+                try:
+                    import yfinance as yf  # noqa: PLC0415
+                    from datetime import timezone as _tz  # noqa: PLC0415
 
-        # Grid parameters
-        col_g1, col_g2 = st.columns(2)
-        with col_g1:
-            tp_range = st.multiselect(
-                "Take-profit % values to test",
-                [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
-                default=[0.03, 0.04, 0.05],
-                format_func=lambda x: f"{x:.0%}",
-            )
-        with col_g2:
-            sl_range = st.multiselect(
-                "ATR multiplier values to test",
-                [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-                default=[1.5, 2.0, 2.5],
-            )
+                    conn_bf = get_connection()
 
-        combos = list(itertools.product(tp_range, sl_range))
-        st.write(f"**{len(combos)} combinations** to test")
+                    with conn_bf.cursor() as cur:
+                        # Tickers needing daily bars: no 1d coverage or stale (> 1 day old)
+                        cur.execute("""
+                            SELECT s.ticker
+                            FROM (
+                                SELECT DISTINCT ticker FROM signals
+                                WHERE generated_at > NOW() - INTERVAL '90 days'
+                            ) s
+                            LEFT JOIN (
+                                SELECT ticker, MAX(bar_datetime::date) AS last_date
+                                FROM price_ohlc WHERE timeframe = '1d'
+                                GROUP BY ticker
+                            ) p ON s.ticker = p.ticker
+                            WHERE p.last_date IS NULL OR p.last_date < CURRENT_DATE - 1
+                        """)
+                        tickers_need_daily = [r[0] for r in cur.fetchall()]
 
-        if len(combos) > 500:
-            st.error("Reduce to ≤ 500 combinations before running")
-        elif combos and st.button("Run Grid Search", type="primary"):
-            results = []
-            progress = st.progress(0)
+                        # (ticker, signal_date) pairs missing 5m intraday bars
+                        cur.execute("""
+                            SELECT DISTINCT s.ticker, s.generated_at::date AS sig_date
+                            FROM signals s
+                            WHERE s.generated_at > NOW() - INTERVAL '90 days'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM price_ohlc p
+                                  WHERE p.ticker    = s.ticker
+                                    AND p.timeframe = '5m'
+                                    AND p.bar_datetime::date = s.generated_at::date
+                              )
+                            ORDER BY sig_date
+                        """)
+                        missing_5m = [(r[0], r[1]) for r in cur.fetchall()]
+                    conn_bf.commit()
 
-            for i, (tp, atr_mult) in enumerate(combos):
-                progress.progress((i + 1) / len(combos))
+                    total_daily = len(tickers_need_daily)
+                    total_5m    = len(missing_5m)
+                    st.write(
+                        f"**{total_daily}** tickers need daily bars · "
+                        f"**{total_5m}** signal dates need 5-min bars"
+                    )
 
-                pnls = []
-                for _, row in trades_df.iterrows():
-                    ep = float(row["entry_price"])
-                    if ep <= 0:
-                        continue
-                    direction = row["direction"]
-                    exit_p = float(row["exit_price"])
-                    qty = float(row["shares"])
-                    cost_bps = 0.002  # 20 bps round-trip
-
-                    # Simulated stop & target prices
-                    # Use 2% of entry as ATR proxy (actual ATR not stored per-trade).
-                    atr_approx = ep * 0.02
-                    if direction == "LONG":
-                        stop   = ep - atr_mult * atr_approx
-                        target = ep * (1 + tp)
-                        # Clamp exit to [stop, target]: hit stop if went lower, hit target if went higher
-                        simulated_exit = max(min(exit_p, target), stop)
-                        raw_pnl = (simulated_exit - ep) * qty
+                    if not tickers_need_daily and not missing_5m:
+                        st.success("✅ Coverage complete — nothing to fetch.")
                     else:
-                        stop   = ep + atr_mult * atr_approx
-                        target = ep * (1 - tp)
-                        # SHORT clamp: target is below entry, stop is above entry
-                        simulated_exit = min(max(exit_p, target), stop)
-                        raw_pnl = (ep - simulated_exit) * qty
+                        def _flatten(df):
+                            if isinstance(df.columns, pd.MultiIndex):
+                                df.columns = df.columns.get_level_values(0)
+                            return df
 
-                    pnls.append(raw_pnl - abs(ep * qty) * cost_bps)
+                        upserted_total = 0
+                        progress_bf = st.progress(0)
+                        total_work = total_daily + total_5m
 
-                if len(pnls) < 5:
-                    continue
+                        # ── Daily bars ────────────────────────────────────────
+                        for idx, ticker in enumerate(tickers_need_daily):
+                            progress_bf.progress(
+                                (idx + 1) / total_work, text=f"Daily: {ticker}"
+                            )
+                            try:
+                                df_d = _flatten(yf.download(
+                                    ticker, period="90d", interval="1d",
+                                    progress=False, auto_adjust=True,
+                                ))
+                                if df_d.empty:
+                                    continue
+                                with conn_bf.cursor() as cur:
+                                    cur.execute("SAVEPOINT ticker_sp")
+                                    try:
+                                        for ts, row in df_d.iterrows():
+                                            dt = ts.to_pydatetime()
+                                            if dt.tzinfo is None:
+                                                dt = dt.replace(tzinfo=_tz.utc)
+                                            try:
+                                                cur.execute(
+                                                    """
+                                                    INSERT INTO price_ohlc
+                                                        (ticker, bar_datetime, timeframe,
+                                                         open, high, low, close, volume, source)
+                                                    VALUES (%s,%s,'1d',%s,%s,%s,%s,%s,'yfinance')
+                                                    ON CONFLICT (ticker, bar_datetime, timeframe)
+                                                    DO UPDATE SET
+                                                        open=EXCLUDED.open, high=EXCLUDED.high,
+                                                        low=EXCLUDED.low, close=EXCLUDED.close,
+                                                        volume=EXCLUDED.volume, fetched_at=NOW()
+                                                    WHERE price_ohlc.source != 'ib'
+                                                    """,
+                                                    (ticker, dt,
+                                                     float(row["Open"]), float(row["High"]),
+                                                     float(row["Low"]),  float(row["Close"]),
+                                                     int(row["Volume"]) if row.get("Volume") else None),
+                                                )
+                                                upserted_total += cur.rowcount
+                                            except (TypeError, ValueError):
+                                                continue
+                                        cur.execute("RELEASE SAVEPOINT ticker_sp")
+                                        conn_bf.commit()
+                                    except Exception as exc:
+                                        cur.execute("ROLLBACK TO SAVEPOINT ticker_sp")
+                                        conn_bf.commit()
+                                        raise exc
+                            except Exception as exc:
+                                st.warning(f"{ticker} (daily): {exc}")
 
-                arr = pd.Series(pnls)
-                results.append({
-                    "take_profit": f"{tp:.0%}",
-                    "atr_mult": atr_mult,
-                    "total_pnl": round(arr.sum(), 2),
-                    "win_rate": round((arr > 0).mean(), 3),
-                    "sharpe": round((arr.mean() / (arr.std() + 1e-9)) * (252**0.5), 3),
-                    "trades": len(pnls),
-                })
+                        # ── 5-min bars (only dates within yfinance 7-day window) ──
+                        import datetime as _dt_mod  # noqa: PLC0415
+                        today_utc = _dt_mod.datetime.now(_tz.utc).date()
 
+                        # Group missing dates by ticker to minimise yfinance calls
+                        from collections import defaultdict  # noqa: PLC0415
+                        ticker_dates: dict = defaultdict(list)
+                        for ticker, sig_date in missing_5m:
+                            age = (today_utc - sig_date).days
+                            if age <= 7:
+                                ticker_dates[ticker].append(sig_date)
+
+                        skipped_old = total_5m - sum(len(v) for v in ticker_dates.values())
+                        if skipped_old:
+                            st.info(
+                                f"ℹ️ {skipped_old} signal date(s) older than 7 days skipped "
+                                "(IB backfill runs automatically via background service)."
+                            )
+
+                        for idx, (ticker, dates) in enumerate(ticker_dates.items()):
+                            progress_bf.progress(
+                                (total_daily + idx + 1) / total_work,
+                                text=f"5m: {ticker}",
+                            )
+                            try:
+                                df_5m = _flatten(yf.download(
+                                    ticker, period="7d", interval="5m",
+                                    progress=False, auto_adjust=True,
+                                ))
+                                if df_5m.empty:
+                                    continue
+                                target_dates = set(dates)
+                                with conn_bf.cursor() as cur:
+                                    cur.execute("SAVEPOINT ticker_5m_sp")
+                                    try:
+                                        for ts, row in df_5m.iterrows():
+                                            dt = ts.to_pydatetime()
+                                            if dt.tzinfo is None:
+                                                dt = dt.replace(tzinfo=_tz.utc)
+                                            if dt.date() not in target_dates:
+                                                continue
+                                            try:
+                                                cur.execute(
+                                                    """
+                                                    INSERT INTO price_ohlc
+                                                        (ticker, bar_datetime, timeframe,
+                                                         open, high, low, close, volume, source)
+                                                    VALUES (%s,%s,'5m',%s,%s,%s,%s,%s,'yfinance')
+                                                    ON CONFLICT (ticker, bar_datetime, timeframe)
+                                                    DO UPDATE SET
+                                                        open=EXCLUDED.open, high=EXCLUDED.high,
+                                                        low=EXCLUDED.low, close=EXCLUDED.close,
+                                                        volume=EXCLUDED.volume, fetched_at=NOW()
+                                                    WHERE price_ohlc.source != 'ib'
+                                                    """,
+                                                    (ticker, dt,
+                                                     float(row["Open"]), float(row["High"]),
+                                                     float(row["Low"]),  float(row["Close"]),
+                                                     int(row["Volume"]) if row.get("Volume") else None),
+                                                )
+                                                upserted_total += cur.rowcount
+                                            except (TypeError, ValueError):
+                                                continue
+                                        cur.execute("RELEASE SAVEPOINT ticker_5m_sp")
+                                        conn_bf.commit()
+                                    except Exception as exc:
+                                        cur.execute("ROLLBACK TO SAVEPOINT ticker_5m_sp")
+                                        conn_bf.commit()
+                                        raise exc
+                            except Exception as exc:
+                                st.warning(f"{ticker} (5m): {exc}")
+
+                        progress_bf.empty()
+                        st.success(
+                            f"✅ Backfill complete: **{upserted_total}** bars upserted. "
+                            "Reload the page to see updated coverage."
+                        )
+                except Exception as exc:
+                    st.error(f"Backfill failed: {exc}")
+
+    # ── Mode & date range ─────────────────────────────────────────────────────
+    col_m1, col_m2, col_m3 = st.columns([2, 2, 2])
+    bt_mode = col_m1.radio(
+        "Backtest mode",
+        [
+            "Fast (executed trades only)",
+            "Full (all signals, ~30s)",
+            "WFO-Fast (walk-forward, executed trades)",
+            "WFO-Full (walk-forward, all signals)",
+        ],
+        horizontal=False,
+        key="bt_mode",
+    )
+    is_full = bt_mode.startswith("Full")
+    is_wfo  = bt_mode.startswith("WFO")
+    is_wfo_full = bt_mode == "WFO-Full (walk-forward, all signals)"
+
+    days_bt = col_m2.slider("Days of history", 14, 90, 90, key="bt_days")
+    bt_trade_mode = col_m3.radio("Trading mode filter", ["live", "All"], horizontal=True, key="bt_tm")
+
+    mode_clause = "" if bt_trade_mode == "All" else f"AND mode = '{bt_trade_mode}'"
+
+    # ── WFO window config (shown only for WFO modes) ──────────────────────────
+    if is_wfo:
+        st.markdown("#### Walk-Forward Window Configuration")
+        wfo_col1, wfo_col2, wfo_col3 = st.columns(3)
+        wfo_is_days  = wfo_col1.number_input("In-sample (days)", min_value=7, max_value=60, value=28, step=7, key="wfo_is")
+        wfo_oos_days = wfo_col2.number_input("Out-of-sample (days)", min_value=7, max_value=30, value=14, step=7, key="wfo_oos")
+
+        from social_trading.monitoring.streamlit.utils.backtest import _build_wfo_windows  # noqa: E402
+        from datetime import date as _date  # noqa: E402
+        _today    = _date.today()
+        _earliest = _today - __import__("datetime").timedelta(days=days_bt)
+        _est_wins = len(_build_wfo_windows(_earliest, _today, int(wfo_is_days), int(wfo_oos_days)))
+
+        ratio = wfo_is_days / wfo_oos_days
+        ratio_color = "🟢" if ratio >= 4 else ("🟡" if ratio >= 2 else "🔴")
+        win_color   = "🟢" if _est_wins >= 5 else ("🟡" if _est_wins >= 3 else "🔴")
+        wfo_col3.metric("Estimated windows", f"{win_color} {_est_wins}")
+        st.caption(
+            f"IS:OOS ratio: {ratio_color} **{ratio:.1f}:1** "
+            f"{'(recommended ≥4:1)' if ratio < 4 else '✅'} · "
+            f"OOS coverage: **{_est_wins * int(wfo_oos_days)} days** of honest out-of-sample data"
+        )
+
+    # ── Data coverage summary ─────────────────────────────────────────────────
+    if is_full or is_wfo_full:
+        sig_count_df = query(f"""
+            SELECT COUNT(*) AS n FROM signals
+            WHERE generated_at > NOW() - INTERVAL '{days_bt} days'
+        """)
+        sig_count = int(sig_count_df.iloc[0]["n"]) if not sig_count_df.empty else 0
+    else:
+        sig_count = 0
+
+    trade_count_df = query(f"""
+        SELECT COUNT(*) AS n FROM trades
+        WHERE closed_at > NOW() - INTERVAL '{days_bt} days'
+          AND exit_price IS NOT NULL {mode_clause}
+    """)
+    trade_count = int(trade_count_df.iloc[0]["n"]) if not trade_count_df.empty else 0
+
+    if is_full or is_wfo_full:
+        coverage_txt = (
+            f"✅ **{sig_count}** signals · **{trade_count}** trades in range · "
+            f"**{ohlc_tickers}** tickers with OHLC data"
+        )
+    else:
+        coverage_txt = (
+            f"✅ **{trade_count}** trades in range · "
+            f"**{ohlc_tickers}** tickers with OHLC data"
+        )
+    st.info(coverage_txt)
+
+    # ── Parameter checkboxes ──────────────────────────────────────────────────
+    st.markdown("#### Parameters to optimise")
+    col_hdr1, col_hdr2, col_hdr3 = st.columns([1, 4, 1])
+    col_hdr1.markdown("**Include**")
+    col_hdr2.markdown("**Values to test**")
+    col_hdr3.markdown("**Mode**")
+
+    selected_params: dict[str, list] = {}
+    use_full_params = is_full or is_wfo_full
+
+    for param_key, defn in PARAM_DEFS.items():
+        modes_txt = "Fast+Full" if defn["modes"] == {"fast", "full"} else "Full only"
+        available = use_full_params or "fast" in defn["modes"]
+        col1, col2, col3 = st.columns([1, 4, 1])
+        enabled = col1.checkbox(
+            " ", key=f"bt_chk_{param_key}",
+            value=available,
+            disabled=not available,
+            label_visibility="collapsed",
+        )
+        vals = col2.multiselect(
+            defn["label"],
+            defn["options"],
+            default=defn["default"],
+            format_func=defn["fmt"],
+            key=f"bt_vals_{param_key}",
+            disabled=not (available and enabled),
+            label_visibility="visible",
+        )
+        col3.caption(modes_txt)
+        if available and enabled and vals:
+            selected_params[param_key] = vals
+
+    # ── Combination count warning ─────────────────────────────────────────────
+    n_combos = count_combinations(selected_params) if selected_params else 0
+    if n_combos == 0:
+        st.warning("Select at least one parameter to test.")
+    elif n_combos > 10000:
+        st.error(f"**{n_combos} combinations** — reduce to ≤ 10,000 before running.")
+    elif n_combos > 1000:
+        st.warning(f"⚠️ {n_combos} combinations — may take 30–60 s in Full mode.")
+    else:
+        st.success(f"✅ **{n_combos} combinations**")
+
+    cfg_bt = load_config()
+    fixed_params = {
+        "trailing_stop_min_pct": getattr(cfg_bt, "trailing_stop_min_pct", 0.02),
+        "signal_phase1_threshold": cfg_bt.signal_phase1_threshold,
+        "mention_decay_threshold": getattr(cfg_bt, "mention_decay_threshold", 0.25),
+        "sentiment_reversal_threshold": getattr(cfg_bt, "sentiment_reversal_threshold", -0.25),
+        # These serve as "current value" when not in the grid
+        "take_profit_pct":  cfg_bt.take_profit_pct,
+        "atr_multiplier":   cfg_bt.atr_multiplier,
+        "trailing_stop_pct": getattr(cfg_bt, "trailing_stop_pct", 0.07),
+        "max_hold_days":    getattr(cfg_bt, "max_hold_trading_days", 3),
+    }
+
+    can_run = 0 < n_combos <= 10000 and (trade_count >= 3 or ((is_full or is_wfo_full) and sig_count >= 3))
+
+    if st.button("▶ Run Backtest", type="primary", disabled=not can_run, key="bt_run"):
+        conn_bt = get_connection()
+        progress = st.progress(0, text="Loading data…")
+
+        # Load trade / signal data
+        if is_full or is_wfo_full:
+            raw_df = query(f"""
+                SELECT ticker, direction, quality_score, atr, generated_at,
+                       sentiment_score
+                FROM signals
+                WHERE generated_at > NOW() - INTERVAL '{days_bt} days'
+                ORDER BY generated_at
+            """)
+        else:
+            raw_df = query(f"""
+                SELECT t.ticker, t.direction, t.shares, t.entry_price,
+                       t.atr_at_entry, t.opened_at
+                FROM trades t
+                WHERE t.closed_at > NOW() - INTERVAL '{days_bt} days'
+                  AND t.exit_price IS NOT NULL
+                  {mode_clause}
+                ORDER BY t.opened_at
+            """)
+
+        progress.progress(20, text="Loading OHLC bars…")
+        tickers = raw_df["ticker"].unique().tolist() if not raw_df.empty else []
+        ohlc_data = load_ohlc(tickers, conn_bt)
+
+        progress.progress(40, text="Running simulation…")
+
+        if raw_df.empty or len(raw_df) < 3:
+            st.warning("Not enough data for the selected range and mode.")
+            progress.empty()
+        elif is_wfo:
+            from social_trading.monitoring.streamlit.utils.backtest import run_wfo  # noqa: E402
+            wfo_mode = "full" if is_wfo_full else "fast"
+            wfo_result = run_wfo(
+                data_df=raw_df,
+                ohlc_data=ohlc_data,
+                param_grid=selected_params,
+                fixed_params=fixed_params,
+                mode=wfo_mode,
+                is_days=int(wfo_is_days),
+                oos_days=int(wfo_oos_days),
+                total_days=days_bt,
+            )
+            progress.progress(100, text="Done.")
+            progress.empty()
+            if wfo_result.windows:
+                st.session_state["wfo_result"] = wfo_result
+                st.session_state.pop("bt_results", None)
+                st.success(f"WFO complete — {len(wfo_result.windows)} windows, {wfo_result.oos_trades} OOS trades.")
+            else:
+                st.warning("No valid WFO windows produced. Try increasing total history or reducing window sizes.")
+        else:
+            if not (is_full or is_wfo_full):
+                bt_results = run_fast_backtest(
+                    trades_df=raw_df,
+                    ohlc_data=ohlc_data,
+                    param_grid=selected_params,
+                    fixed_params=fixed_params,
+                )
+            else:
+                bt_results = run_full_backtest(
+                    signals_df=raw_df,
+                    ohlc_data=ohlc_data,
+                    param_grid=selected_params,
+                    fixed_params=fixed_params,
+                )
+
+            progress.progress(100, text="Done.")
             progress.empty()
 
-            if results:
-                res_df = pd.DataFrame(results).sort_values("sharpe", ascending=False)
-                st.session_state["grid_results"] = res_df
-                st.success(f"Completed {len(results)} valid combinations")
+            if bt_results:
+                st.session_state["bt_results"] = bt_results
+                st.session_state["bt_selected_params"] = list(selected_params.keys())
+                st.session_state.pop("wfo_result", None)
+                st.success(f"Completed {len(bt_results)} combinations.")
             else:
-                st.warning("No valid combinations produced (need ≥ 5 trades per combination)")
+                st.warning("No valid combinations (need ≥ 3 simulated trades per combo).")
 
-        # Results and Apply button rendered outside the run-button block so
-        # clicking "Apply" doesn't wipe results on rerun.
-        if "grid_results" in st.session_state:
-            res_df = st.session_state["grid_results"]
+    # ── WFO Results ───────────────────────────────────────────────────────────
+    if "wfo_result" in st.session_state:
+        from social_trading.monitoring.streamlit.utils.backtest import WFOResult  # noqa: E402
+        wfo: WFOResult = st.session_state["wfo_result"]
 
-            # Heatmap
-            pivot = res_df.pivot_table(
-                values="sharpe",
-                index="atr_mult",
-                columns="take_profit",
-                aggfunc="mean",
+        st.subheader("Walk-Forward Optimization Results")
+
+        # Warnings
+        for warn in wfo.warnings:
+            icon = "🔴" if "significant" in warn.lower() or "only" in warn.lower() else "⚠️"
+            st.warning(f"{icon} {warn}")
+
+        # Summary metrics
+        wfe_color = "🟢" if wfo.avg_wfe >= 60 else ("🟡" if wfo.avg_wfe >= 40 else "🔴")
+        std_color = "🟢" if wfo.wfe_std < 30 else ("🟡" if wfo.wfe_std < 50 else "🔴")
+        pos_color = "🟢" if wfo.positive_wfe_pct >= 60 else ("🟡" if wfo.positive_wfe_pct >= 40 else "🔴")
+
+        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+        mc1.metric("Avg WFE", f"{wfe_color} {wfo.avg_wfe:.1f}%", help="Target ≥60%")
+        mc2.metric("WFE Std Dev", f"{std_color} {wfo.wfe_std:.1f}%", help="Target <30%")
+        mc3.metric("Positive OOS", f"{pos_color} {wfo.positive_wfe_pct:.0f}%", help="Target ≥60%")
+        mc4.metric("OOS Sharpe", f"{wfo.oos_sharpe:.3f}", delta=f"IS: {wfo.is_sharpe:.3f}")
+        mc5.metric("OOS P&L", f"${wfo.oos_total_pnl:,.2f}")
+        mc6.metric("OOS Trades", str(wfo.oos_trades))
+
+        st.divider()
+
+        # Per-window table
+        st.markdown("#### Per-Window Results")
+        win_rows = []
+        for w in wfo.windows:
+            row = {
+                "Window":     w.window_num,
+                "IS Period":  f"{w.is_start} → {w.is_end}",
+                "OOS Period": f"{w.oos_start} → {w.oos_end}",
+                "IS Sharpe":  f"{w.is_sharpe:.3f}",
+                "OOS Sharpe": f"{w.oos_result.sharpe:.3f}" if w.oos_result else "—",
+                "OOS Trades": w.oos_result.trades if w.oos_result else 0,
+                "WFE %":      f"{w.wfe:.1f}%" if w.wfe is not None else "—",
+            }
+            for k, v in w.best_params.items():
+                fmt = PARAM_DEFS.get(k, {}).get("fmt", str)
+                row[PARAM_DEFS.get(k, {}).get("label", k)] = fmt(v)
+            win_rows.append(row)
+        st.dataframe(pd.DataFrame(win_rows), use_container_width=True, hide_index=True)
+
+        # OOS equity curve (cumulative OOS P&L per window)
+        oos_pnls = [w.oos_result.total_pnl if w.oos_result else 0.0 for w in wfo.windows]
+        if any(p != 0 for p in oos_pnls):
+            st.markdown("#### Combined OOS Equity Curve")
+            eq_df = pd.DataFrame({
+                "Window": [f"W{w.window_num}\n{w.oos_start}" for w in wfo.windows],
+                "OOS P&L": oos_pnls,
+                "Cumulative P&L": pd.Series(oos_pnls).cumsum().tolist(),
+            })
+            fig_eq = px.bar(
+                eq_df, x="Window", y="OOS P&L",
+                color="OOS P&L",
+                color_continuous_scale=["red", "lightgray", "green"],
+                color_continuous_midpoint=0,
+                title="OOS P&L per Window",
             )
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(
+                x=eq_df["Window"], y=eq_df["Cumulative P&L"],
+                mode="lines+markers", name="Cumulative OOS P&L",
+                line={"color": "steelblue", "width": 2},
+            ))
+            fig_line.update_layout(title="Cumulative OOS Equity", height=280)
+            col_eq1, col_eq2 = st.columns(2)
+            col_eq1.plotly_chart(fig_eq, use_container_width=True)
+            col_eq2.plotly_chart(fig_line, use_container_width=True)
+
+        # Parameter stability
+        if wfo.param_stability:
+            st.markdown("#### Parameter Stability Across Windows")
+            stab_rows = []
+            for k, info in wfo.param_stability.items():
+                fmt = PARAM_DEFS.get(k, {}).get("fmt", str)
+                stab_rows.append({
+                    "Parameter": PARAM_DEFS.get(k, {}).get("label", k),
+                    "Stability": "✅ Stable" if info["stable"] else "⚠️ Unstable",
+                    "CV": f"{info['cv']:.2f}",
+                    "Values": " → ".join(fmt(v) for v in info["values"]),
+                    "Range": f"{fmt(info['min'])} – {fmt(info['max'])}",
+                })
+            st.dataframe(pd.DataFrame(stab_rows), use_container_width=True, hide_index=True)
+
+        # Apply — use mode (most frequent) params across windows
+        st.divider()
+        st.markdown("#### Apply Recommended Settings")
+
+        # Modal params: most frequent value per param across windows
+        from collections import Counter  # noqa: E402
+        param_map = {
+            "take_profit_pct":            "take_profit_pct",
+            "atr_multiplier":             "atr_multiplier",
+            "trailing_stop_pct":          "trailing_stop_pct",
+            "max_hold_days":              "max_hold_trading_days",
+            "signal_phase1_threshold":    "signal_phase1_threshold",
+            "mention_decay_threshold":    "mention_decay_threshold",
+            "sentiment_reversal_threshold": "sentiment_reversal_threshold",
+        }
+        modal_params = {}
+        for k in (wfo.param_stability or {}):
+            if k in param_map:
+                vals = [w.best_params.get(k) for w in wfo.windows if w.best_params.get(k) is not None]
+                if vals:
+                    modal_params[k] = Counter(vals).most_common(1)[0][0]
+
+        if modal_params:
+            st.caption("Recommended = most frequent optimal value across all windows (more robust than single-window best).")
+            changes_md = "\n".join(
+                f"- **{PARAM_DEFS.get(k, {}).get('label', k)}**: "
+                f"`{getattr(cfg_bt, param_map[k], '?')}` → `{PARAM_DEFS.get(k, {}).get('fmt', str)(v)}`"
+                for k, v in modal_params.items()
+            )
+            with st.expander("✅ Apply recommended settings to live config", expanded=False):
+                st.warning("**This will update live trading parameters immediately. Running positions are not affected.**")
+                st.markdown(changes_md)
+                confirm_wfo = st.checkbox("I understand this changes live trading behaviour", key="wfo_confirm")
+                if st.button("Apply", type="primary", key="wfo_apply", disabled=not confirm_wfo):
+                    cfg_apply = load_config()
+                    for k, v in modal_params.items():
+                        setattr(cfg_apply, param_map[k], v)
+                    errs = save_config(cfg_apply)
+                    if errs:
+                        for e in errs:
+                            st.error(e)
+                    else:
+                        st.success("Settings applied. Services pick up within ~1 minute.")
+                        del st.session_state["wfo_result"]
+                        st.rerun()
+
+    # ── Standard Grid Search Results ──────────────────────────────────────────
+    if "bt_results" in st.session_state:
+        bt_results: list[BacktestResult] = st.session_state["bt_results"]
+        bt_keys: list[str] = st.session_state.get("bt_selected_params", [])
+        res_df = results_to_dataframe(bt_results)
+
+        # Auto-select top-2 most impactful params for heatmap axes
+        if len(bt_keys) >= 2 and not res_df.empty:
+            # Impact = Pearson correlation with Sharpe
+            impacts = {}
+            for k in bt_keys:
+                if k in res_df.columns and res_df[k].nunique() > 1:
+                    try:
+                        impacts[k] = abs(res_df[k].astype(float).corr(res_df["sharpe"]))
+                    except Exception:
+                        impacts[k] = 0.0
+            top2 = sorted(impacts, key=lambda x: impacts[x], reverse=True)[:2]
+        elif len(bt_keys) == 1:
+            top2 = bt_keys[:1]
+        else:
+            top2 = []
+
+        if len(top2) == 2:
+            pivot = res_df.groupby(top2)["sharpe"].mean().unstack()
             if not pivot.empty:
-                fig = px.imshow(
+                fig_heat = px.imshow(
                     pivot,
-                    title="Sharpe Ratio Heatmap (ATR mult × Take-profit)",
+                    title=f"Sharpe Heatmap ({top2[0]} × {top2[1]})",
                     color_continuous_scale="RdYlGn",
                     aspect="auto",
                     text_auto=".2f",
                 )
-                fig.update_layout(height=350)
-                st.plotly_chart(fig, width='stretch')
+                fig_heat.update_layout(height=350)
+                st.plotly_chart(fig_heat, use_container_width=True)
 
-            st.dataframe(res_df, width='stretch', hide_index=True)
+        # Full results table
+        display_cols = bt_keys + ["sharpe", "win_rate", "total_pnl", "trades", "avg_hold_days"]
+        display_cols = [c for c in display_cols if c in res_df.columns]
+        st.dataframe(
+            res_df[display_cols].style.format({
+                "sharpe": "{:.3f}", "win_rate": "{:.1%}",
+                "total_pnl": "${:.2f}", "avg_hold_days": "{:.1f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            best = res_df.iloc[0]
-            st.subheader("Best combination found")
-            st.write(f"- Take-profit: **{best['take_profit']}**")
-            st.write(f"- ATR multiplier: **{best['atr_mult']}**")
-            st.write(f"- Sharpe: **{best['sharpe']:.3f}** | Win rate: **{best['win_rate']:.1%}**")
+        # Best result summary
+        best = bt_results[0]
+        st.subheader("Best combination found")
+        best_cols = st.columns(len(best.params) + 3)
+        for i, (k, v) in enumerate(best.params.items()):
+            fmt = PARAM_DEFS.get(k, {}).get("fmt", str)
+            best_cols[i].metric(PARAM_DEFS.get(k, {}).get("label", k), fmt(v))
+        best_cols[-3].metric("Sharpe", f"{best.sharpe:.3f}")
+        best_cols[-2].metric("Win rate", f"{best.win_rate:.1%}")
+        best_cols[-1].metric("Trades", str(best.trades))
 
-            if st.button("Apply best settings to config", type="primary", key="apply_grid"):
-                cfg_apply = load_config()
-                cfg_apply.take_profit_pct = float(best["take_profit"].rstrip("%")) / 100
-                cfg_apply.atr_multiplier = float(best["atr_mult"])
-                errs = save_config(cfg_apply)
-                if errs:
-                    for e in errs:
-                        st.error(e)
-                else:
-                    st.success("Settings applied to Redis config. Services will pick up within ~1 minute.")
-                    del st.session_state["grid_results"]
+        # ── Apply with confirmation ───────────────────────────────────────────
+        param_map = {
+            "take_profit_pct":            "take_profit_pct",
+            "atr_multiplier":             "atr_multiplier",
+            "trailing_stop_pct":          "trailing_stop_pct",
+            "max_hold_days":              "max_hold_trading_days",
+            "signal_phase1_threshold":    "signal_phase1_threshold",
+            "mention_decay_threshold":    "mention_decay_threshold",
+            "sentiment_reversal_threshold": "sentiment_reversal_threshold",
+        }
+        applicable = {k: v for k, v in best.params.items() if k in param_map}
+
+        if applicable:
+            changes_md = "\n".join(
+                f"- **{PARAM_DEFS.get(k, {}).get('label', k)}**: "
+                f"`{getattr(cfg_bt, param_map[k], '?')}` → `{PARAM_DEFS.get(k, {}).get('fmt', str)(v)}`"
+                for k, v in applicable.items()
+            )
+
+            with st.expander("✅ Apply best settings to live config", expanded=False):
+                st.warning(
+                    "**This will update the following live parameters immediately. "
+                    "Running positions are not affected — only future trades.**"
+                )
+                st.markdown(changes_md)
+                confirm = st.checkbox(
+                    "I understand this changes live trading behaviour", key="bt_confirm"
+                )
+                if st.button(
+                    "Apply", type="primary", key="bt_apply",
+                    disabled=not confirm,
+                ):
+                    cfg_apply = load_config()
+                    for k, v in applicable.items():
+                        setattr(cfg_apply, param_map[k], v)
+                    errs = save_config(cfg_apply)
+                    if errs:
+                        for e in errs:
+                            st.error(e)
+                    else:
+                        st.success(
+                            "Settings applied to Redis config. "
+                            "Services will pick up within ~1 minute."
+                        )
+                        del st.session_state["bt_results"]
+                        st.rerun()
