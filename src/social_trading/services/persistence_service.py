@@ -295,6 +295,30 @@ def _mark_signal_executed(ticker: str, generated_at: str) -> None:
         conn.close()
 
 
+def _mark_signal_rejected(ticker: str, generated_at: str, reason: str) -> None:
+    """Set rejection_reason on the most recent unrejected signal for (ticker, generated_at).
+
+    Safe to call multiple times — only updates rows where rejection_reason IS NULL
+    so a prior rejection reason is never overwritten.
+    """
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET    rejection_reason = %s
+                    WHERE  ticker = %s
+                      AND  generated_at = %s::timestamptz
+                      AND  rejection_reason IS NULL
+                    """,
+                    (reason, ticker, generated_at),
+                )
+    finally:
+        conn.close()
+
+
 def _mark_latest_signal_executed(ticker: str, within_hours: int = 48) -> bool:
     """
     Best-effort: mark the most recent approved-but-unexecuted signal for `ticker`

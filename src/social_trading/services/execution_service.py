@@ -79,6 +79,23 @@ _GROUP = "execution"
 _CONSUMER = "exec-0"
 _INGEST_BATCH = 16
 
+# Lazy import for rejection recording — avoids circular import at module load.
+def _record_signal_rejection(signal: "Signal", reason: str) -> None:
+    """Fire-and-forget: persist rejection_reason to DB in a thread pool."""
+    try:
+        from social_trading.services.persistence_service import (  # noqa: PLC0415
+            _mark_signal_rejected, _run_db,
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        ts = signal.generated_at.isoformat() if signal.generated_at else ""
+        if ts:
+            _asyncio.create_task(
+                _run_db(_mark_signal_rejected, signal.ticker, ts, reason),
+                name=f"reject_reason:{signal.ticker}",
+            )
+    except Exception:
+        pass  # best-effort only
+
 # Shared halt flag: set by HALT_NEW command, cleared by RESUME.
 # run_trade_loop checks this before opening any new position.
 _halt_flag = asyncio.Event()
@@ -417,6 +434,7 @@ async def run_trade_loop(
                             signal.ticker, hours_elapsed, cfg.signal_age_max_hours,
                         )
                         skipped += 1
+                        _record_signal_rejection(signal, f"expired: {hours_elapsed:.1f}h old at execution (max {cfg.signal_age_max_hours}h)")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -424,6 +442,7 @@ async def run_trade_loop(
                     if _halt_flag.is_set():
                         logger.debug("Skip %s — new positions halted", signal.ticker)
                         skipped += 1
+                        _record_signal_rejection(signal, "halted: new positions halted via UI command")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -454,6 +473,7 @@ async def run_trade_loop(
                     if already_open:
                         logger.debug("Skip %s — position already open", signal.ticker)
                         skipped += 1
+                        _record_signal_rejection(signal, "position_already_open: duplicate signal discarded")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 

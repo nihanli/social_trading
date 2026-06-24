@@ -356,6 +356,7 @@ full_signals = query(f"""
            ROUND(COALESCE(momentum, 0)::numeric, 4)         AS momentum,
            ROUND(COALESCE(convergence, 0)::numeric, 3)      AS convergence,
            approved, executed,
+           COALESCE(rejection_reason, '') AS rejection_reason,
            TO_CHAR(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS time
     FROM signals
     {where}
@@ -375,6 +376,7 @@ if not full_signals.empty:
             "phase2": "color:#2ECC71;font-weight:bold",
             "legacy": "color:#95A5A6",
         }},
+        col_styles={"rejection_reason": "color:#dc3545;font-size:0.85em"},
     )
     st.caption(f"{len(full_signals)} signals shown (max 300)")
 else:

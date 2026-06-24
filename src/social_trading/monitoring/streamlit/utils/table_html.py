@@ -71,6 +71,7 @@ def render_table(
     tooltips: dict[str, dict[str, str]] | None = None,
     link_cols: dict[str, tuple[str, str]] | None = None,
     cell_styles: dict[str, dict[str, str]] | None = None,
+    col_styles: dict[str, str] | None = None,
     hide_cols: list[str] | None = None,
     max_rows: int = 500,
     key: str = "ht",
@@ -88,6 +89,9 @@ def render_table(
         cell_styles:  Mapping of column_name → {cell_value → css_style_string}.
                       Applies inline style to matching cells.
                       E.g. ``{"phase": {"phase1": "color:#4A90D9;font-weight:bold"}}``.
+        col_styles:   Mapping of column_name → css_style_string applied to ALL
+                      non-empty cells in that column regardless of value.
+                      E.g. ``{"rejection_reason": "color:#dc3545;font-size:0.85em"}``.
         hide_cols:    Column names to omit from output.
         max_rows:     Silently cap rows to avoid huge HTML blobs.
         key:          Unused; kept for API consistency.
@@ -99,6 +103,7 @@ def render_table(
     tooltips    = tooltips    or {}
     link_cols   = link_cols   or {}
     cell_styles = cell_styles or {}
+    col_styles  = col_styles  or {}
     hide_cols   = set(hide_cols or [])
 
     display_cols = [c for c in df.columns if c not in hide_cols]
@@ -133,7 +138,11 @@ def render_table(
                 )
                 lines.append(f"<td>{cell}</td>")
             else:
+                # Value-level style takes precedence; fall back to column-level style
+                # for non-empty cells only (don't colour empty rejection_reason cells).
                 style  = cell_styles.get(col, {}).get(val_str, "")
+                if not style and val_str and col in col_styles:
+                    style = col_styles[col]
                 tip    = tooltips.get(col, {}).get(val_str, "")
                 bold   = col in tooltips
                 inner  = f"<b>{html.escape(val_str)}</b>" if bold else html.escape(val_str)

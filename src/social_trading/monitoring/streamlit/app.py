@@ -281,6 +281,7 @@ with col_right:
                ROUND(sentiment_score::numeric, 2)   AS sentiment,
                ROUND(mention_zscore::numeric, 1)    AS vol_z,
                approved, executed,
+               COALESCE(rejection_reason, '') AS rejection_reason,
                TO_CHAR(generated_at, 'HH24:MI:SS') AS time
         FROM signals
         ORDER BY generated_at DESC
@@ -297,6 +298,7 @@ with col_right:
                 "phase2": "color:#2ECC71;font-weight:bold",
                 "legacy": "color:#95A5A6",
             }},
+            col_styles={"rejection_reason": "color:#dc3545;font-size:0.85em"},
         )
     else:
         st.info("No signals recorded yet")

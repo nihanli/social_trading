@@ -51,6 +51,7 @@ from social_trading.risk.circuit_breaker import CircuitBreaker
 from social_trading.risk.liquidity_gate import LiquidityGate, LiquidityQuote
 from social_trading.risk.position_sizer import PositionSizer
 from social_trading.storage.event_bus import TradingEventBus
+from social_trading.services.persistence_service import _mark_signal_rejected, _run_db
 
 load_dotenv()
 
@@ -286,6 +287,16 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
 
 # ── Service main loop ─────────────────────────────────────────────────────────
 
+async def _record_rejection(signal: "Signal", reason: str) -> None:
+    """Best-effort: persist rejection_reason to DB without blocking the hot path."""
+    try:
+        ts = signal.generated_at.isoformat() if signal.generated_at else ""
+        if ts:
+            await _run_db(_mark_signal_rejected, signal.ticker, ts, reason)
+    except Exception as exc:
+        logger.debug("Could not record rejection reason for %s: %s", signal.ticker, exc)
+
+
 async def run_risk_service(
     bus: TradingEventBus,
     breaker: CircuitBreaker,
@@ -350,6 +361,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="stale").inc()
+                    await _record_rejection(signal, f"stale: age {signal_age_sec:.0f}s > max {cfg.signal_approval_max_age_min * 60}s")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -364,6 +376,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="cooldown").inc()
+                    await _record_rejection(signal, f"cooldown: {cooldown_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -385,6 +398,7 @@ async def run_risk_service(
                     logger.info("REJECTED (liquidity) %s: %s", signal.ticker, gate_result.reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="liquidity").inc()
+                    await _record_rejection(signal, f"liquidity: {gate_result.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -410,6 +424,7 @@ async def run_risk_service(
                     logger.info("REJECTED (sizer) %s: %s", signal.ticker, size_reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sizer").inc()
+                    await _record_rejection(signal, f"sizer: {size_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -421,6 +436,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="adv_pct").inc()
+                    await _record_rejection(signal, f"adv_pct: {gate_result2.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -433,6 +449,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="atr_zero").inc()
+                    await _record_rejection(signal, "atr_zero: ATR=0, cannot compute stop-loss")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -451,6 +468,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sl_invalid").inc()
+                    await _record_rejection(signal, f"sl_invalid: entry={entry_price:.2f} ATR={atr:.4f} → sl={stop_loss:.2f} ≤ 0")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
