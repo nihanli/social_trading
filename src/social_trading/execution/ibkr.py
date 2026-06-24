@@ -718,16 +718,41 @@ class IBKRExecutionEngine:
         except Exception as exc:
             logger.error("[IBKR] submit_signal failed for %s: %s", ticker, exc)
             # If the entry was placed and accepted, attempt emergency close
-            if entry_trade is not None and (
+            _entry_confirmed = entry_trade is not None and (
                 entry_trade.fills or entry_trade.orderStatus.status in (
                     OrderStatus.Submitted, OrderStatus.Filled
                 )
-            ):
+            )
+            if _entry_confirmed:
                 logger.warning("[IBKR] Emergency close after submit error: %s", ticker)
+                _close_ok = False
                 try:
-                    await self.close_position(ticker, reason="SUBMIT_ERROR")
+                    _cr = await self.close_position(ticker, reason="SUBMIT_ERROR")
+                    _close_ok = _cr.status not in ("rejected",)
                 except Exception as close_exc:
                     logger.error("[IBKR] Emergency close failed: %s", close_exc)
+
+                if not _close_ok:
+                    # Emergency close also failed — IB position still open but untracked.
+                    # Seed minimal params so the duplicate-entry guard (Layer 2 in-memory)
+                    # blocks any re-entry on the next signal cycle.  The reconcile loop
+                    # and naked-position check will handle cleanup on the next cycle.
+                    logger.error(
+                        "[IBKR] %s: emergency close failed — seeding params to block re-entry; "
+                        "reconcile will clean up the open position",
+                        ticker,
+                    )
+                    self._position_params[ticker] = {
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "opened_at": opened_at_dt.isoformat(),
+                        "direction": signal.direction,
+                        "source": "system",
+                        "entry_price": fill_price or 0.0,
+                        "shares": quantity,
+                        "oca_group": "",  # no OCA placed — naked; reattach will fire
+                        "emergency_close_failed": True,
+                    }
             return OrderResult(
                 order_id=str(entry_id) if entry_id else str(uuid.uuid4()),
                 ticker=ticker,
@@ -760,13 +785,26 @@ class IBKRExecutionEngine:
                         and getattr(trade.order, "orderRef", "") == ORDER_REF):
                     self._ib.cancelOrder(trade.order)
 
-            # Determine close action from existing position
+            # Determine close action from existing position.
+            # IB updates its positions() cache asynchronously after a fill — there's
+            # a brief window (~1s) where positions() still shows 0 even though the
+            # position exists.  Retry once after a short wait to avoid incorrectly
+            # returning "rejected" when the entry just filled a moment ago.
             positions = self._ib.positions()
             pos_qty = 0
             for p in positions:
                 if p.contract.symbol == ticker:
                     pos_qty = int(p.position)
                     break
+
+            if pos_qty == 0:
+                # One retry after brief wait to let IB propagate the fill to the cache
+                await asyncio.sleep(1.0)
+                positions = self._ib.positions()
+                for p in positions:
+                    if p.contract.symbol == ticker:
+                        pos_qty = int(p.position)
+                        break
 
             if pos_qty == 0:
                 return OrderResult(

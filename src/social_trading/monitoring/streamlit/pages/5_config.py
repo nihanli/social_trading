@@ -449,6 +449,33 @@ with tab_sig:
         )
 
     st.divider()
+    st.subheader("Contrarian Mode")
+    st.caption(
+        "Statistical analysis of 143 closed trades shows the social-buzz signal is a reliable "
+        "**contrarian** indicator — bullish social sentiment precedes price declines, and vice versa. "
+        "When enabled, every signal direction is inverted at generation time: "
+        "LONG → SHORT and SHORT → LONG."
+    )
+    contrarian_on = st.toggle(
+        "🔄 Enable Contrarian Mode (invert all signal directions)",
+        value=bool(cfg.contrarian_mode),
+        help=(
+            "Flipped strategy back-test result: Total PnL +$7,518 vs −$566 original, "
+            "win rate 59% vs 33%, profit factor 5.0 vs 0.86, Sharpe +8.7 vs −0.85, "
+            "max drawdown $309 vs $1,636. Default: OFF."
+        ),
+    )
+    if contrarian_on and not cfg.contrarian_mode:
+        st.warning(
+            "⚠️ **Contrarian mode will be enabled.** All new signals will trade the "
+            "**opposite** direction of social sentiment. Existing open positions are "
+            "unaffected — they follow the direction they were opened with."
+        )
+    elif not contrarian_on and cfg.contrarian_mode:
+        st.info("ℹ️ Contrarian mode will be **disabled**. Signals will resume normal direction.")
+    cfg.contrarian_mode = contrarian_on
+
+    st.divider()
     st.subheader("Two-Phase Thresholds")
     st.caption(
         "Phase 1 uses free Tier-1 sources (always on). "

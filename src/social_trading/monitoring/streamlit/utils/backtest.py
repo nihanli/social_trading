@@ -187,6 +187,12 @@ def _simulate_trade(
     """
     Simulate a single trade walk-forward using stored OHLC bars.
 
+    ``params`` may include ``contrarian`` (bool, default False).  When True,
+    the sentiment-reversal trail-tightening check is inverted so that a
+    contrarian SHORT (opened on bullish buzz) tightens only when sentiment
+    turns *negative* — i.e. when the original thesis (social-buzz pump) is
+    no longer present — rather than when it stays bullish.
+
     Returns a dict with keys: pnl, exit_reason, hold_days.
     Returns None if insufficient price data is available.
     """
@@ -197,6 +203,7 @@ def _simulate_trade(
     trail_min   = params.get("trailing_stop_min_pct", 0.02)
     mention_thr = params.get("mention_decay_threshold", 0.25)
     sent_thr    = params.get("sentiment_reversal_threshold", -0.25)
+    is_contrarian = bool(params.get("contrarian", False))
 
     ep = entry_price
     atr_val = atr if atr and atr > 0 else ep * 0.02   # fallback: 2% proxy
@@ -285,8 +292,15 @@ def _simulate_trade(
             if sentiment_series is not None:
                 try:
                     sv = float(sentiment_series.get(bar_date, 0.0))
-                    if (direction == "LONG" and sv < sent_thr) or \
-                       (direction == "SHORT" and sv > -sent_thr):
+                    # In contrarian mode the position direction is the OPPOSITE
+                    # of the original sentiment.  A contrarian SHORT was opened
+                    # on bullish buzz — tighten when buzz disappears (sv negative).
+                    # A contrarian LONG was opened on bearish buzz — tighten when
+                    # bearish buzz disappears (sv positive).
+                    # In normal mode: LONG tightens on negative sentiment, SHORT on positive.
+                    check_long = (direction == "LONG") ^ is_contrarian
+                    if (check_long and sv < sent_thr) or \
+                       (not check_long and sv > -sent_thr):
                         trail_applied = min(trail_applied, trail_min)
                 except Exception:
                     pass

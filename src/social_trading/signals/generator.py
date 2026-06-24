@@ -89,20 +89,35 @@ class SignalGenerator:
             )
             return None
 
+        # Raw sentiment direction (pre-flip) — used for alignment/convergence
+        # checks so they evaluate against the actual market signal, not the
+        # trade direction that results from contrarian inversion.
+        sentiment_direction: Direction = direction
+        if cfg.contrarian_mode and direction != "FLAT":  # type: ignore[comparison-overlap]
+            direction = "SHORT" if direction == "LONG" else "LONG"
+
         # ── 2. Price alignment check (skip if no market data) ────────────────
-        if price_momentum != 0.0 and not _price_aligned(direction, price_momentum):
-            logger.debug(
-                "%s: price misaligned — direction=%s momentum=%.3f",
-                stats.ticker, direction, price_momentum,
-            )
-            return None
+        # In contrarian mode the thesis is that a rising stock with bullish
+        # buzz is about to reverse — price alignment against the trade
+        # direction would incorrectly filter out exactly these setups.
+        # We still want to detect *reactive* signals (price already moved),
+        # but the directional filter itself is skipped.
+        if price_momentum != 0.0 and not cfg.contrarian_mode:
+            if not _price_aligned(sentiment_direction, price_momentum):
+                logger.debug(
+                    "%s: price misaligned — direction=%s momentum=%.3f",
+                    stats.ticker, sentiment_direction, price_momentum,
+                )
+                return None
 
         # ── 3. Compute quality factors ────────────────────────────────────────
         v = _normalise_volume(volume_zscore)
         s = min(abs(stats.mean_score), 1.0)
         p = 0.0 if is_reactive else 1.0
         m = _normalise_momentum(price_momentum)
-        c = _convergence(stats.source_scores, direction, cfg)
+        # Convergence measures cross-platform agreement with the *sentiment*
+        # direction, not the (possibly flipped) trade direction.
+        c = _convergence(stats.source_scores, sentiment_direction, cfg)
 
         raw_quality = (
             cfg.w_volume       * v
@@ -148,6 +163,8 @@ class SignalGenerator:
                 "window_hours": stats.window_hours,
                 "is_reactive": is_reactive,
                 "quality_factors": {"v": v, "s": s, "p": p, "m": m, "c": c},
+                "sentiment_direction": sentiment_direction,
+                "contrarian": cfg.contrarian_mode,
             },
         )
 

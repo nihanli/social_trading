@@ -243,13 +243,23 @@ def _sentiment_reversal(
     """
     Returns True if sentiment has reversed against the position direction.
 
-    Reversal condition:
-      LONG:  current_sentiment < cfg.signal_reversal_threshold  (strongly negative)
-      SHORT: current_sentiment > -cfg.signal_reversal_threshold (strongly positive)
+    In normal mode:
+      LONG:  reversal when current_sentiment < threshold  (strongly negative)
+      SHORT: reversal when current_sentiment > -threshold (strongly positive)
+
+    In contrarian mode the position direction is the *opposite* of the
+    original sentiment, so the check is inverted: a contrarian LONG was
+    opened on bearish buzz, and its reversal is when sentiment turns
+    strongly *positive* (buzz drying up or flipping bullish).
 
     signal_reversal_threshold is stored as a negative number in cfg (e.g. -0.20).
     """
     threshold = cfg.signal_reversal_threshold  # e.g. -0.20
-    if position.direction == "LONG":
+    # In contrarian mode flip the logical direction so we compare against the
+    # *original* sentiment polarity rather than the trade direction.
+    is_long = position.direction == "LONG"
+    if cfg.contrarian_mode:
+        is_long = not is_long
+    if is_long:
         return current_sentiment < threshold
     return current_sentiment > -threshold

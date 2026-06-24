@@ -1872,7 +1872,9 @@ async def _reconcile_ib_state(
     except Exception as exc:
         logger.debug("[RECONCILE] open-order prime failed: %s", exc)
     try:
-        await ib.reqPositionsAsync()
+        await asyncio.wait_for(ib.reqPositionsAsync(), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.warning("[RECONCILE] reqPositionsAsync timed out after 30s — using cached positions")
     except Exception as exc:
         logger.debug("[RECONCILE] reqPositionsAsync failed: %s", exc)
 
@@ -1906,6 +1908,8 @@ async def _reconcile_ib_state(
     trail_order_ids: dict[str, int] = {}
     system_tickers: set[str] = set()
     protected_tickers: set[str] = set()
+    # ticker → max single protective-order quantity seen (for under-coverage check)
+    _reconcile_protective_qty: dict[str, float] = {}
     # Tickers with a pending system MKT order (likely a close order submitted by
     # run_price_eval_loop that hasn't filled yet).  Reconcile skips the naked-position
     # check for these tickers to avoid conflicting with the in-flight close order.
@@ -1940,6 +1944,9 @@ async def _reconcile_ib_state(
                 trail_order_ids[ticker] = order_id
             if order_type in _protective_order_types and status not in _done_statuses:
                 protected_tickers.add(ticker)
+                qty = float(getattr(order, "totalQuantity", 0) or 0)
+                if qty > _reconcile_protective_qty.get(ticker, 0.0):
+                    _reconcile_protective_qty[ticker] = qty
             if order_type == "MKT" and status not in _done_statuses:
                 # Pending system MKT order — likely a close order from price_eval_loop
                 pending_mkt_tickers.add(ticker)
@@ -1954,7 +1961,14 @@ async def _reconcile_ib_state(
     _latest_fill_time: dict[str, datetime | None] = {}
     _fill_accum: dict[str, tuple[float, float]] = {}
     try:
-        executions = await ib.reqExecutionsAsync(ExecutionFilter())
+        executions = await asyncio.wait_for(ib.reqExecutionsAsync(ExecutionFilter()), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.warning("[RECONCILE] reqExecutionsAsync timed out after 30s — skipping fill classification")
+        executions = []
+    except Exception as exc:
+        logger.warning("[RECONCILE] Failed to read IB executions (reqExecutionsAsync): %s", exc)
+        executions = []
+    try:
         for fill in executions or []:
             record = _execution_fill_to_dict(fill)
             ticker = str(record.get("ticker", "")).upper()
@@ -1981,7 +1995,7 @@ async def _reconcile_ib_state(
                     _pv, _ps = _fill_accum.get(_key, (0.0, 0.0))
                     _fill_accum[_key] = (_pv + (_px * _qty), _ps + _qty)
     except Exception as exc:
-        logger.warning("[RECONCILE] Failed to read IB executions: %s", exc)
+        logger.warning("[RECONCILE] Failed to process IB executions: %s", exc)
 
     _round_tripped_today: set[str] = set()
     for t, sides in _fill_sides_by_ticker.items():
@@ -2012,7 +2026,17 @@ async def _reconcile_ib_state(
     completed_by_ticker: dict[str, float] = {}
     system_entry_tickers: set[str] = set()
     try:
-        for order_state in (await ib.reqCompletedOrdersAsync(apiOnly=False) or []):
+        _completed_orders = await asyncio.wait_for(
+            ib.reqCompletedOrdersAsync(apiOnly=False), timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[RECONCILE] reqCompletedOrdersAsync timed out after 30s — skipping completed-order check")
+        _completed_orders = []
+    except Exception as exc:
+        logger.debug("[RECONCILE] reqCompletedOrders unavailable: %s", exc)
+        _completed_orders = []
+    try:
+        for order_state in (_completed_orders or []):
             sym = str(getattr(getattr(order_state, "contract", None), "symbol", "") or "").upper()
             ref = getattr(getattr(order_state, "order", None), "orderRef", "")
             ot = getattr(getattr(order_state, "order", None), "orderType", "")
@@ -2025,7 +2049,7 @@ async def _reconcile_ib_state(
                 if avg_fill > 0:
                     completed_by_ticker[sym] = avg_fill
     except Exception as exc:
-        logger.debug("[RECONCILE] reqCompletedOrders unavailable: %s", exc)
+        logger.debug("[RECONCILE] Failed to process completed orders: %s", exc)
 
     app_params = await redis.hgetall(_POSITION_PARAMS_KEY)
     params: dict[str, dict] = {}
@@ -2302,6 +2326,25 @@ async def _reconcile_ib_state(
                         if state == "matched":
                             state = "naked"
                             reason = f"{ticker}: position is open but no active STP/TRAIL order is present."
+                elif ticker in protected_tickers and str(app_entry.get("source", "system")).lower() == "system":
+                    # Under-coverage check: protective order exists but covers fewer shares
+                    # than the actual IB position.  This can happen when duplicate entry orders
+                    # resulted in an oversized position while only one OCA bracket was placed.
+                    _pos_qty = float(ib_shares)
+                    _oca_qty = _reconcile_protective_qty.get(ticker, 0.0)
+                    _COVERAGE_TOL = 1
+                    if _pos_qty > 0 and (_pos_qty - _oca_qty) > _COVERAGE_TOL and ticker not in pending_mkt_tickers:
+                        naked_tickers.add(ticker)
+                        if state in ("matched", "shares_synced"):
+                            state = "naked"
+                            reason = (
+                                f"{ticker}: under-covered — position has {int(_pos_qty)} share(s) "
+                                f"but protective OCA order covers only {int(_oca_qty)}."
+                            )
+                        logger.warning(
+                            "[RECONCILE] %s: under-covered — position %.0f shares, OCA covers %.0f",
+                            ticker, _pos_qty, _oca_qty,
+                        )
 
             elif ib_entry and not app_entry:
                 if ticker in (system_tickers | system_entry_tickers):
@@ -2689,10 +2732,15 @@ async def _check_naked_positions(
     # A ticker is "protected" only if IB has at least one active STP/TRAIL order
     # placed by this system (orderRef == ORDER_REF).  A bare LMT (TP-only) is not
     # a protective order — it cannot prevent unlimited loss.
+    # We also track the TOTAL protective quantity per ticker so we can detect
+    # "under-covered" positions where the OCA covers fewer shares than are held
+    # (e.g. duplicate entry orders resulted in 2× shares but only one OCA set).
     _protective_order_types = {"STP", "STP LMT", "TRAIL"}
     _done_statuses = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
     _active_statuses = {"PendingSubmit", "PreSubmitted", "Submitted"}
     protected_tickers: set[str] = set()
+    # ticker → max single protective-order quantity seen (IB OCA shares per leg)
+    _protective_qty: dict[str, float] = {}
     # Tickers with a pending MKT close order — OCA was intentionally cancelled
     # before the close was submitted.  Do NOT reattach for these: doing so would
     # place new bracket orders that conflict with the in-flight MKT close.
@@ -2711,6 +2759,12 @@ async def _check_naked_positions(
                 continue
             if ot in _protective_order_types:
                 protected_tickers.add(sym)
+                qty = float(getattr(ord_obj, "totalQuantity", 0) or 0)
+                # Use the MAX single-order qty as the coverage size.  In a normal
+                # bracket each OCA leg has the same qty; taking max avoids inflating
+                # when IB reports partial-fill remainders on one leg.
+                if qty > _protective_qty.get(sym, 0.0):
+                    _protective_qty[sym] = qty
             elif ot == "MKT" and status in _active_statuses:
                 # Active MKT order = a close submitted but not yet filled.
                 # OCA brackets were intentionally cancelled before this order.
@@ -2719,8 +2773,29 @@ async def _check_naked_positions(
         logger.warning("[NAKED] Could not inspect IB open trades: %s — skipping check", exc)
         return just_closed, just_reattached  # cannot safely assess
 
+    # Under-covered: has a protective order but it covers fewer shares than held.
+    # This happens when duplicate entry orders result in an oversized position
+    # while only one OCA bracket was placed.  Treat these as naked so a full
+    # reattach is attempted for the correct (IB-reported) position size.
+    _COVERAGE_TOLERANCE = 1  # allow 1-share rounding difference
+    under_covered_tickers: set[str] = set()
+    for pos in open_positions:
+        t = pos.ticker
+        if t not in protected_tickers or t in pending_mkt_close_tickers:
+            continue
+        pos_qty = float(abs(pos.shares))
+        oca_qty = _protective_qty.get(t, 0.0)
+        if pos_qty > 0 and (pos_qty - oca_qty) > _COVERAGE_TOLERANCE:
+            under_covered_tickers.add(t)
+            logger.warning(
+                "[NAKED] %s: under-covered — position has %.0f share(s) but "
+                "protective OCA order covers only %.0f; treating as naked",
+                t, pos_qty, oca_qty,
+            )
+
     naked = [p for p in open_positions
-             if p.ticker not in protected_tickers and p.ticker not in pending_mkt_close_tickers]
+             if (p.ticker not in protected_tickers or p.ticker in under_covered_tickers)
+             and p.ticker not in pending_mkt_close_tickers]
     for ticker in pending_mkt_close_tickers:
         if any(p.ticker == ticker for p in open_positions):
             logger.info(
@@ -2741,16 +2816,40 @@ async def _check_naked_positions(
         direction = params.get("direction", pos.direction)
         quantity = int(params.get("shares", pos.shares)) or pos.shares
         known_oca_group = params.get("oca_group", "")
+        opened_at_str = params.get("opened_at", "")
 
-        # During the startup grace window, IB's openTrades() cache may be
-        # incomplete (openOrder callbacks still arriving).  If this position
-        # has a known OCA group from persisted params, the bracket was placed
-        # in a prior session — skip reattach and let the next cycle confirm.
-        if _in_grace and known_oca_group:
+        # ── Per-position OCA propagation grace window ─────────────────────────
+        # IB broadcasts open-order callbacks asynchronously after placeOrder().
+        # If the position was just entered (within the last 60s), its OCA orders
+        # may not yet be visible in openTrades() even though they were placed.
+        # Skip reattach if oca_group is already recorded in params — proof that
+        # OCA placement was attempted.  The next exit-loop cycle (60s later)
+        # will confirm whether IB has the orders or a real reattach is needed.
+        # This prevents a duplicate OCA set when the exit loop fires before IB
+        # propagates the freshly placed bracket back to openTrades().
+        _OCA_PROPAGATION_GRACE_SECS = 60.0
+        _recent_entry = False
+        if known_oca_group and opened_at_str:
+            try:
+                _opened_dt = datetime.fromisoformat(opened_at_str)
+                if _opened_dt.tzinfo is None:
+                    _opened_dt = _opened_dt.replace(tzinfo=UTC)
+                _age = (datetime.now(UTC) - _opened_dt).total_seconds()
+                if _age < _OCA_PROPAGATION_GRACE_SECS:
+                    _recent_entry = True
+            except Exception:
+                pass
+
+        # During the startup grace window OR for a recently entered position
+        # with a known OCA group, skip reattach — the bracket is either still
+        # propagating or was placed in a prior session.
+        if ((_in_grace or _recent_entry) and known_oca_group):
             logger.debug(
-                "[NAKED] %s: startup grace period — skipping reattach "
+                "[NAKED] %s: %s grace — skipping reattach "
                 "(oca_group=%r already placed; openTrades cache may be incomplete)",
-                ticker, known_oca_group,
+                ticker,
+                "startup" if _in_grace else f"recent-entry ({int((_age if _recent_entry else 0))}s old)",  # type: ignore[possibly-undefined]
+                known_oca_group,
             )
             continue
 
@@ -3223,6 +3322,9 @@ async def _reconcile_startup(
             # ── Confirmed close: IB has a fill record — proceed with cleanup ──
             # We have evidence the position was closed; record the event and
             # remove from all tracking structures.
+            # Cancel any remaining open OCA bracket orders first — the position
+            # may have been closed offline via a non-OCA path, leaving brackets live.
+            _cancel_bracket_orders_sync(engine, ticker)  # type: ignore[arg-type]
             engine.forget_position(ticker)  # type: ignore[union-attr]
             await redis.hdel(_HWM_REDIS_KEY, ticker)
             await redis.hdel(_POSITION_PARAMS_KEY, ticker)
@@ -4098,6 +4200,41 @@ async def _save_eod_snapshot(cfg: SystemConfig, mode: str) -> None:
         logger.error("[EOD] Failed to save session snapshot: %s", exc, exc_info=True)
 
 
+def _cancel_bracket_orders_sync(engine: ExecutionEngine, ticker: str) -> int:
+    """
+    Cancel all open bracket/OCA orders for *ticker* that were placed by this
+    system (orderRef == ORDER_REF).  Returns the number of cancels issued.
+
+    This is intentionally synchronous (fire-and-forget) because ib_async's
+    cancelOrder() enqueues the cancel in the TWS message buffer; no await
+    is needed or possible.  Safe to call even when the position has already
+    been closed — cancelling an already-inactive order is a no-op at IB.
+    """
+    try:
+        from social_trading.execution.ibkr import ORDER_REF  # noqa: PLC0415
+        ib_obj = getattr(engine, "_ib", None)
+        if ib_obj is None:
+            return 0
+        count = 0
+        for trade in ib_obj.openTrades():
+            sym = getattr(getattr(trade, "contract", None), "symbol", "")
+            ord_obj = getattr(trade, "order", None)
+            ref = getattr(ord_obj, "orderRef", "")
+            if sym == ticker and ref == ORDER_REF:
+                try:
+                    ib_obj.cancelOrder(ord_obj)
+                    count += 1
+                except Exception as _ce:
+                    logger.debug("[SYNC] cancelOrder for %s orderId=%s failed: %s",
+                                 ticker, getattr(ord_obj, "orderId", "?"), _ce)
+        if count:
+            logger.info("[SYNC] %s: cancelled %d orphaned bracket order(s)", ticker, count)
+        return count
+    except Exception as exc:
+        logger.debug("[SYNC] _cancel_bracket_orders_sync(%s) error: %s", ticker, exc)
+        return 0
+
+
 async def _reconcile_external_closes(
     redis: aioredis.Redis,
     engine: ExecutionEngine,
@@ -4331,6 +4468,14 @@ async def _reconcile_external_closes(
             except Exception as _ae:
                 logger.debug("[SYNC] Failed to write fill_sync alert for %s: %s", ticker, _ae)
 
+
+        # Cancel any remaining open OCA bracket orders for this ticker.
+        # When a position is closed by an IB OCA fill, IB auto-cancels the
+        # other OCA legs.  But if it was closed via a manual TWS market order
+        # (bypassing OCA) the bracket orders remain as orphaned GTC orders.
+        # We always issue the cancel here — it's a no-op for already-inactive
+        # orders and prevents accidental re-entry if a bracket leg fires later.
+        _cancel_bracket_orders_sync(engine, ticker)
 
         engine.forget_position(ticker)
         await redis.hdel(_HWM_REDIS_KEY, ticker)

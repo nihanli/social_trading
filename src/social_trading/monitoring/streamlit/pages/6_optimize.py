@@ -688,6 +688,47 @@ with tab_grid:
 
     mode_clause = "" if bt_trade_mode == "All" else f"AND mode = '{bt_trade_mode}'"
 
+    # ── Contrarian population filter ──────────────────────────────────────────
+    st.caption(
+        "**Signal population**: choose which trades/signals to include. "
+        "Mixing normal and contrarian trades in one optimisation produces "
+        "misleading results because the two strategies have opposite price dynamics."
+    )
+    contrarian_filter = st.radio(
+        "Signal population",
+        ["Normal only", "Contrarian only", "All (mixed — not recommended)"],
+        horizontal=True,
+        key="bt_contrarian_filter",
+        help=(
+            "Normal = signals generated before contrarian mode was enabled (direction follows sentiment). "
+            "Contrarian = signals generated with contrarian_mode=True (direction is inverted). "
+            "Mixing both will optimise for a blended population that may not reflect either strategy."
+        ),
+    )
+    if contrarian_filter == "Normal only":
+        contrarian_clause_signals = "AND (metadata->>'contrarian')::boolean IS NOT TRUE"
+        contrarian_clause_trades  = (
+            "AND (SELECT (s.metadata->>'contrarian')::boolean "
+            "     FROM signals s WHERE s.id = t.signal_id) IS NOT TRUE"
+        )
+        bt_is_contrarian = False
+    elif contrarian_filter == "Contrarian only":
+        contrarian_clause_signals = "AND (metadata->>'contrarian')::boolean = TRUE"
+        contrarian_clause_trades  = (
+            "AND (SELECT (s.metadata->>'contrarian')::boolean "
+            "     FROM signals s WHERE s.id = t.signal_id) = TRUE"
+        )
+        bt_is_contrarian = True
+    else:
+        contrarian_clause_signals = ""
+        contrarian_clause_trades  = ""
+        bt_is_contrarian = None  # mixed — warn below
+        st.warning(
+            "⚠️ **Mixed population** — optimisation results will reflect a blend of "
+            "normal and contrarian trades. Parameter recommendations may not be valid "
+            "for either strategy independently."
+        )
+
     # ── WFO window config (shown only for WFO modes) ──────────────────────────
     if is_wfo:
         st.markdown("#### Walk-Forward Window Configuration")
@@ -716,15 +757,17 @@ with tab_grid:
         sig_count_df = query(f"""
             SELECT COUNT(*) AS n FROM signals
             WHERE generated_at > NOW() - INTERVAL '{days_bt} days'
+              {contrarian_clause_signals}
         """)
         sig_count = int(sig_count_df.iloc[0]["n"]) if not sig_count_df.empty else 0
     else:
         sig_count = 0
 
     trade_count_df = query(f"""
-        SELECT COUNT(*) AS n FROM trades
+        SELECT COUNT(*) AS n FROM trades t
         WHERE closed_at > NOW() - INTERVAL '{days_bt} days'
           AND exit_price IS NOT NULL {mode_clause}
+          {contrarian_clause_trades}
     """)
     trade_count = int(trade_count_df.iloc[0]["n"]) if not trade_count_df.empty else 0
 
@@ -795,6 +838,9 @@ with tab_grid:
         "atr_multiplier":   cfg_bt.atr_multiplier,
         "trailing_stop_pct": getattr(cfg_bt, "trailing_stop_pct", 0.07),
         "max_hold_days":    getattr(cfg_bt, "max_hold_trading_days", 3),
+        # Pass contrarian flag so _simulate_trade inverts sentiment-reversal check correctly.
+        # None (mixed) defaults to False — least surprising behaviour for blended data.
+        "contrarian": bool(bt_is_contrarian) if bt_is_contrarian is not None else False,
     }
 
     can_run = 0 < n_combos <= 10000 and (trade_count >= 3 or ((is_full or is_wfo_full) and sig_count >= 3))
@@ -810,6 +856,7 @@ with tab_grid:
                        sentiment_score
                 FROM signals
                 WHERE generated_at > NOW() - INTERVAL '{days_bt} days'
+                  {contrarian_clause_signals}
                 ORDER BY generated_at
             """)
         else:
@@ -820,6 +867,7 @@ with tab_grid:
                 WHERE t.closed_at > NOW() - INTERVAL '{days_bt} days'
                   AND t.exit_price IS NOT NULL
                   {mode_clause}
+                  {contrarian_clause_trades}
                 ORDER BY t.opened_at
             """)
 
