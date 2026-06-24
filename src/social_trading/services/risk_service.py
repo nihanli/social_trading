@@ -287,30 +287,40 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
 
 # ── Service main loop ─────────────────────────────────────────────────────────
 
-async def _record_rejection(signal: "Signal", reason: str) -> None:
-    """Best-effort: persist rejection_reason to DB without blocking the hot path.
+def _record_rejection(signal: "Signal", reason: str) -> None:
+    """Fire-and-forget: schedule a background task that persists rejection_reason.
 
     The persistence service inserts signal rows from the same Redis stream in a
-    separate consumer group.  There is a race: risk_service may reject a signal
-    before persistence_service has inserted the row.  Retry up to 3 times with
-    a short delay so the INSERT has time to land.
+    separate consumer group.  Both groups wake from the same xreadgroup block
+    simultaneously, but the risk service finishes its in-memory checks faster
+    than the persistence service finishes the DB INSERT.  The background task
+    retries up to 6 times (≈5s total) so the INSERT has plenty of time to land
+    without blocking the risk-service hot path.
     """
-    try:
-        ts = signal.generated_at.isoformat() if signal.generated_at else ""
-        if not ts:
-            return
-        for attempt in range(3):
+    async def _persist(ticker: str, ts: str, r: str) -> None:
+        for attempt in range(6):
             if attempt:
-                await asyncio.sleep(0.8)  # give persistence service time to INSERT
-            rows = await _run_db(_mark_signal_rejected, signal.ticker, ts, reason)
-            if rows:
-                return
+                await asyncio.sleep(1.0)
+            try:
+                rows = await _run_db(_mark_signal_rejected, ticker, ts, r)
+                if rows:
+                    return
+            except Exception as exc:
+                logger.debug("rejection reason attempt %d failed for %s: %s", attempt, ticker, exc)
         logger.debug(
             "rejection_reason not saved for %s @ %s after retries (row may not exist)",
-            signal.ticker, ts,
+            ticker, ts,
         )
+
+    try:
+        ts = signal.generated_at.isoformat() if signal.generated_at else ""
+        if ts:
+            asyncio.create_task(
+                _persist(signal.ticker, ts, reason),
+                name=f"reject_reason:{signal.ticker}",
+            )
     except Exception as exc:
-        logger.debug("Could not record rejection reason for %s: %s", signal.ticker, exc)
+        logger.debug("Could not schedule rejection reason for %s: %s", signal.ticker, exc)
 
 
 async def run_risk_service(
@@ -377,7 +387,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="stale").inc()
-                    await _record_rejection(signal, f"stale: age {signal_age_sec:.0f}s > max {cfg.signal_approval_max_age_min * 60}s")
+                    _record_rejection(signal, f"stale: age {signal_age_sec:.0f}s > max {cfg.signal_approval_max_age_min * 60}s")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -392,7 +402,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="cooldown").inc()
-                    await _record_rejection(signal, f"cooldown: {cooldown_reason}")
+                    _record_rejection(signal, f"cooldown: {cooldown_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -414,7 +424,7 @@ async def run_risk_service(
                     logger.info("REJECTED (liquidity) %s: %s", signal.ticker, gate_result.reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="liquidity").inc()
-                    await _record_rejection(signal, f"liquidity: {gate_result.reason}")
+                    _record_rejection(signal, f"liquidity: {gate_result.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -440,7 +450,7 @@ async def run_risk_service(
                     logger.info("REJECTED (sizer) %s: %s", signal.ticker, size_reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sizer").inc()
-                    await _record_rejection(signal, f"sizer: {size_reason}")
+                    _record_rejection(signal, f"sizer: {size_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -452,7 +462,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="adv_pct").inc()
-                    await _record_rejection(signal, f"adv_pct: {gate_result2.reason}")
+                    _record_rejection(signal, f"adv_pct: {gate_result2.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -465,7 +475,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="atr_zero").inc()
-                    await _record_rejection(signal, "atr_zero: ATR=0, cannot compute stop-loss")
+                    _record_rejection(signal, "atr_zero: ATR=0, cannot compute stop-loss")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -484,7 +494,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sl_invalid").inc()
-                    await _record_rejection(signal, f"sl_invalid: entry={entry_price:.2f} ATR={atr:.4f} → sl={stop_loss:.2f} ≤ 0")
+                    _record_rejection(signal, f"sl_invalid: entry={entry_price:.2f} ATR={atr:.4f} → sl={stop_loss:.2f} ≤ 0")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
