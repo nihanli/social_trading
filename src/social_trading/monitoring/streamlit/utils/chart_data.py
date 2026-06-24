@@ -163,12 +163,20 @@ def _fetch_yfinance(ticker: str, period: str, interval: str) -> list[dict[str, A
 def _bars_to_df(bars: list[dict[str, Any]]) -> pd.DataFrame:
     """Convert list-of-dicts to a DataFrame with DatetimeIndex."""
     df = pd.DataFrame(bars)
-    df["datetime"] = pd.to_datetime(df["timestamp"], utc=True)
+    # Parse without forcing UTC first so tz-aware strings keep their offset.
+    parsed = pd.to_datetime(df["timestamp"])
+    if parsed.dt.tz is None:
+        # Date-only strings (e.g. IB daily "2024-06-24") are tz-naive.
+        # Localise as Eastern — treating midnight UTC would shift the date
+        # back by one day when converted to Eastern time (UTC-4/5).
+        parsed = parsed.dt.tz_localize(
+            "America/New_York", ambiguous="infer", nonexistent="shift_forward"
+        )
+    df["datetime"] = parsed.dt.tz_convert("America/New_York")
     df = df.set_index("datetime").sort_index()
     df = df.rename(columns={
         "open": "Open", "high": "High",
         "low": "Low", "close": "Close", "volume": "Volume",
     })
     df = df[["Open", "High", "Low", "Close", "Volume"]]
-    df.index = df.index.tz_convert("America/New_York")
     return df
