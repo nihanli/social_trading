@@ -12,7 +12,7 @@ Redis state, the IB account, and the UI perfectly in sync.
 │                                                                     │
 │  ┌──────────────┐   ┌──────────────────┐   ┌────────────────────┐  │
 │  │  trade_loop  │   │   exit_loop      │   │  reconcile_loop    │  │
-│  │  (new trades)│   │  (60 s cadence)  │   │  (60 s cadence)    │  │
+│  │  (new trades)│   │  (15 s cadence)  │   │  (60 s cadence)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └─────────┬──────────┘  │
 │         │                   │                        │              │
 │         ▼                   ▼                        ▼              │
@@ -27,6 +27,14 @@ Redis state, the IB account, and the UI perfectly in sync.
 │  └──────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+### Cadence rationale
+
+| Loop | Interval | Config key | Reason |
+|---|---|---|---|
+| exit_loop | **15 s** | `exit_eval_interval_sec` | Price-sensitive: faster SL/TP detection |
+| reconcile_loop | **60 s** | `signal_poll_interval_sec` | Heavy IB queries (`reqExecutionsAsync`) — avoid pacing violations |
+| trade_loop | event-driven | — | Blocks on Redis stream; no polling overhead |
 
 ---
 
@@ -94,12 +102,12 @@ Signal: TOYO LONG 450 shares, SL=24.50, TP=28.00
 
 ## 2. exit_loop (run_exit_loop) — Ongoing Position Monitoring
 
-**Purpose:** Every `signal_poll_interval_sec` (default 60 s), refresh prices, evaluate exit rules, close positions that trigger an exit, and write `positions:live` for the UI.
+**Purpose:** Every `exit_eval_interval_sec` (default **15 s**), refresh prices, evaluate exit rules, close positions that trigger an exit, and write `positions:live` for the UI. Also owns naked-position detection and OCA reattach.
 
 ### Full Cycle
 
 ```
-Every 60 seconds:
+Every 15 seconds:
 │
 ├─ 1. Connection guard
 │     IB disconnected? → rebuild positions:live from position:params, sleep, continue
@@ -117,23 +125,26 @@ Every 60 seconds:
 │
 ├─ 3. Evaluate exit rules (PositionExitManager)
 │     ├─ Write positions:live FIRST (captures current sl/tp before any changes)
-│     ├─ Naked position check → reattach OCA or force-close
+│     ├─ Naked position check → reattach OCA or force-close  [EXIT LOOP ONLY]
 │     └─ For each open system position:
 │           ├─ Skip if close order pending fill (_closing_tickers)
 │           ├─ Evaluate: SL hit? TP hit? Trailing stop? Time decay? Sentiment decay?
 │           └─ Exit triggered? → close position → add to just_closed + _closing_tickers
 │
-├─ 4. _reconcile_external_closes
-│     Detects tickers that vanished from IB without this service closing them
-│     (i.e., bracket leg filled natively, or manual TWS close)
-│     → infer exit price and reason from IB fills
-│     → clean up position:params + positions:live
-│     → publish position_closed event
+├─ 4. Persist state + write account metrics
+│     → HWM, position params, account equity to Redis
+│     → Prometheus metrics (PnL, drawdown, open count)
 │
-└─ 5. Persist state + write account metrics
-      → HWM, position params, account equity to Redis
-      → Prometheus metrics (PnL, drawdown, open count)
+└─ 5. Clear stale _closing_tickers
+      For tickers in _closing_tickers no longer present in IB positions:
+      → remove from _closing_tickers (fill confirmed by IB)
+      → reconcile_loop will publish position_closed event next cycle
 ```
+
+> **Note:** External-close detection (IB bracket fills, manual TWS closes) is owned by
+> `reconcile_loop` via the `CLOSED_OFFLINE` state in `_reconcile_ib_state()`.
+> The exit loop does NOT scan for disappeared positions — this avoids the race
+> condition where both loops independently detect and act on the same external close.
 
 ### Exit Rules (PositionExitManager)
 
@@ -184,7 +195,7 @@ _reconcile_ib_state() called every 60s
 ├─ 2. Classify every ticker into one of 9 states
 │
 ├─ 3. Auto-resolve safe states:
-│     ├─ CLOSED_OFFLINE  → clean Redis, publish position_closed event, log P&L
+│     ├─ CLOSED_OFFLINE  → clean Redis, publish position_closed event, log P&L  [RECONCILE ONLY]
 │     ├─ ADOPTED_SYSTEM  → create position:params from IB data, adopt into exit loop
 │     └─ ADOPTED_MANUAL  → adopt with source=manual flag
 │
@@ -200,6 +211,10 @@ _reconcile_ib_state() called every 60s
       → update entry_price in position:params if fill recovered
       → surface unrecoverable inflight entries as alerts:fill_sync alerts in UI
 ```
+
+> **Note:** Naked-position reattach is NOT performed by reconcile_loop.
+> It is classified as `state = "naked"` in the summary (for UI visibility) but
+> the actual reattach is delegated to exit_loop which runs every 15 s.
 
 ---
 
@@ -239,19 +254,21 @@ _reconcile_ib_state() called every 60s
                           └──────────────────────────────┘
 ```
 
-### Responsibility Division
+### Responsibility Division (after refactor)
 
-| Concern | Owner |
-|---|---|
-| Opening new positions | trade_loop |
-| Refreshing prices | exit_loop |
-| Evaluating software exits (SL/TP/trailing) | exit_loop |
-| Detecting IB native bracket fills | exit_loop (_reconcile_external_closes) |
-| Detecting positions closed while offline | reconcile_loop |
-| Adopting orphaned / manual positions | reconcile_loop |
-| Recovering fill prices after restart | reconcile_loop (startup) |
-| Writing positions:live for the UI | exit_loop (primary) / trade_loop (on open) |
-| Halting trade_loop on conflicts | reconcile_loop |
+| Concern | Owner | Notes |
+|---|---|---|
+| Opening new positions | trade_loop | |
+| Refreshing prices | exit_loop | Portfolio feed → IB batch → yfinance fallback |
+| Evaluating software exits (SL/TP/trailing/sentiment) | exit_loop | Every 15 s |
+| Naked position check + OCA reattach | **exit_loop exclusively** | Removed from reconcile to eliminate double-call |
+| Clearing `_closing_tickers` when fill confirmed | exit_loop | Cleared once IB position disappears |
+| Detecting IB native bracket fills (CLOSED_OFFLINE) | **reconcile_loop exclusively** | `_reconcile_ib_state` CLOSED_OFFLINE state |
+| Detecting positions closed while offline | reconcile_loop | Same CLOSED_OFFLINE path |
+| Adopting orphaned / manual positions | reconcile_loop | |
+| Recovering fill prices after restart | reconcile_loop (startup) | `_reconcile_inflight_orders` |
+| Writing positions:live for the UI | exit_loop (primary) / trade_loop (on open) | |
+| Halting trade_loop on conflicts | reconcile_loop | Via `reconcile:conflicts` key |
 
 ---
 

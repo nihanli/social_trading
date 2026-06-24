@@ -61,6 +61,10 @@ class SystemConfig:
     signal_approval_max_age_min: int = 10   # reject signals older than this many minutes at approval
     signal_decay_lambda: float = 0.10       # hyperbolic decay λ (half-life ~7h)
     signal_poll_interval_sec: int = 60
+    # Cadence for the exit-eval (price refresh + exit rule) loop.
+    # Shorter than signal_poll_interval_sec so stop-loss / trailing-stop
+    # triggers are detected faster.  Keep reconcile_loop at signal_poll_interval_sec.
+    exit_eval_interval_sec: int = 15
 
     # ── Two-Phase Signal Pipeline ─────────────────────────────────────────────
     # Phase 1: evaluated using only free/Tier-1 sources (lower threshold).

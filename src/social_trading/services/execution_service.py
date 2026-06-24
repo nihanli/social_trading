@@ -1087,6 +1087,20 @@ async def run_exit_loop(
                     else (pos.entry_price - cur) * pos.shares
                 POSITION_PNL.labels(ticker=pos.ticker, direction=pos.direction).set(pnl)
 
+            # ── 5. Clear stale _closing_tickers ──────────────────────────────
+            # Tickers are added to _closing_tickers when a software-triggered
+            # close order is submitted but the fill is not immediately confirmed.
+            # They must be cleared once IB confirms the position is gone, so the
+            # exit loop doesn't permanently skip evaluation for those tickers.
+            # Reconcile loop handles the position_closed event; we only clear the
+            # local guard set here once IB no longer reports the position.
+            if _closing_tickers:
+                remaining_tickers = {p.ticker for p in remaining_positions}
+                cleared = _closing_tickers - remaining_tickers
+                if cleared:
+                    logger.info("[EXIT] _closing_tickers cleared (fill confirmed): %s", sorted(cleared))
+                    _closing_tickers -= cleared
+
             # ── 6. EOD snapshot ───────────────────────────────────────────────
             # Save session metrics once per day after NYSE close (≥ 16:00 ET).
             # Guard with a Redis key so restarts don't duplicate the write.
@@ -1108,12 +1122,11 @@ async def run_exit_loop(
         except Exception as exc:
             logger.error("[EXIT LOOP] Unhandled error — will retry next cycle: %s", exc, exc_info=True)
 
-        await asyncio.sleep(cfg.signal_poll_interval_sec)  # type: ignore[possibly-undefined]
+        await asyncio.sleep(cfg.exit_eval_interval_sec)  # type: ignore[possibly-undefined]
 
 
-# Semantic alias — run_exit_loop is the price-evaluation + external-close detection
-# loop.  The reconcile refactor (Phase 3) will fold the remaining logic and rename
-# this function; until then, the alias keeps external references consistent.
+# Semantic alias — exit_loop is the price-evaluation + exit rule loop.
+# Reconcile loop owns: state classification, external closes, conflict surfacing.
 run_price_eval_loop = run_exit_loop
 
 
@@ -1862,7 +1875,6 @@ async def _reconcile_ib_state(
     matched_tickers: set[str] = set()
     adopted_tickers: set[str] = set()
     closed_offline_tickers: set[str] = set()
-    managed_naked_check_tickers: set[str] = set()
     naked_tickers: set[str] = set()
     entry_fix_tickers: set[str] = set()
     shares_synced_tickers: set[str] = set()
@@ -2268,7 +2280,6 @@ async def _reconcile_ib_state(
                 state = "matched"
                 reason = f"App and IB both show {ticker} {ib_dir or app_dir} {ib_shares} shares."
                 matched_tickers.add(ticker)
-                managed_naked_check_tickers.add(ticker)
                 if abs(app_shares - ib_shares) > 1 and ib_shares > 0:
                     synced = dict(app_entry)
                     synced["shares"] = ib_shares
@@ -2358,7 +2369,6 @@ async def _reconcile_ib_state(
                         adopted_ok, reason = await _adopt_position(ticker, ib_entry)
                         if adopted_ok:
                             adopted_tickers.add(ticker)
-                            managed_naked_check_tickers.add(ticker)
                             auto_actions.append({"ticker": ticker, "action": "adopt_position"})
                 else:
                     state = "manual_ib"
@@ -2462,22 +2472,11 @@ async def _reconcile_ib_state(
         except Exception as exc:
             logger.warning("[RECONCILE] %s: reconcile processing failed: %s", ticker, exc)
 
-    try:
-        system_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}  # type: ignore[union-attr]
-        if current_positions:
-            managed_tickers = managed_naked_check_tickers | adopted_tickers
-            managed_open_positions = [pos for pos in current_positions if getattr(pos, "ticker", "").upper() in managed_tickers]
-            if managed_open_positions:
-                await _check_naked_positions(
-                    redis,
-                    engine,
-                    managed_open_positions,
-                    system_params,
-                    cfg,
-                    mode,
-                )
-    except Exception as exc:
-        logger.debug("[RECONCILE] naked-position follow-up failed: %s", exc)
+    # Naked-position detection and OCA reattach is owned exclusively by the
+    # exit loop (run_exit_loop / _check_naked_positions), which runs every
+    # exit_eval_interval_sec (default 15 s).  Reconcile loop classifies naked
+    # state in the summary above (for UI visibility) but does NOT act on it —
+    # doing so would duplicate the reattach attempt and race with the exit loop.
 
     existing_conflicts_raw = await redis.hgetall(_RECONCILE_CONFLICTS_KEY)
     for ticker_raw in list(existing_conflicts_raw.keys()):
@@ -4254,6 +4253,11 @@ async def _reconcile_external_closes(
     Attempts to infer the actual exit price and reason (STOP_LOSS, TAKE_PROFIT,
     TRAILING_STOP) from IB fill records for the current session.  Falls back to
     IB_EXTERNAL when no matching fill is found (e.g. position closed offline).
+
+    NOTE: This function is NOT called from the exit loop.  External-close
+    detection is owned entirely by reconcile_loop via the CLOSED_OFFLINE state
+    in _reconcile_ib_state().  This function is preserved as a reference
+    implementation; it can be called directly for testing or one-off recovery.
     """
     # Exclude tickers with a pending close order — their fill callback handles cleanup.
     # Also exclude tickers that were immediately filled by a UI command this cycle —

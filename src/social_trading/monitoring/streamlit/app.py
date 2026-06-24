@@ -166,7 +166,7 @@ daily_pnl_df = query("""
            COUNT(*) FILTER (WHERE net_pnl > 0) AS wins,
            COUNT(*) AS total
     FROM trades
-    WHERE opened_at::date = CURRENT_DATE
+    WHERE closed_at::date = CURRENT_DATE
 """)
 open_pos_df = query("SELECT COUNT(*) AS cnt FROM positions")
 signals_today_df = query("""
