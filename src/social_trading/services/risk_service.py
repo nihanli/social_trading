@@ -356,7 +356,13 @@ async def run_risk_service(
             messages = await bus.consume(
                 STREAM_STRATEGY_SIGNALS, _GROUP, _CONSUMER, count=_INGEST_BATCH
             )
-            for msg_id, _ in messages:
+            for msg_id, fields in messages:
+                _sig = _stream_dict_to_signal(fields)
+                if _sig is not None:
+                    _record_rejection(
+                        _sig,
+                        f"circuit_breaker: {cb_status.state.value} — new entries blocked",
+                    )
                 await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
             await asyncio.sleep(cfg.signal_poll_interval_sec)
             continue
@@ -514,6 +520,7 @@ async def run_risk_service(
 
             except Exception as exc:
                 logger.exception("Error processing signal for %s: %s", signal.ticker, exc)
+                _record_rejection(signal, f"error: {type(exc).__name__}: {exc}")
 
             await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
 
