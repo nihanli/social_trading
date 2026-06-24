@@ -295,11 +295,13 @@ def _mark_signal_executed(ticker: str, generated_at: str) -> None:
         conn.close()
 
 
-def _mark_signal_rejected(ticker: str, generated_at: str, reason: str) -> None:
+def _mark_signal_rejected(ticker: str, generated_at: str, reason: str) -> int:
     """Set rejection_reason on the most recent unrejected signal for (ticker, generated_at).
 
     Safe to call multiple times — only updates rows where rejection_reason IS NULL
     so a prior rejection reason is never overwritten.
+
+    Returns the number of rows updated (0 if the signal row does not exist yet).
     """
     conn = _get_conn()
     try:
@@ -315,6 +317,7 @@ def _mark_signal_rejected(ticker: str, generated_at: str, reason: str) -> None:
                     """,
                     (reason, ticker, generated_at),
                 )
+                return cur.rowcount
     finally:
         conn.close()
 

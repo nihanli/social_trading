@@ -288,11 +288,27 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
 # ── Service main loop ─────────────────────────────────────────────────────────
 
 async def _record_rejection(signal: "Signal", reason: str) -> None:
-    """Best-effort: persist rejection_reason to DB without blocking the hot path."""
+    """Best-effort: persist rejection_reason to DB without blocking the hot path.
+
+    The persistence service inserts signal rows from the same Redis stream in a
+    separate consumer group.  There is a race: risk_service may reject a signal
+    before persistence_service has inserted the row.  Retry up to 3 times with
+    a short delay so the INSERT has time to land.
+    """
     try:
         ts = signal.generated_at.isoformat() if signal.generated_at else ""
-        if ts:
-            await _run_db(_mark_signal_rejected, signal.ticker, ts, reason)
+        if not ts:
+            return
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.8)  # give persistence service time to INSERT
+            rows = await _run_db(_mark_signal_rejected, signal.ticker, ts, reason)
+            if rows:
+                return
+        logger.debug(
+            "rejection_reason not saved for %s @ %s after retries (row may not exist)",
+            signal.ticker, ts,
+        )
     except Exception as exc:
         logger.debug("Could not record rejection reason for %s: %s", signal.ticker, exc)
 

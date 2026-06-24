@@ -81,16 +81,28 @@ _INGEST_BATCH = 16
 
 # Lazy import for rejection recording — avoids circular import at module load.
 def _record_signal_rejection(signal: "Signal", reason: str) -> None:
-    """Fire-and-forget: persist rejection_reason to DB in a thread pool."""
-    try:
+    """Fire-and-forget: persist rejection_reason to DB with retry for race condition.
+
+    The persistence service may not have inserted the signal row yet when this
+    is called.  Schedule a retrying coroutine as a background task.
+    """
+    async def _retry_rejection(ticker: str, ts: str, r: str) -> None:
         from social_trading.services.persistence_service import (  # noqa: PLC0415
             _mark_signal_rejected, _run_db,
         )
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.8)
+            rows = await _run_db(_mark_signal_rejected, ticker, ts, r)
+            if rows:
+                return
+
+    try:
         import asyncio as _asyncio  # noqa: PLC0415
         ts = signal.generated_at.isoformat() if signal.generated_at else ""
         if ts:
             _asyncio.create_task(
-                _run_db(_mark_signal_rejected, signal.ticker, ts, reason),
+                _retry_rejection(signal.ticker, ts, reason),
                 name=f"reject_reason:{signal.ticker}",
             )
     except Exception:
@@ -1967,6 +1979,7 @@ async def _reconcile_ib_state(
                 "action": getattr(order, "action", ""),
                 "oca_group": oca_group,
                 "aux_price": float(getattr(order, "auxPrice", 0) or 0),
+                "lmt_price": float(getattr(order, "lmtPrice", 0) or 0),
                 "status": status,
             })
             system_tickers.add(ticker)
@@ -2193,9 +2206,24 @@ async def _reconcile_ib_state(
 
         has_bracket = ticker in oca_groups or ticker in trail_order_ids
         if has_bracket:
+            # Try to recover SL/TP prices from the live IB bracket orders so that
+            # (a) position:params has real levels for the exit loop's PositionExitManager,
+            # and (b) if a future reattach is needed, valid prices are passed to
+            # reattach_oca_orders() instead of zeros (which would skip the STP/LMT legs).
+            _recovered_sl = 0.0
+            _recovered_tp = 0.0
+            for _ord in app_oca_orders:
+                if _ord.get("ticker") != ticker:
+                    continue
+                _ot = _ord.get("order_type", "")
+                if _ot in {"STP", "STP LMT"} and _ord.get("aux_price", 0.0) > 0:
+                    _recovered_sl = float(_ord["aux_price"])
+                elif _ot == "LMT" and _ord.get("lmt_price", 0.0) > 0:
+                    _recovered_tp = float(_ord["lmt_price"])
+
             seeded_params = {
-                "stop_loss": 0.0,
-                "take_profit": 0.0,
+                "stop_loss": _recovered_sl,
+                "take_profit": _recovered_tp,
                 "opened_at": pos.opened_at.isoformat() if pos.opened_at else datetime.now(UTC).isoformat(),
                 "direction": pos.direction,
                 "source": "system",
@@ -2213,16 +2241,25 @@ async def _reconcile_ib_state(
                     "direction": pos.direction,
                     "shares": pos.shares,
                     "entry_price": pos.entry_price,
-                    "stop_price": 0.0,
-                    "target_price": 0.0,
+                    "stop_price": _recovered_sl,
+                    "target_price": _recovered_tp,
                     "opened_at": seeded_params["opened_at"],
                     "mode": mode,
                 })
+            # Warn if no active protective leg (STP/TRAIL) was found — the exit loop's
+            # naked check will detect this within 15 s and call reattach_oca_orders().
+            _has_protective = ticker in protected_tickers
             logger.warning(
-                "[RECONCILE] %s: ATR unavailable but IB bracket is live (oca_group=%r) — seeding with stop_loss=0",
-                ticker, seeded_params["oca_group"],
+                "[RECONCILE] %s: ATR unavailable; adopted with IB bracket (oca_group=%r) "
+                "recovered sl=%.4f tp=%.4f%s",
+                ticker, seeded_params["oca_group"], _recovered_sl, _recovered_tp,
+                "" if _has_protective else
+                " — no STP/TRAIL leg active; exit loop will reattach within next cycle",
             )
-            return True, f"{ticker} adopted with existing IB bracket."
+            return True, (
+                f"{ticker} adopted with IB bracket "
+                f"(sl={_recovered_sl:.4f}, tp={_recovered_tp:.4f})."
+            )
 
         seeded_params = {
             "stop_loss": 0.0,
