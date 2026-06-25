@@ -36,6 +36,7 @@ from social_trading.config.system_config import SystemConfig
 from social_trading.core.events import (
     STREAM_MAXLEN,
     STREAM_SELECTED_SIGNALS,
+    STREAM_SIGNAL_REJECTIONS,
     STREAM_STRATEGY_SIGNALS,
 )
 import json
@@ -51,7 +52,6 @@ from social_trading.risk.circuit_breaker import CircuitBreaker
 from social_trading.risk.liquidity_gate import LiquidityGate, LiquidityQuote
 from social_trading.risk.position_sizer import PositionSizer
 from social_trading.storage.event_bus import TradingEventBus
-from social_trading.services.persistence_service import _mark_signal_rejected, _run_db
 
 load_dotenv()
 
@@ -287,40 +287,28 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
 
 # ── Service main loop ─────────────────────────────────────────────────────────
 
-def _record_rejection(signal: "Signal", reason: str) -> None:
-    """Fire-and-forget: schedule a background task that persists rejection_reason.
+async def _publish_rejection(redis: aioredis.Redis, signal: "Signal", reason: str) -> None:
+    """Publish a rejection event to STREAM_SIGNAL_REJECTIONS.
 
-    The persistence service inserts signal rows from the same Redis stream in a
-    separate consumer group.  Both groups wake from the same xreadgroup block
-    simultaneously, but the risk service finishes its in-memory checks faster
-    than the persistence service finishes the DB INSERT.  The background task
-    retries up to 6 times (≈5s total) so the INSERT has plenty of time to land
-    without blocking the risk-service hot path.
+    persistence_service consumes this stream and writes rejection_reason to the
+    signals table.  Using a stream (instead of a direct DB update here) keeps
+    all DB writes in one process and avoids race conditions with the signals
+    INSERT.
     """
-    async def _persist(ticker: str, ts: str, r: str) -> None:
-        for attempt in range(6):
-            if attempt:
-                await asyncio.sleep(1.0)
-            try:
-                rows = await _run_db(_mark_signal_rejected, ticker, ts, r)
-                if rows:
-                    return
-            except Exception as exc:
-                logger.debug("rejection reason attempt %d failed for %s: %s", attempt, ticker, exc)
-        logger.debug(
-            "rejection_reason not saved for %s @ %s after retries (row may not exist)",
-            ticker, ts,
-        )
-
+    ts = signal.generated_at.isoformat() if signal.generated_at else ""
+    if not ts:
+        return
     try:
-        ts = signal.generated_at.isoformat() if signal.generated_at else ""
-        if ts:
-            asyncio.create_task(
-                _persist(signal.ticker, ts, reason),
-                name=f"reject_reason:{signal.ticker}",
-            )
+        await redis.xadd(
+            STREAM_SIGNAL_REJECTIONS,
+            {"ticker": signal.ticker, "generated_at": ts, "reason": reason},
+            maxlen=STREAM_MAXLEN.get(STREAM_SIGNAL_REJECTIONS),
+            approximate=True,
+        )
     except Exception as exc:
-        logger.debug("Could not schedule rejection reason for %s: %s", signal.ticker, exc)
+        logger.warning(
+            "Could not publish rejection for %s to stream: %s", signal.ticker, exc
+        )
 
 
 async def run_risk_service(
@@ -359,7 +347,8 @@ async def run_risk_service(
             for msg_id, fields in messages:
                 _sig = _stream_dict_to_signal(fields)
                 if _sig is not None:
-                    _record_rejection(
+                    await _publish_rejection(
+                        redis,
                         _sig,
                         f"circuit_breaker: {cb_status.state.value} — new entries blocked",
                     )
@@ -393,7 +382,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="stale").inc()
-                    _record_rejection(signal, f"stale: age {signal_age_sec:.0f}s > max {cfg.signal_approval_max_age_min * 60}s")
+                    await _publish_rejection(redis, signal, f"stale: age {signal_age_sec:.0f}s > max {cfg.signal_approval_max_age_min * 60}s")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -408,7 +397,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="cooldown").inc()
-                    _record_rejection(signal, f"cooldown: {cooldown_reason}")
+                    await _publish_rejection(redis, signal, f"cooldown: {cooldown_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -430,7 +419,7 @@ async def run_risk_service(
                     logger.info("REJECTED (liquidity) %s: %s", signal.ticker, gate_result.reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="liquidity").inc()
-                    _record_rejection(signal, f"liquidity: {gate_result.reason}")
+                    await _publish_rejection(redis, signal, f"liquidity: {gate_result.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -456,7 +445,7 @@ async def run_risk_service(
                     logger.info("REJECTED (sizer) %s: %s", signal.ticker, size_reason)
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sizer").inc()
-                    _record_rejection(signal, f"sizer: {size_reason}")
+                    await _publish_rejection(redis, signal, f"sizer: {size_reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -468,7 +457,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="adv_pct").inc()
-                    _record_rejection(signal, f"adv_pct: {gate_result2.reason}")
+                    await _publish_rejection(redis, signal, f"adv_pct: {gate_result2.reason}")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -481,7 +470,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="atr_zero").inc()
-                    _record_rejection(signal, "atr_zero: ATR=0, cannot compute stop-loss")
+                    await _publish_rejection(redis, signal, "atr_zero: ATR=0, cannot compute stop-loss")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -500,7 +489,7 @@ async def run_risk_service(
                     )
                     rejected_total += 1
                     SIGNALS_REJECTED.labels(reason="sl_invalid").inc()
-                    _record_rejection(signal, f"sl_invalid: entry={entry_price:.2f} ATR={atr:.4f} → sl={stop_loss:.2f} ≤ 0")
+                    await _publish_rejection(redis, signal, f"sl_invalid: entry={entry_price:.2f} ATR={atr:.4f} → sl={stop_loss:.2f} ≤ 0")
                     await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
                     continue
 
@@ -520,7 +509,7 @@ async def run_risk_service(
 
             except Exception as exc:
                 logger.exception("Error processing signal for %s: %s", signal.ticker, exc)
-                _record_rejection(signal, f"error: {type(exc).__name__}: {exc}")
+                await _publish_rejection(redis, signal, f"error: {type(exc).__name__}: {exc}")
 
             await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
 

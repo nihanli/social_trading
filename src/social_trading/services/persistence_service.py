@@ -36,6 +36,7 @@ from social_trading.core.events import (
     STREAM_RAW_SOCIAL,
     STREAM_SELECTED_SIGNALS,
     STREAM_SENTIMENT,
+    STREAM_SIGNAL_REJECTIONS,
     STREAM_STRATEGY_SIGNALS,
 )
 from social_trading.storage.event_bus import TradingEventBus
@@ -250,8 +251,9 @@ def _write_signals(rows: list[dict]) -> int:
     return inserted
 
 
-def _mark_signal_approved(ticker: str, generated_at: str) -> None:
-    """Set approved=TRUE on the signal matching (ticker, generated_at)."""
+def _mark_signal_approved(ticker: str, generated_at: str) -> int:
+    """Set approved=TRUE on the signal matching (ticker, generated_at).
+    Returns the number of rows updated (0 if row not yet inserted)."""
     conn = _get_conn()
     try:
         with conn:
@@ -266,6 +268,7 @@ def _mark_signal_approved(ticker: str, generated_at: str) -> None:
                     """,
                     (ticker, generated_at),
                 )
+                return cur.rowcount
     finally:
         conn.close()
 
@@ -989,7 +992,14 @@ async def run_approved_signals_task(bus: TradingEventBus) -> None:
     The risk service writes to selected_signals after each signal passes all
     risk checks.  We update signals.approved here rather than in the risk service
     itself to keep DB writes in one process.
+
+    Retry logic: run_signal_task (which INSERTs the row) and this task both run
+    concurrently in the same event loop.  The UPDATE may arrive before the INSERT
+    completes (race condition).  Retry up to _APPROVED_MAX_RETRIES × 1s.
     """
+    _APPROVED_MAX_RETRIES = 5
+    _APPROVED_RETRY_SLEEP = 1.0
+
     await bus.create_group(STREAM_SELECTED_SIGNALS, _GROUP)
     while True:
         messages = await bus.consume(
@@ -1001,12 +1011,78 @@ async def run_approved_signals_task(bus: TradingEventBus) -> None:
             ticker = fields.get("ticker", "")
             generated_at = fields.get("generated_at", "")
             if ticker and generated_at:
-                try:
-                    await _run_db(_mark_signal_approved, ticker, generated_at)
-                    logger.debug("signal approved in DB: %s @ %s", ticker, generated_at)
-                except Exception as exc:
-                    logger.warning("Failed to mark signal approved (%s): %s", ticker, exc)
+                updated = 0
+                for attempt in range(_APPROVED_MAX_RETRIES):
+                    if attempt:
+                        await asyncio.sleep(_APPROVED_RETRY_SLEEP)
+                    try:
+                        updated = await _run_db(_mark_signal_approved, ticker, generated_at)
+                    except Exception as exc:
+                        logger.warning("Failed to mark signal approved (%s) attempt %d: %s", ticker, attempt, exc)
+                    if updated:
+                        logger.debug("signal approved in DB: %s @ %s", ticker, generated_at)
+                        break
+                else:
+                    logger.warning(
+                        "approved flag not set after %d retries for %s @ %s",
+                        _APPROVED_MAX_RETRIES, ticker, generated_at,
+                    )
             await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+
+
+async def run_rejected_signals_task(bus: TradingEventBus) -> None:
+    """
+    Consume signal:rejections stream and write rejection_reason to the signals table.
+
+    Both risk_service and execution_service publish to STREAM_SIGNAL_REJECTIONS
+    when a signal is rejected at any stage.  Handling DB writes here keeps all
+    persistence in one process and avoids the race condition where the UPDATE
+    arrives before the INSERT.
+
+    Retry logic: the signals INSERT (run_signals_task) and this UPDATE share the
+    same process but are separate consumer loops, so the INSERT may not have landed
+    yet when the first retry runs.  We retry up to _REJECTION_MAX_RETRIES times
+    with a short sleep between each attempt before giving up with a WARNING.
+    """
+    _REJECTION_MAX_RETRIES = 5
+    _REJECTION_RETRY_SLEEP = 1.0
+
+    await bus.create_group(STREAM_SIGNAL_REJECTIONS, _GROUP)
+    logger.info("Rejection tracking consumer started (stream=%s)", STREAM_SIGNAL_REJECTIONS)
+
+    while True:
+        messages = await bus.consume(
+            STREAM_SIGNAL_REJECTIONS, _GROUP, "persist-rejected-0", count=_BATCH
+        )
+        if not messages:
+            continue
+        for msg_id, fields in messages:
+            ticker = fields.get("ticker", "")
+            generated_at = fields.get("generated_at", "")
+            reason = fields.get("reason", "")
+            if not (ticker and generated_at and reason):
+                await bus.ack(STREAM_SIGNAL_REJECTIONS, _GROUP, msg_id)
+                continue
+            updated = 0
+            for attempt in range(_REJECTION_MAX_RETRIES):
+                if attempt:
+                    await asyncio.sleep(_REJECTION_RETRY_SLEEP)
+                try:
+                    updated = await _run_db(_mark_signal_rejected, ticker, generated_at, reason)
+                except Exception as exc:
+                    logger.warning(
+                        "rejection_reason DB error for %s attempt %d: %s",
+                        ticker, attempt, exc,
+                    )
+                if updated:
+                    logger.debug("rejection_reason saved: %s — %s", ticker, reason)
+                    break
+            else:
+                logger.warning(
+                    "rejection_reason not saved after %d retries for %s @ %s: %r",
+                    _REJECTION_MAX_RETRIES, ticker, generated_at, reason,
+                )
+            await bus.ack(STREAM_SIGNAL_REJECTIONS, _GROUP, msg_id)
 
 
 async def run_prune_task() -> None:
@@ -1609,6 +1685,7 @@ async def main() -> None:
         asyncio.create_task(run_sentiment_task(bus), name="sentiment"),
         asyncio.create_task(run_signal_task(bus), name="signal"),
         asyncio.create_task(run_approved_signals_task(bus), name="approved_signals"),
+        asyncio.create_task(run_rejected_signals_task(bus), name="rejected_signals"),
         asyncio.create_task(run_prune_task(), name="prune"),
         asyncio.create_task(run_execution_events_task(bus), name="exec_events"),
         asyncio.create_task(run_positions_sync_task(redis), name="positions_sync"),

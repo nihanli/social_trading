@@ -39,7 +39,7 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from social_trading.config.system_config import SystemConfig
-from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS
+from social_trading.core.events import STREAM_MAXLEN, STREAM_SELECTED_SIGNALS, STREAM_SIGNAL_REJECTIONS
 from social_trading.core.market_hours import NYSE as _NYSE
 from social_trading.core.models import Signal
 from social_trading.core.protocols import ExecutionEngine, MarketDataProvider
@@ -80,33 +80,30 @@ _CONSUMER = "exec-0"
 _INGEST_BATCH = 16
 
 # Lazy import for rejection recording — avoids circular import at module load.
-def _record_signal_rejection(signal: "Signal", reason: str) -> None:
-    """Fire-and-forget: persist rejection_reason to DB with retry for race condition.
+async def _publish_signal_rejection(
+    redis: aioredis.Redis,
+    signal: "Signal",
+    reason: str,
+) -> None:
+    """Publish a rejection event to STREAM_SIGNAL_REJECTIONS.
 
-    The persistence service may not have inserted the signal row yet when this
-    is called.  Schedule a retrying coroutine as a background task.
+    persistence_service consumes this stream and writes rejection_reason to the
+    signals table.  Replaces the old fire-and-forget background-task approach.
     """
-    async def _retry_rejection(ticker: str, ts: str, r: str) -> None:
-        from social_trading.services.persistence_service import (  # noqa: PLC0415
-            _mark_signal_rejected, _run_db,
-        )
-        for attempt in range(3):
-            if attempt:
-                await asyncio.sleep(0.8)
-            rows = await _run_db(_mark_signal_rejected, ticker, ts, r)
-            if rows:
-                return
-
+    ts = signal.generated_at.isoformat() if signal.generated_at else ""
+    if not ts:
+        return
     try:
-        import asyncio as _asyncio  # noqa: PLC0415
-        ts = signal.generated_at.isoformat() if signal.generated_at else ""
-        if ts:
-            _asyncio.create_task(
-                _retry_rejection(signal.ticker, ts, reason),
-                name=f"reject_reason:{signal.ticker}",
-            )
-    except Exception:
-        pass  # best-effort only
+        await redis.xadd(
+            STREAM_SIGNAL_REJECTIONS,
+            {"ticker": signal.ticker, "generated_at": ts, "reason": reason},
+            maxlen=STREAM_MAXLEN.get(STREAM_SIGNAL_REJECTIONS),
+            approximate=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not publish rejection for %s to stream: %s", signal.ticker, exc
+        )
 
 # Shared halt flag: set by HALT_NEW command, cleared by RESUME.
 # run_trade_loop checks this before opening any new position.
@@ -428,6 +425,7 @@ async def run_trade_loop(
 
             for msg_id, fields in messages:
                 try:
+                    signal = None  # sentinel so except block can check if signal was parsed
                     parsed = _stream_dict_to_approved(fields)
                     if parsed is None:
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
@@ -446,7 +444,7 @@ async def run_trade_loop(
                             signal.ticker, hours_elapsed, cfg.signal_age_max_hours,
                         )
                         skipped += 1
-                        _record_signal_rejection(signal, f"expired: {hours_elapsed:.1f}h old at execution (max {cfg.signal_age_max_hours}h)")
+                        await _publish_signal_rejection(redis, signal, f"expired: {hours_elapsed:.1f}h old at execution (max {cfg.signal_age_max_hours}h)")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -454,7 +452,7 @@ async def run_trade_loop(
                     if _halt_flag.is_set():
                         logger.debug("Skip %s — new positions halted", signal.ticker)
                         skipped += 1
-                        _record_signal_rejection(signal, "halted: new positions halted via UI command")
+                        await _publish_signal_rejection(redis, signal, "halted: new positions halted via UI command")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -470,6 +468,7 @@ async def run_trade_loop(
                             "[EXEC] Could not check open_tickers for %s (%s) — skipping signal",
                             signal.ticker, exc,
                         )
+                        await _publish_signal_rejection(redis, signal, f"error: open_tickers check failed: {exc}")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -485,7 +484,7 @@ async def run_trade_loop(
                     if already_open:
                         logger.debug("Skip %s — position already open", signal.ticker)
                         skipped += 1
-                        _record_signal_rejection(signal, "position_already_open: duplicate signal discarded")
+                        await _publish_signal_rejection(redis, signal, "position_already_open: duplicate signal discarded")
                         await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
                         continue
 
@@ -705,6 +704,7 @@ async def run_trade_loop(
                     else:
                         ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
                         logger.warning("[EXEC] Rejected %s: %s", signal.ticker, result.error)
+                        await _publish_signal_rejection(redis, signal, f"ib_rejected: {result.error or 'unknown'}")
 
                     await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
 
@@ -715,6 +715,8 @@ async def run_trade_loop(
                         "[TRADE LOOP] Error processing msg %s — acking to avoid redelivery: %s",
                         msg_id, exc, exc_info=True,
                     )
+                    if signal is not None:
+                        await _publish_signal_rejection(redis, signal, f"error: {type(exc).__name__}: {exc}")
                     await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
 
             if not messages:
@@ -1025,12 +1027,48 @@ async def run_exit_loop(
                             )
                         continue  # do not close — tightened trail handles the exit
 
-                    # Capture position metadata before close_position may clear state.
+                    # Capture position metadata before any close may clear state.
                     _pos_opened_at = pos.opened_at.isoformat() if pos.opened_at else ""
                     _pos_entry_price = pos.entry_price
                     _pos_shares = pos.shares
                     _pos_direction = pos.direction
 
+                    # ── Regular exit: modify existing STP order to trigger immediately ──
+                    # This keeps the OCA group intact and avoids creating a new market
+                    # order.  The STP becomes a market order on the next tick and the
+                    # OCA siblings (TRAIL, LMT) are cancelled automatically by IB on fill.
+                    # Emergency closes (circuit breaker, volatility spike) bypass this and
+                    # call close_position() directly.
+                    _triggered = False
+                    if hasattr(engine, "trigger_stop_exit"):
+                        try:
+                            _triggered = await engine.trigger_stop_exit(  # type: ignore[union-attr]
+                                pos.ticker, current_price
+                            )
+                        except Exception as _te:
+                            logger.warning(
+                                "[EXIT] trigger_stop_exit failed for %s (%s) — falling back to market close",
+                                pos.ticker, _te,
+                            )
+
+                    if _triggered:
+                        # STP modified — IB will fill it on the next tick via OCA.
+                        # Reconcile loop detects the fill and publishes position_closed.
+                        _closing_tickers.add(pos.ticker)
+                        _trailing_pct_applied.pop(pos.ticker, None)
+                        logger.info(
+                            "[EXIT] %s STP order triggered at %.4f (reason=%s) — "
+                            "awaiting fill via OCA; reconcile will confirm",
+                            pos.ticker, current_price, decision.reason,
+                        )
+                        continue
+
+                    # ── Fallback: no active STP — use emergency market close ──────────
+                    logger.warning(
+                        "[EXIT] %s no STP order found for rule-based exit — "
+                        "falling back to market close (reason=%s)",
+                        pos.ticker, decision.reason,
+                    )
                     close_result = await engine.close_position(pos.ticker, reason=decision.reason)
 
                     if close_result and close_result.status == "rejected":

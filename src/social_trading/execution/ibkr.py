@@ -960,6 +960,82 @@ class IBKRExecutionEngine:
             logger.error("[IBKR] update_trailing_stop failed for %s: %s", ticker, exc)
             return False
 
+    async def trigger_stop_exit(self, ticker: str, current_price: float) -> bool:
+        """
+        Trigger a regular position close by modifying the existing OCA STP order
+        so its stop price equals the current market price.
+
+        IB immediately converts any stop whose trigger condition is already met
+        into a market order on the next tick, closing the position through the
+        established OCA mechanism.  The sibling OCA orders (TRAIL, LMT) are
+        cancelled automatically by IB when the STP fills.
+
+        Preferred over submitting a new market order for all rule-based exits
+        (sentiment reversal, time-exit, mention-decay etc.) so that:
+          - No new orders are created and TIF is never an issue.
+          - The position closes through the normal fill/reconcile path.
+          - The OCA group stays intact until filled.
+
+        Returns True  if a STP order was found and successfully modified.
+        Returns False if no active STP order exists for this ticker — the caller
+                      should fall back to close_position() for emergency closure.
+        """
+        if not _IB_AVAILABLE:
+            return False
+
+        if current_price <= 0:
+            logger.warning("[IBKR] trigger_stop_exit: invalid current_price=%.4f for %s", current_price, ticker)
+            return False
+
+        _stp_types   = {"STP", "STP LMT"}
+        _done_states = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+
+        stp_trade = None
+        for trade in self._ib.openTrades():
+            sym = getattr(getattr(trade, "contract", None), "symbol", "")
+            ord_obj = getattr(trade, "order", None)
+            ref = getattr(ord_obj, "orderRef", "")
+            ot  = getattr(ord_obj, "orderType", "")
+            st  = getattr(getattr(trade, "orderStatus", None), "status", "")
+            if sym == ticker and ref == ORDER_REF and ot in _stp_types and st not in _done_states:
+                stp_trade = trade
+                break
+
+        if stp_trade is None:
+            logger.warning(
+                "[IBKR] trigger_stop_exit: no active STP order found for %s — "
+                "caller should use emergency close_position()",
+                ticker,
+            )
+            return False
+
+        order  = stp_trade.order
+        action = getattr(order, "action", "SELL")
+        # For a SELL STP (long): set stop just above current price so it triggers immediately.
+        # For a BUY STP (short): set stop just below current price for the same effect.
+        if action == "SELL":
+            trigger_price = round(current_price * 1.001, 2)
+        else:
+            trigger_price = round(current_price * 0.999, 2)
+
+        trigger_price = max(trigger_price, 0.01)
+
+        try:
+            contract = stp_trade.contract
+            order.auxPrice = trigger_price
+            order.transmit = True
+            self._ib.placeOrder(contract, order)   # same orderId → IB treats as modify
+            logger.info(
+                "[IBKR] trigger_stop_exit: %s modified STP orderId=%d auxPrice → %.4f "
+                "(current=%.4f, action=%s) — IB will trigger as market immediately",
+                ticker, order.orderId, trigger_price, current_price, action,
+            )
+            return True
+        except Exception as exc:
+            logger.error("[IBKR] trigger_stop_exit: modify STP failed for %s: %s", ticker, exc)
+            return False
+
+
     async def reattach_oca_orders(
         self,
         ticker: str,

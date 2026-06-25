@@ -99,6 +99,7 @@ STREAM_STRATEGY_SIGNALS = "strategy_signals"
 STREAM_SELECTED_SIGNALS = "selected_signals"
 STREAM_EXEC_EVENTS = "execution:events"  # position open/close lifecycle events
 STREAM_ENRICHMENT_REQUESTS = "enrichment:requests"  # Phase-1 → Tier-2 enrichment triggers
+STREAM_SIGNAL_REJECTIONS = "signal:rejections"  # risk/exec rejection reasons → persistence
 
 ALL_STREAMS = [
     STREAM_RAW_SOCIAL,
@@ -108,6 +109,7 @@ ALL_STREAMS = [
     STREAM_SELECTED_SIGNALS,
     STREAM_EXEC_EVENTS,
     STREAM_ENRICHMENT_REQUESTS,
+    STREAM_SIGNAL_REJECTIONS,
 ]
 
 # Maximum entries to retain per stream (approximate trim — Redis `MAXLEN ~`).
@@ -127,4 +129,5 @@ STREAM_MAXLEN: dict[str, int] = {
     STREAM_SELECTED_SIGNALS:        10_000,
     STREAM_EXEC_EVENTS:             50_000,
     STREAM_ENRICHMENT_REQUESTS:      5_000,
+    STREAM_SIGNAL_REJECTIONS:       50_000,
 }
