@@ -345,6 +345,8 @@ async def run_risk_service(
 
     approved_total = 0
     rejected_total = 0
+    _last_heartbeat: float = 0.0
+    _HEARTBEAT_SECS = 300  # log status every 5 min to keep logs:risk stream alive
 
     while True:
         cfg = await SystemConfig.load(redis)
@@ -532,6 +534,14 @@ async def run_risk_service(
             await bus.ack(STREAM_STRATEGY_SIGNALS, _GROUP, msg_id)
 
         if not messages:
+            now = asyncio.get_event_loop().time()
+            if now - _last_heartbeat >= _HEARTBEAT_SECS:
+                logger.info(
+                    "[RISK] idle — cb=%s approved=%d rejected=%d nlv=%.0f",
+                    cb_status.state.value, approved_total, rejected_total,
+                    account.net_liquidation,
+                )
+                _last_heartbeat = now
             await asyncio.sleep(1.0)  # back-off when queue empty
 
 
