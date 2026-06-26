@@ -214,31 +214,33 @@ def _write_signals(rows: list[dict]) -> int:
                                 (timestamp, ticker, strategy, direction,
                                  confidence, sentiment_score, mention_zscore,
                                  quality_score, signal_phase, generated_at,
-                                 momentum, convergence, proactivity, atr)
+                                momentum, convergence, proactivity, atr,
+                                contrarian)
                             VALUES (%(ts)s, %(ticker)s, %(strategy)s,
-                                    %(direction)s, %(confidence)s,
-                                    %(sentiment_score)s, %(mention_zscore)s,
-                                    %(quality_score)s, %(signal_phase)s, %(ts)s,
-                                    %(momentum)s, %(convergence)s, %(proactivity)s,
-                                    %(atr)s)
+                                   %(direction)s, %(confidence)s,
+                                   %(sentiment_score)s, %(mention_zscore)s,
+                                   %(quality_score)s, %(signal_phase)s, %(ts)s,
+                                   %(momentum)s, %(convergence)s, %(proactivity)s,
+                                   %(atr)s, %(contrarian)s)
                             """,
                             {
-                                "ts": r.get("generated_at") or datetime.now(UTC).isoformat(),
-                                "ticker": r.get("ticker", ""),
-                                "strategy": "social_momentum",
-                                "direction": r.get("direction", ""),
-                                "confidence": _float(r.get("quality_score", 0)),
-                                "sentiment_score": _float(r.get("sentiment_score", 0)),
-                                "mention_zscore": _float(r.get("volume_z_score", 0)),
-                                "quality_score": _float(r.get("quality_score", 0)),
-                                "signal_phase": r.get("signal_phase") or None,
-                                # momentum=0 means "no market data" → store NULL to distinguish
-                                # from a genuinely flat price; convergence/proactivity are always
-                                # meaningful numbers so store them as-is (never coerce to NULL).
-                                "momentum": _float(r.get("momentum")) or None,
-                                "convergence": _float(r.get("convergence")),
-                                "proactivity": _float(r.get("proactivity"), default=1.0),
-                                "atr": _float(r.get("atr")) or None,
+                               "ts": r.get("generated_at") or datetime.now(UTC).isoformat(),
+                               "ticker": r.get("ticker", ""),
+                               "strategy": "social_momentum",
+                               "direction": r.get("direction", ""),
+                               "confidence": _float(r.get("quality_score", 0)),
+                               "sentiment_score": _float(r.get("sentiment_score", 0)),
+                               "mention_zscore": _float(r.get("volume_z_score", 0)),
+                               "quality_score": _float(r.get("quality_score", 0)),
+                               "signal_phase": r.get("signal_phase") or None,
+                               # momentum=0 means "no market data" → store NULL to distinguish
+                               # from a genuinely flat price; convergence/proactivity are always
+                               # meaningful numbers so store them as-is (never coerce to NULL).
+                               "momentum": _float(r.get("momentum")) or None,
+                               "convergence": _float(r.get("convergence")),
+                               "proactivity": _float(r.get("proactivity"), default=1.0),
+                               "atr": _float(r.get("atr")) or None,
+                               "contrarian": r.get("contrarian", "false").lower() == "true",
                             },
                         )
                         cur.execute("RELEASE SAVEPOINT row_sp")

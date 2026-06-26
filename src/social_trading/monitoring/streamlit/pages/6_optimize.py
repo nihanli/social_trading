@@ -706,16 +706,16 @@ with tab_grid:
         ),
     )
     if contrarian_filter == "Normal only":
-        contrarian_clause_signals = "AND (metadata->>'contrarian')::boolean IS NOT TRUE"
+        contrarian_clause_signals = "AND contrarian IS NOT TRUE"
         contrarian_clause_trades  = (
-            "AND (SELECT (s.metadata->>'contrarian')::boolean "
+            "AND (SELECT s.contrarian "
             "     FROM signals s WHERE s.id = t.signal_id) IS NOT TRUE"
         )
         bt_is_contrarian = False
     elif contrarian_filter == "Contrarian only":
-        contrarian_clause_signals = "AND (metadata->>'contrarian')::boolean = TRUE"
+        contrarian_clause_signals = "AND contrarian = TRUE"
         contrarian_clause_trades  = (
-            "AND (SELECT (s.metadata->>'contrarian')::boolean "
+            "AND (SELECT s.contrarian "
             "     FROM signals s WHERE s.id = t.signal_id) = TRUE"
         )
         bt_is_contrarian = True
