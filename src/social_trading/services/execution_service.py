@@ -172,6 +172,9 @@ async def _write_account_state(
         "weekly_pnl": str(state.weekly_pnl),
         "drawdown_pct": str(state.drawdown_pct),
         "updated_at": datetime.now(UTC).isoformat(),
+        # state_date lets risk_service detect stale P&L from a prior trading day
+        # and avoid spurious circuit-breaker trips on service restart.
+        "state_date": datetime.now(UTC).date().isoformat(),
     })
 
 

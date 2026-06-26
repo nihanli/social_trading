@@ -210,7 +210,7 @@ factor_df = query("""
            -- c: convergence (fraction × bonus, 0 = single source or no agreement)
            ROUND(COALESCE(convergence, 0)::numeric, 3)         AS c_convergence,
            momentum IS NULL                                     AS no_market_data,
-           TO_CHAR(generated_at, 'MM-DD HH24:MI')              AS time
+           TO_CHAR(generated_at, 'MM-DD HH24:MI')          AS time
     FROM signals
     WHERE generated_at > NOW() - INTERVAL '2 days'
     ORDER BY generated_at DESC

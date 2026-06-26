@@ -137,7 +137,7 @@ def _render_service(svc: str) -> None:
         ts_ms = fields.get("ts", "0")
         try:
             ts_dt = datetime.fromtimestamp(int(ts_ms) / 1000)  # local time
-            ts_str = ts_dt.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+            ts_str = ts_dt.strftime("%m-%d %H:%M:%S.%f")[:-3]  # MM-DD HH:MM:SS.mmm
         except Exception:
             ts_str = ts_ms
         rows.append({

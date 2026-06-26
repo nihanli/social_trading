@@ -279,7 +279,7 @@ with col_left:
                ROUND(unrealized_pnl::numeric, 2)      AS unrealized_pnl,
                ROUND((unrealized_pnl /
                  NULLIF(entry_price * shares, 0) * 100)::numeric, 1) AS pnl_pct,
-               TO_CHAR(opened_at, 'HH24:MI') AS opened
+               TO_CHAR(opened_at, 'MM-DD HH24:MI') AS opened
         FROM positions
         ORDER BY opened_at DESC
     """)

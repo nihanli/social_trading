@@ -250,6 +250,24 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
         v = raw.get(key) or raw.get(key.encode())
         return float(v) if v is not None else default
 
+    # Detect stale account state written on a prior trading day.
+    # daily_pnl and (on a new week) weekly_pnl should be treated as 0 to avoid
+    # spurious circuit-breaker trips on service restart before execution_service
+    # has written today's fresh values.  drawdown_pct persists across days.
+    today = datetime.now(UTC).date().isoformat()
+    state_date_raw = raw.get("state_date") or raw.get(b"state_date")
+    state_date = state_date_raw.decode() if isinstance(state_date_raw, bytes) else state_date_raw
+    is_stale = state_date != today
+    if is_stale:
+        logger.debug(
+            "_get_account_state: account:state is from %s (today=%s) — zeroing P&L fields "
+            "to prevent stale circuit-breaker trips on restart",
+            state_date,
+            today,
+        )
+
+    is_new_week = datetime.now(UTC).weekday() == 0  # Monday
+
     # Load open positions so the social_exposure concentration check works
     open_positions: list[Position] = []
     try:
@@ -278,9 +296,9 @@ async def _get_account_state(redis: aioredis.Redis) -> AccountState:
     return AccountState(
         net_liquidation=_f("net_liquidation", 100_000.0),
         cash=_f("cash", 100_000.0),
-        daily_pnl=_f("daily_pnl", 0.0),
-        weekly_pnl=_f("weekly_pnl", 0.0),
-        drawdown_pct=_f("drawdown_pct", 0.0),
+        daily_pnl=0.0 if is_stale else _f("daily_pnl", 0.0),
+        weekly_pnl=0.0 if (is_stale and is_new_week) else _f("weekly_pnl", 0.0),
+        drawdown_pct=_f("drawdown_pct", 0.0),  # persists across days — real measure of peak-to-trough
         open_positions=open_positions,
     )
 
