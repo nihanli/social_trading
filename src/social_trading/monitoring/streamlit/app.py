@@ -32,7 +32,9 @@ from social_trading.monitoring.streamlit.utils.db import query, localize_datetim
 from social_trading.monitoring.streamlit.utils.redis_ctrl import (
     close_all_positions,
     close_position,
+    get_fill_sync_alerts,
     get_phase_pipeline_stats,
+    get_reconcile_conflicts,
     get_reconcile_state,
     get_system_state,
     halt_new_trades,
@@ -144,12 +146,37 @@ with st.sidebar:
     st.metric("VIX", f"{state['vix']:.1f}",
               help="Live VIX — affects position size scalars")
 
-# Startup reconcile banner
+# ── Reconcile / fill-sync warning banners ───────────────────────────────────
+# 1. Conflict banner (highest priority) — trading is halted until resolved
+_rec_conflicts = get_reconcile_conflicts()
+if _rec_conflicts:
+    _conflict_tickers = ", ".join(sorted(_rec_conflicts.keys()))
+    st.error(
+        f"⛔ **TRADING HALTED — reconcile conflict(s) require manual resolution** "
+        f"({len(_rec_conflicts)} ticker(s): **{_conflict_tickers}**). "
+        f"Go to [**Reconcile page**](/Reconcile) to review and resolve.",
+        icon="⛔",
+    )
+
+# 2. Startup reconcile pending banner
 _rec_state = get_reconcile_state()
 if _rec_state == "awaiting_approval":
     st.warning(
         "⚠️ **Startup reconcile is pending** — trading is paused until approved. "
         "Go to [**Reconcile page**](/Reconcile) to review and approve.",
+        icon="⚠️",
+    )
+
+# 3. Fill-sync alert banner — inflight orders that couldn't be confirmed
+_fill_alerts = get_fill_sync_alerts()
+if _fill_alerts:
+    _fill_tickers = ", ".join(
+        sorted({a.get("ticker", "?") for a in _fill_alerts})
+    )
+    st.warning(
+        f"⚠️ **{len(_fill_alerts)} fill-sync alert(s)** — order fill(s) could not be "
+        f"confirmed automatically (ticker(s): **{_fill_tickers}**). "
+        f"Go to [**Reconcile page**](/Reconcile) to review.",
         icon="⚠️",
     )
 
