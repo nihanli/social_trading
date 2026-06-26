@@ -157,6 +157,11 @@ if conflicts:
                         resolve_conflict(ticker, "use_ib_direction")
                         st.success(f"use_ib_direction sent for {ticker}")
                         st.rerun()
+                if "close_position" in options:
+                    if st.button(f"⛔ Close IB Position", key=f"cp_{ticker}", type="primary"):
+                        resolve_conflict(ticker, "close_position")
+                        st.success(f"close_position sent for {ticker}")
+                        st.rerun()
     st.divider()
 
 # ── Summary metrics ────────────────────────────────────────────────────────────

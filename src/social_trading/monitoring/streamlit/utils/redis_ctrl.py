@@ -235,6 +235,11 @@ def trigger_reconcile_now() -> None:
     send_command("FULL_RECONCILE")
 
 
+def cancel_brackets(ticker: str) -> None:
+    """Cancel orphaned OCA bracket orders for a closed position ticker."""
+    send_command("CANCEL_BRACKETS", {"ticker": ticker.upper()})
+
+
 # Backward-compatible alias used by older pages
 trigger_full_reconcile = trigger_reconcile_now
 

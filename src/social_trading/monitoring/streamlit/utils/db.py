@@ -97,6 +97,12 @@ def query(sql: str, params: tuple | None = None) -> pd.DataFrame:
     Uses a raw psycopg2 cursor rather than pd.read_sql() to avoid the
     "DBAPI2 objects are not tested" UserWarning that pandas emits when passed
     a bare psycopg2 connection.
+
+    Commits after every query so that CURRENT_DATE / NOW() are always
+    evaluated against the current wall-clock time rather than the start of a
+    long-lived transaction (psycopg2 default autocommit=False keeps the same
+    transaction open indefinitely, freezing CURRENT_DATE at the first query
+    of the session).
     """
     conn = get_connection()
     try:
@@ -104,6 +110,7 @@ def query(sql: str, params: tuple | None = None) -> pd.DataFrame:
             cur.execute(sql, params)
             cols = [desc[0] for desc in cur.description]
             rows = cur.fetchall()
+        conn.commit()
         return pd.DataFrame(rows, columns=cols)
     except Exception as exc:
         # Roll back the broken transaction so the connection is reusable

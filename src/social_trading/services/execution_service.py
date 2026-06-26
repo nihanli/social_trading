@@ -1527,12 +1527,15 @@ def _execution_fill_to_dict(fill: object) -> dict:
     quantity = float(getattr(execution, "shares", 0) or 0)
     price = float(getattr(execution, "price", 0) or 0)
     fill_time = getattr(fill, "time", None) or getattr(execution, "time", None)
+    # IB Execution objects do not carry orderType — this will only produce a meaningful
+    # result when the Fill object also has an Order attached (e.g. from openTrades()).
+    # Callers should prefer reqCompletedOrdersAsync classifications over this field.
     exit_reason = {
         "STP": "STOP_LOSS",
         "STP LMT": "STOP_LOSS",
         "LMT": "TAKE_PROFIT",
         "TRAIL": "TRAILING_STOP",
-    }.get(order_type, "STARTUP_RECONCILE_CLOSED")
+    }.get(order_type, "")  # empty = unknown; callers decide the final fallback label
     return {
         "ticker": getattr(contract, "symbol", ""),
         "action": action,
@@ -2108,6 +2111,16 @@ async def _reconcile_ib_state(
 
     completed_by_ticker: dict[str, float] = {}
     system_entry_tickers: set[str] = set()
+    # Exit reasons derived from completed OCA legs (STP/LMT/TRAIL) — keyed by ticker.
+    # reqCompletedOrdersAsync carries the full order object including orderType, unlike
+    # reqExecutionsAsync whose Execution records do not expose orderType.  This is the
+    # authoritative source for classifying how a position was exited.
+    _completed_exit_reason: dict[str, str] = {}
+    _oca_exit_type_map = {
+        "STP": "STOP_LOSS", "STP LMT": "STOP_LOSS",
+        "LMT": "TAKE_PROFIT",
+        "TRAIL": "TRAILING_STOP",
+    }
     try:
         _completed_orders = await asyncio.wait_for(
             ib.reqCompletedOrdersAsync(apiOnly=False), timeout=30.0
@@ -2131,6 +2144,12 @@ async def _reconcile_ib_state(
                 system_entry_tickers.add(sym)
                 if avg_fill > 0:
                     completed_by_ticker[sym] = avg_fill
+            elif ot in _oca_exit_type_map:
+                _completed_exit_reason[sym] = _oca_exit_type_map[ot]
+                logger.debug(
+                    "[RECONCILE] %s: completed OCA leg type=%s → exit_reason=%s",
+                    sym, ot, _oca_exit_type_map[ot],
+                )
     except Exception as exc:
         logger.debug("[RECONCILE] Failed to process completed orders: %s", exc)
 
@@ -2148,6 +2167,9 @@ async def _reconcile_ib_state(
     app_by_ticker: dict[str, dict] = {ticker: payload for ticker, payload in params.items()}
 
     async def _adopt_position(ticker: str, ib_entry: dict) -> tuple[bool, str]:
+        # GAP-2 fix: cancel any pre-existing OCA/bracket orders before placing
+        # new ones, so we never end up with duplicate OCA brackets on this ticker.
+        _cancel_bracket_orders_sync(engine, ticker)
         pos = current_by_ticker.get(ticker)
         if pos is None:
             from social_trading.core.models import Position  # noqa: PLC0415
@@ -2351,6 +2373,9 @@ async def _reconcile_ib_state(
                 if app_dir and ib_dir and app_dir != ib_dir:
                     state = "direction_mismatch"
                     reason = f"{ticker}: app says {app_dir} but IB shows {ib_dir}."
+                    # GAP-1 fix: cancel any stale OCA/bracket orders for this ticker
+                    # so they don't fill and create further position divergence.
+                    _cancel_bracket_orders_sync(engine, ticker)
                     new_conflicts[ticker] = {
                         "state": "direction_mismatch",
                         "ticker": ticker,
@@ -2483,7 +2508,15 @@ async def _reconcile_ib_state(
                 close_is_valid = close_fill is not None
                 if close_is_valid:
                     exit_price = _to_float(close_fill.get("fill_price", 0.0)) if close_fill else 0.0
-                    exit_reason = close_fill.get("exit_reason", "STARTUP_RECONCILE_CLOSED") if close_fill else "STARTUP_RECONCILE_CLOSED"
+                    # Prefer completed-order classification (reqCompletedOrdersAsync carries
+                    # full orderType on the Order object).  Fall back to the fill record's
+                    # exit_reason, and only use STARTUP_RECONCILE_CLOSED as a last resort
+                    # when no order type info is available.
+                    exit_reason = (
+                        _completed_exit_reason.get(ticker)
+                        or (close_fill.get("exit_reason") if close_fill else None)
+                        or "STARTUP_RECONCILE_CLOSED"
+                    )
                     closed_at = (
                         str(close_fill.get("time"))
                         if close_fill and close_fill.get("time")
@@ -2500,6 +2533,13 @@ async def _reconcile_ib_state(
                         "opened_at": app_entry.get("opened_at", datetime.now(UTC).isoformat()),
                         "mode": mode,
                     })
+                    # Cancel any OCA bracket orders that may still be live in IB.
+                    # The position closed via a non-OCA path (offline close, manual TWS
+                    # close, or a single OCA leg fill that left siblings active) — orphaned
+                    # bracket orders MUST be cancelled before new positions can be entered
+                    # for the same ticker, otherwise they can fill and create unintended
+                    # positions (e.g. a BUY stop on a closed SHORT becomes a spurious LONG).
+                    _cancel_bracket_orders_sync(engine, ticker)
                     await redis.hdel(_POSITION_PARAMS_KEY, ticker)
                     await redis.hdel(_HWM_REDIS_KEY, ticker)
                     await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
@@ -2538,6 +2578,9 @@ async def _reconcile_ib_state(
                         )
                     else:
                         state = "missing"
+                        # GAP-4 fix: cancel any orphaned OCA/bracket orders so they
+                        # don't fill and create an unintended position in IB.
+                        _cancel_bracket_orders_sync(engine, ticker)
                         new_conflicts[ticker] = {
                             "state": "missing",
                             "ticker": ticker,
@@ -3018,6 +3061,9 @@ async def _check_naked_positions(
             continue
 
         # ── Attempt reattach ──────────────────────────────────────────────────
+        # GAP-3 fix: cancel any partial/stale brackets first so reattach
+        # doesn't layer new OCA orders on top of lingering old ones.
+        _cancel_bracket_orders_sync(engine, ticker)
         try:
             success = await engine.reattach_oca_orders(  # type: ignore[union-attr]
                 ticker=ticker,
@@ -3445,6 +3491,11 @@ async def _reconcile_startup(
             # This can happen for positions opened on a prior trading day that
             # were closed before today's session, or if IB's execution history
             # is unavailable.  Do NOT auto-discard — require explicit user action.
+            #
+            # Always cancel any remaining OCA bracket orders: even without a fill
+            # record, the IB position is gone, so bracket orders are orphaned and
+            # could fill unexpectedly (creating unintended positions).
+            _cancel_bracket_orders_sync(engine, ticker)
             pending_payload = json.dumps({
                 "ticker": ticker,
                 "direction": direction,
@@ -3465,7 +3516,7 @@ async def _reconcile_startup(
             await redis.hset(_PENDING_RECONCILE_KEY, ticker, pending_payload)
             logger.warning(
                 "[SYNC] %s: in position:params but absent from IB with no fill record "
-                "— moved to positions:pending_reconcile for manual review",
+                "— cancelled orphaned OCA orders and moved to positions:pending_reconcile for manual review",
                 ticker,
             )
 
@@ -5049,6 +5100,29 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                     else:
                         logger.warning("RESOLVE_CONFLICT: no IB direction for %s", ticker)
                         continue
+                elif action == "close_position":
+                    # Close the IB position for this ticker (used for direction_mismatch
+                    # conflicts where the app wants to reject the IB position entirely).
+                    _cancel_bracket_orders_sync(active_engine, ticker)
+                    close_result = await _command_close_position(
+                        redis, active_engine, ticker,
+                        reason="USER_RESOLVED_CONFLICT",
+                        mode=_rc_mode,
+                    )
+                    if close_result is False:
+                        logger.warning(
+                            "RESOLVE_CONFLICT: close_position for %s rejected or failed — "
+                            "clearing app state anyway",
+                            ticker,
+                        )
+                    # Clean up app-side state regardless of IB close result
+                    if hasattr(active_engine, "forget_position"):
+                        active_engine.forget_position(ticker)  # type: ignore[union-attr]
+                    await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+                    await redis.hdel(_HWM_REDIS_KEY, ticker)
+                    await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
+                    await redis.hdel(_POSITIONS_LIVE_KEY, ticker)
+                    logger.info("RESOLVE_CONFLICT: %s IB position closed and app state cleared", ticker)
                 else:
                     logger.warning("RESOLVE_CONFLICT: unknown action %r for %s", action, ticker)
                     continue
@@ -5101,6 +5175,31 @@ async def run_command_listener(engine: Optional[ExecutionEngine], redis: aioredi
                 logger.info("RECONCILE_DELETE: %s deleted by user at reconcile", ticker)
             except Exception as exc:
                 logger.warning("RECONCILE_DELETE_POSITION failed for %s: %s", ticker, exc)
+        elif cmd == "CANCEL_BRACKETS":
+            # Cancel all orphaned OCA bracket orders for a closed position ticker
+            # and remove it from orders:inflight.
+            # Payload: {ticker: str}
+            ticker = str(payload.get("ticker", "")).upper()
+            if not ticker:
+                logger.warning("CANCEL_BRACKETS: missing ticker in payload")
+                continue
+            try:
+                cancelled = _cancel_bracket_orders_sync(active_engine, ticker)
+                # Remove stale orders:inflight entries for this ticker
+                inf_raw = await redis.hgetall(_INFLIGHT_ENTRY_KEY)
+                for _oid_b, _inf_b in inf_raw.items():
+                    _oid = _oid_b.decode() if isinstance(_oid_b, bytes) else _oid_b
+                    try:
+                        _inf = json.loads(_inf_b.decode() if isinstance(_inf_b, bytes) else _inf_b)
+                        if _inf.get("ticker") == ticker:
+                            await redis.hdel(_INFLIGHT_ENTRY_KEY, _oid)
+                            logger.info("CANCEL_BRACKETS: removed stale orders:inflight entry %s for %s", _oid, ticker)
+                    except Exception:
+                        pass
+                logger.info("CANCEL_BRACKETS: %s — cancelled %d bracket order(s) and cleaned inflight", ticker, cancelled)
+            except Exception as exc:
+                logger.warning("CANCEL_BRACKETS failed for %s: %s", ticker, exc)
+
         elif cmd == "ADOPT_IB_POSITION":
             # Adopt an IB position that has no system params (manual_ib / orphan).
             # Seeds position:params from IB portfolio data + ATR; places OCA bracket.
