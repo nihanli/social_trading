@@ -1,6 +1,6 @@
 ## Part 2 — Run Workflows
 
-Three distinct operating modes depending on your goal.
+Four distinct operating modes depending on your goal.
 
 ---
 
@@ -13,13 +13,13 @@ Social data sources disabled (no API keys needed).
 
 **Terminal 1 — Infrastructure:**
 ```bash
-make up
+make test-infra
 ```
 
 **Terminal 2 — All services:**
 ```bash
 source .venv/bin/activate
-honcho start ingest nlp signal risk ui
+honcho start -e .env.test ingest nlp signal risk ui
 ```
 
 > With no API keys set, ingest produces no posts. To test the pipeline
@@ -35,7 +35,7 @@ source .venv/bin/activate
 python -m social_trading.services.execution_service
 ```
 
-**Stop:** `Ctrl+C` in each terminal, then `make down` to stop Docker.
+**Stop:** `Ctrl+C` in each terminal, then `make test-infra-down` to stop Docker.
 
 ---
 
@@ -44,25 +44,23 @@ python -m social_trading.services.execution_service
 **Purpose:** 5-day paper dry run — real social data, real market data, simulated trades via IBKR paper account.
 This is the gate before going live.
 
-**Prerequisites:** API keys in `.env`, IB Gateway running and logged in to paper account.
+**Prerequisites:** API keys in `.env.test`, IB Gateway running and logged in to paper account.
 
-**Step 1 — Start infrastructure:**
+**Step 1 — Start test infrastructure:**
 ```bash
-make up
-docker compose ps    # confirm postgres and redis show (healthy)
+make test-infra
+docker compose -p social_trading_test -f docker-compose.test.yml ps   # confirm healthy
 ```
 
 **Step 2 — Verify IB Gateway is reachable:**
 ```bash
 nc -z 127.0.0.1 7497 && echo "TWS reachable" || echo "NOT reachable"
-# OR for Gateway:
-nc -z 127.0.0.1 4002 && echo "Gateway reachable" || echo "NOT reachable"
 ```
 
 **Step 3 — Start all services in one terminal:**
 ```bash
 source .venv/bin/activate
-honcho start ingest nlp signal risk ui
+honcho start -e .env.test
 ```
 
 Expected startup log (within 60 seconds):
@@ -82,11 +80,6 @@ python -m social_trading.services.execution_service --ibkr
 
 Expected: `Connected to IBKR port=7497 clientId=10`
 
-**Step 5 — Start observability (optional):**
-```bash
-docker compose up -d prometheus grafana
-```
-
 **Open the UI:** http://localhost:8501
 
 ---
@@ -99,20 +92,74 @@ docker compose up -d prometheus grafana
 
 1. Tighten risk parameters in Streamlit → Config page (see Part 7.2)
 
-2. Update `.env`:
+2. Fill in `.env.prod`:
    ```dotenv
-   IBKR_PORT=4001        # IB Gateway live port
-   TRADING_MODE=live
+   IBKR_PORT=7496        # live TWS port
+   IBKR_ACCOUNT=U...     # your live account number
    ```
 
-3. Switch IB Gateway to live account login (port 4001)
+3. Switch IB Gateway to live account login (port 7496)
 
-4. Start exactly as Workflow B — the `--ibkr` flag reads `IBKR_PORT` from `.env`
-
-5. Seed conservative watchlist:
+4. **Terminal 1 — Start prod infrastructure:**
    ```bash
-   python scripts/seed_watchlist.py --tickers AAPL MSFT SPY QQQ
+   make prod-infra
    ```
+
+5. **Terminal 2 — Start prod services:**
+   ```bash
+   source .venv/bin/activate
+   honcho start -e .env.prod
+   ```
+
+6. **Terminal 3 — Start prod execution:**
+   ```bash
+   source .venv/bin/activate
+   python -m social_trading.services.execution_service --ibkr
+   ```
+
+**Open the prod UI:** http://localhost:8502
+
+---
+
+### Workflow D — Simultaneous Test + Production
+
+Run both environments at the same time on the same machine.
+
+**Prerequisites:** Both `.env.test` and `.env.prod` configured. Both TWS instances running
+(paper on port 7497, live on port 7496).
+
+**Terminal 1 — Start both Docker stacks:**
+```bash
+make test-infra && make prod-infra
+```
+
+**Terminal 2 — Test services:**
+```bash
+source .venv/bin/activate
+honcho start -e .env.test
+# UI at http://localhost:8501
+```
+
+**Terminal 3 — Prod services:**
+```bash
+source .venv/bin/activate
+honcho start -e .env.prod
+# UI at http://localhost:8502
+```
+
+**Terminal 4 — Test execution:**
+```bash
+python -m social_trading.services.execution_service --ibkr
+# reads IBKR_PORT=7497 from .env.test
+```
+
+**Terminal 5 — Prod execution:**
+```bash
+python -m social_trading.services.execution_service --ibkr
+# reads IBKR_PORT=7496 from .env.prod
+```
+
+See [11-test-prod-environments.md](11-test-prod-environments.md) for full details.
 
 ---
 

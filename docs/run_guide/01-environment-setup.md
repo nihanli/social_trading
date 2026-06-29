@@ -155,25 +155,37 @@ with `IBKR_SCANNER_CLIENT_ID` in `.env` if needed.
 > defaults to `clientId=99` (`IBKR_SCANNER_CLIENT_ID`). Keep them distinct to
 > avoid `"Already connected"` errors.
 
-### 1.5 Create the .env File
+### 1.5 Create Environment Config Files
 
+The system uses separate config files for test (IB paper) and production (IB live) environments.
+Both can run simultaneously on the same machine — see [11-test-prod-environments.md](11-test-prod-environments.md).
+
+**Test environment (paper trading — start here):**
 ```bash
-cp .env.example .env
-nano .env    # fill in your values
+cp .env.example .env.test
+nano .env.test    # fill in your values
 ```
 
-Complete `.env` reference:
+**Production environment (live trading — set up after paper run is validated):**
+```bash
+cp .env.example .env.prod
+nano .env.prod    # same keys but IBKR_PORT=7496 and live IBKR_ACCOUNT
+```
+
+> ⚠️ `.env.test` and `.env.prod` are in `.gitignore` — never commit them.
+
+Complete config reference:
 
 ```dotenv
 # ── Database ─────────────────────────────────────────────────────────────────
 DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=trading
+DB_PORT=5432           # test: 5432  |  prod: 5433
+DB_NAME=trading_test   # test: trading_test  |  prod: trading_prod
 DB_USER=trader
 DB_PASSWORD=changeme
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://localhost:6379/0   # test: :6379/0  |  prod: :6380/0
 
 # ── X (Twitter) — disabled by default; enable via x_api_enabled in Config UI ──
 X_BEARER_TOKEN=                    # set but x_api_enabled must be True to activate
@@ -189,7 +201,6 @@ REDDIT_USER_AGENT=social-trading-bot/0.1 by u/YourUsername
 
 # ── StockTwits ────────────────────────────────────────────────────────────────
 # No token required — public unauthenticated endpoints are used automatically.
-# STOCKTWITS_TOKEN is no longer used; remove it if set.
 
 # ── Bluesky ───────────────────────────────────────────────────────────────────
 BLUESKY_HANDLE=                    # e.g. yourhandle.bsky.social
@@ -199,43 +210,46 @@ BLUESKY_APP_PASSWORD=              # from bsky.app Settings → App Passwords
 # Yahoo Finance screener: no key needed — zero-config, enabled by default
 
 # Alpha Vantage free key — get one at alphavantage.co/support/#api-key
-# Leave empty to disable (Yahoo Finance + IBKR scanner still run)
 ALPHA_VANTAGE_API_KEY=
 
 # ── Interactive Brokers ───────────────────────────────────────────────────────
-IBKR_HOST=127.0.0.1        # shared by execution layer and market scanner
-
-# Execution layer
-IBKR_PORT=7497          # 7497=TWS paper, 4002=Gateway paper, 4001=Gateway live
+IBKR_HOST=127.0.0.1
+IBKR_PORT=7497          # test/paper: 7497 (TWS) or 4002 (Gateway)
+                        # prod/live:  7496 (TWS) or 4001 (Gateway)
 IBKR_CLIENT_ID=10
-
-# Market Scanner (discovery) — separate client ID avoids "Already connected" errors
-IBKR_SCANNER_PORT=7497             # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
+IBKR_ACCOUNT=           # paper: DU... number  |  live: U... number
 IBKR_SCANNER_CLIENT_ID=99
+
+# ── Streamlit UI ─────────────────────────────────────────────────────────────
+UI_PORT=8501            # test: 8501  |  prod: 8502
 
 # ── System ────────────────────────────────────────────────────────────────────
 LOG_LEVEL=INFO
-TRADING_MODE=paper
-PAPER_INITIAL_CASH=100000
-GF_SECURITY_ADMIN_PASSWORD=changeme_grafana
 ```
-
-> ⚠️ Never commit `.env` to git — it is already in `.gitignore`.
 
 ### 1.6 First-Time Database Initialisation
 
-Run once after setting up `.env`:
+Run once per environment:
 
+**Test environment:**
 ```bash
 source .venv/bin/activate
-make up                          # start Postgres + Redis
-make migrate                     # create database tables
-python scripts/seed_watchlist.py # seed default ticker watchlist
+make test-infra                  # start test Postgres (:5432) + Redis (:6379)
+make migrate-test                # create database tables in trading_test
+DB_NAME=trading_test DB_PORT=5432 python scripts/seed_watchlist.py
+```
+
+**Production environment (after paper run is validated):**
+```bash
+make prod-infra                  # start prod Postgres (:5433) + Redis (:6380)
+make migrate-prod                # create database tables in trading_prod
+DB_NAME=trading_prod DB_PORT=5433 python scripts/seed_watchlist.py
 ```
 
 Verify the watchlist was seeded:
 ```bash
-redis-cli smembers watchlist:active
+redis-cli -p 6379 smembers watchlist:active   # test
+redis-cli -p 6380 smembers watchlist:active   # prod
 ```
 
 

@@ -10,8 +10,10 @@ build/
 venv/
 env/
 
-# Environment
+# Environment — never commit secrets
 .env
+.env.test
+.env.prod
 *.env.local
 
 # Testing

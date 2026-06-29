@@ -4,4 +4,4 @@ signal:      python -m social_trading.services.signal_service
 risk:        python -m social_trading.services.risk_service
 execution:   python -m social_trading.services.execution_service --ibkr
 persistence: python -m social_trading.services.persistence_service
-ui:          streamlit run src/social_trading/monitoring/streamlit/app.py --server.port 8501
+ui:          streamlit run src/social_trading/monitoring/streamlit/app.py --server.port ${UI_PORT:-8501}
