@@ -11,43 +11,56 @@ Environment variables (from .env / docker-compose):
     DB_NAME       trading   (default)
     DB_USER       trader    (default)
     DB_PASSWORD   changeme  (default)
+
+Timezone convention
+-------------------
+* All timestamps are stored as TIMESTAMP WITH TIME ZONE (UTC) in PostgreSQL.
+* The DB session timezone is set to the local IANA timezone (LOCAL_TZ_NAME)
+  so TO_CHAR() display and CURRENT_DATE reflect local wall-clock time.
+* Python datetime handling always parses into UTC first (utc=True), then
+  converts to LOCAL_TZ (a zoneinfo-backed, DST-aware zone) for display.
+* Use UTC midnight anchors for "today" filters:
+      col >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+  This is consistent regardless of the local clock and matches the signals
+  date filter already in use throughout the app.
 """
 from __future__ import annotations
 
-import datetime
 import os
 import subprocess
+import zoneinfo
 
 import pandas as pd
 import psycopg2
 import streamlit as st
 
-# Local timezone (used to convert UTC datetimes for display)
-_LOCAL_TZ = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
-
 
 def _get_local_iana_tz() -> str:
-    """
-    Return the local IANA timezone name (e.g. 'America/Los_Angeles').
-    Falls back to a UTC-offset string if the system symlink can't be resolved.
-    """
+    """Return the local IANA timezone name (e.g. 'America/Los_Angeles').
+    Falls back to 'UTC' if the system symlink cannot be resolved."""
     try:
         link = subprocess.run(
             ["readlink", "/etc/localtime"], capture_output=True, text=True
         ).stdout.strip()
-        # Resolve path components after 'zoneinfo'
         parts = link.split("/")
         for i, part in enumerate(parts):
             if part == "zoneinfo":
-                return "/".join(parts[i + 1 :])
+                return "/".join(parts[i + 1:])
     except Exception:
         pass
-    # Fallback: use UTC offset in ISO form but flip sign for POSIX (PostgreSQL quirk)
-    # Use 'UTC' as safe default rather than a broken offset
     return "UTC"
 
 
-_PG_TZ = _get_local_iana_tz()
+# Shared IANA timezone name used by both the DB session and Python conversions.
+# Import this in other modules (e.g. chart_data.py) instead of hardcoding a tz.
+LOCAL_TZ_NAME: str = _get_local_iana_tz()
+
+# DST-aware zoneinfo object — use this for all pandas .dt.tz_convert() calls
+# so that historical timestamps show the correct UTC offset (e.g. PST vs PDT).
+LOCAL_TZ = zoneinfo.ZoneInfo(LOCAL_TZ_NAME)
+
+# Keep as alias so PostgreSQL SET TIME ZONE uses the same IANA name.
+_PG_TZ = LOCAL_TZ_NAME
 
 
 @st.cache_resource
@@ -74,8 +87,9 @@ def get_connection():
 
 def localize_datetimes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert all timezone-aware datetime columns in *df* to the local timezone.
+    Convert all datetime columns in *df* to LOCAL_TZ (DST-aware local timezone).
     Timezone-naive columns are assumed UTC and are first localized to UTC.
+    Timezone-aware columns (any offset) are converted via UTC to LOCAL_TZ.
     Returns the dataframe in-place (also returns it for chaining).
     """
     for col in df.columns:
@@ -83,7 +97,7 @@ def localize_datetimes(df: pd.DataFrame) -> pd.DataFrame:
             continue
         if df[col].dt.tz is None:
             df[col] = df[col].dt.tz_localize("UTC")
-        df[col] = df[col].dt.tz_convert(_LOCAL_TZ)
+        df[col] = df[col].dt.tz_convert(LOCAL_TZ)
     return df
 
 

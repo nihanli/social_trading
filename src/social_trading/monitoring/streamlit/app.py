@@ -193,7 +193,7 @@ daily_pnl_df = query("""
            COUNT(*) FILTER (WHERE net_pnl > 0) AS wins,
            COUNT(*) AS total
     FROM trades
-    WHERE closed_at::date = CURRENT_DATE
+    WHERE closed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 """)
 open_pos_df = query("SELECT COUNT(*) AS cnt FROM positions")
 signals_today_df = query("""
@@ -202,7 +202,7 @@ signals_today_df = query("""
            COUNT(*) FILTER (WHERE signal_phase = 'phase1') AS phase1,
            COUNT(*) FILTER (WHERE signal_phase = 'phase2') AS phase2
     FROM signals
-    WHERE generated_at::date = CURRENT_DATE
+    WHERE generated_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 """)
 
 col1, col2, col3, col4, col5, col6 = st.columns(6)

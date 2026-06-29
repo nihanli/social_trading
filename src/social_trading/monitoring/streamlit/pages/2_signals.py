@@ -41,11 +41,13 @@ pipeline = get_phase_pipeline_stats()
 
 p1_today = query("""
     SELECT COUNT(*) AS cnt FROM signals
-    WHERE generated_at::date = CURRENT_DATE AND signal_phase = 'phase1'
+    WHERE generated_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+      AND signal_phase = 'phase1'
 """)
 p2_today = query("""
     SELECT COUNT(*) AS cnt FROM signals
-    WHERE generated_at::date = CURRENT_DATE AND signal_phase = 'phase2'
+    WHERE generated_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+      AND signal_phase = 'phase2'
 """)
 p1_cnt = int(p1_today.iloc[0]["cnt"]) if not p1_today.empty else 0
 p2_cnt = int(p2_today.iloc[0]["cnt"]) if not p2_today.empty else 0

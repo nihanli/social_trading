@@ -24,6 +24,8 @@ from typing import Any
 
 import pandas as pd
 
+from social_trading.monitoring.streamlit.utils.db import LOCAL_TZ_NAME
+
 logger = logging.getLogger(__name__)
 
 # ── Timeframe definitions ──────────────────────────────────────────────────────
@@ -161,18 +163,20 @@ def _fetch_yfinance(ticker: str, period: str, interval: str) -> list[dict[str, A
 # ── Conversion ────────────────────────────────────────────────────────────────
 
 def _bars_to_df(bars: list[dict[str, Any]]) -> pd.DataFrame:
-    """Convert list-of-dicts to a DataFrame with DatetimeIndex."""
+    """Convert list-of-dicts to a DataFrame with a tz-aware DatetimeIndex.
+
+    Parses all timestamp strings via UTC (utc=True) to avoid the
+    "Mixed timezones detected" error that arises when bars span a DST
+    transition and some strings carry -0400 while others carry -0500.
+    The index is then converted to LOCAL_TZ_NAME for display.
+    """
     df = pd.DataFrame(bars)
-    # Parse without forcing UTC first so tz-aware strings keep their offset.
-    parsed = pd.to_datetime(df["timestamp"])
-    if parsed.dt.tz is None:
-        # Date-only strings (e.g. IB daily "2024-06-24") are tz-naive.
-        # Localise as Eastern — treating midnight UTC would shift the date
-        # back by one day when converted to Eastern time (UTC-4/5).
-        parsed = parsed.dt.tz_localize(
-            "America/New_York", ambiguous="infer", nonexistent="shift_forward"
-        )
-    df["datetime"] = parsed.dt.tz_convert("America/New_York")
+    # utc=True normalises everything — tz-aware strings are converted to UTC,
+    # tz-naive strings (e.g. IB daily "2024-06-24" date-only) are treated as UTC.
+    # format='ISO8601' accepts both date-only and full ISO datetime strings in
+    # the same series without raising "Mixed timezones detected".
+    parsed = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
+    df["datetime"] = parsed.dt.tz_convert(LOCAL_TZ_NAME)
     df = df.set_index("datetime").sort_index()
     df = df.rename(columns={
         "open": "Open", "high": "High",

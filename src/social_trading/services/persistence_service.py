@@ -605,6 +605,23 @@ def _write_trade_closed(data: dict) -> None:
                 if not row:
                     # No open trade row found — position was opened before persistence
                     # was tracking it (adopted from IB, prior session, etc.).
+                    # Before inserting a synthetic closed record, check whether a closed
+                    # row already exists for this ticker with the same opened_at timestamp.
+                    # This prevents duplicate synthetic rows when two position_closed events
+                    # fire for the same position (e.g. reconcile close + real OCA fill close).
+                    synth_opened_at_check = data.get("opened_at") or closed_at
+                    cur.execute(
+                        "SELECT id FROM trades WHERE ticker = %s AND status = 'closed' "
+                        "AND opened_at = %s ORDER BY id DESC LIMIT 1",
+                        (ticker, synth_opened_at_check),
+                    )
+                    if cur.fetchone():
+                        logger.info(
+                            "Duplicate position_closed for %s (opened_at=%s) — "
+                            "closed row already exists; skipping synthetic insert",
+                            ticker, synth_opened_at_check,
+                        )
+                        return
                     # Insert a synthetic closed record if we have enough data to compute P&L.
                     synth_entry = _float(data.get("entry_price", 0))
                     synth_shares = _int(data.get("shares", 0))

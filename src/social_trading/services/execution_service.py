@@ -1926,12 +1926,14 @@ async def _reconcile_ib_state(
         return 0.0
 
     def _close_fill_for_ticker(ticker: str, direction: str) -> dict | None:
+        # Only the direction-correct closing side confirms a close fill.
+        # LONG exits via SLD (sell); SHORT exits via BOT (buy-to-cover).
+        # Removing the _close_fills_by_ticker / fills_by_ticker fallbacks prevents
+        # entry fills (BOT for LONG, SLD for SHORT) from being misread as close fills,
+        # which previously caused spurious position_closed events when the position
+        # had just opened and only the entry fill existed in reqExecutionsAsync.
         close_side = "SLD" if direction == "LONG" else "BOT"
-        return (
-            fills_by_ticker_side.get(ticker, {}).get(close_side)
-            or _close_fills_by_ticker.get(ticker)
-            or fills_by_ticker.get(ticker)
-        )
+        return fills_by_ticker_side.get(ticker, {}).get(close_side)
 
     async def _persist_params(ticker: str, payload: dict) -> None:
         await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(payload, default=str))
