@@ -538,15 +538,31 @@ class IBKRExecutionEngine:
                         effective_stop_loss = min_sl
 
             effective_take_profit = take_profit
-            if fill_price and not _tp_valid(fill_price):
+            if fill_price and fill_price > 0 and take_profit_pct > 0:
+                # Always recompute TP from the actual fill price so the bracket
+                # order lands exactly take_profit_pct away from the real entry,
+                # regardless of slippage between signal approval and execution.
+                # The pre-approved take_profit was computed from market["last"] at
+                # approval time; if the fill came in higher (LONG) or lower (SHORT),
+                # the OCA limit order would fire too early or too late.
                 if signal.direction == "LONG":
                     effective_take_profit = round(fill_price * (1.0 + take_profit_pct), 2)
                 else:
                     effective_take_profit = round(fill_price * (1.0 - take_profit_pct), 2)
+                if effective_take_profit != take_profit:
+                    logger.info(
+                        "[IBKR] TP adjusted to fill: %.4f → %.4f (fill=%.4f pct=%.2f%% %s)",
+                        take_profit, effective_take_profit,
+                        fill_price, take_profit_pct * 100, signal.direction,
+                    )
+            elif fill_price and not _tp_valid(fill_price):
+                # take_profit_pct not available — TP is on wrong side; skip the limit leg
                 logger.warning(
-                    "[IBKR] TP %.4f stale vs fill %.4f (%s) — recomputed to %.4f",
-                    take_profit, fill_price, signal.direction, effective_take_profit,
+                    "[IBKR] TP %.4f invalid vs fill %.4f (%s) and no take_profit_pct — "
+                    "OCA limit leg will be skipped",
+                    take_profit, fill_price, signal.direction,
                 )
+                effective_take_profit = 0.0
 
             oca_group = f"oca_{entry_id}"
             oca_errors: list[str] = []

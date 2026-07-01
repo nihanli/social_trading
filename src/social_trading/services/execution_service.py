@@ -523,6 +523,16 @@ async def run_trade_loop(
                         # trigger the disconnect-guard (early return) or produce an
                         # empty hash, neither of which shows the new position in the UI.
                         fill_px = result.fill_price or 0.0
+                        # Recompute take_profit from the actual fill price so params
+                        # match what ibkr.py already passed to the OCA bracket order.
+                        # The signal's take_profit was computed from market["last"] at
+                        # approval time; fill_px reflects slippage and price movement.
+                        effective_tp = take_profit
+                        if fill_px > 0 and cfg.take_profit_pct > 0:
+                            if signal.direction == "LONG":
+                                effective_tp = round(fill_px * (1.0 + cfg.take_profit_pct), 2)
+                            else:
+                                effective_tp = round(fill_px * (1.0 - cfg.take_profit_pct), 2)
                         try:
                             await redis.hset(_POSITIONS_LIVE_KEY, signal.ticker, json.dumps({
                                 "ticker": signal.ticker,
@@ -530,7 +540,7 @@ async def run_trade_loop(
                                 "shares": quantity,
                                 "entry_price": fill_px,
                                 "stop_loss": stop_loss,
-                                "take_profit": take_profit,
+                                "take_profit": effective_tp,
                                 "unrealized_pnl": 0.0,
                                 "high_water_mark": fill_px,
                                 "opened_at": result.submitted_at.isoformat(),
@@ -544,7 +554,7 @@ async def run_trade_loop(
                             # _persist_position_params_to_redis has a chance to run.
                             await redis.hset(_POSITION_PARAMS_KEY, signal.ticker, json.dumps({
                                 "stop_loss": stop_loss,
-                                "take_profit": take_profit,
+                                "take_profit": effective_tp,
                                 "opened_at": result.submitted_at.isoformat(),
                                 "direction": signal.direction,
                                 "source": "system",
@@ -562,7 +572,7 @@ async def run_trade_loop(
                             "shares": quantity,
                             "entry_price": result.fill_price or 0.0,
                             "stop_loss": stop_loss,
-                            "take_profit": take_profit,
+                            "take_profit": effective_tp,
                             "opened_at": result.submitted_at.isoformat(),
                             "signal_generated_at": signal.generated_at.isoformat(),
                             "mode": mode,
@@ -573,15 +583,15 @@ async def run_trade_loop(
                             "quantity": quantity,
                             "fill_price": result.fill_price,
                             "stop_loss": stop_loss,
-                            "take_profit": take_profit,
+                            "take_profit": effective_tp,
                             "submitted_at": result.submitted_at.isoformat(),
                             "quality_score": signal.quality_score,
                         }))
                         await redis.ltrim("trades:recent", 0, 999)
                         logger.info(
-                            "[EXEC] Submitted %s %s qty=%d fill=%.4f [total=%d]",
+                            "[EXEC] Submitted %s %s qty=%d fill=%.4f tp=%.4f [total=%d]",
                             signal.direction, signal.ticker, quantity,
-                            result.fill_price or 0.0, submitted,
+                            result.fill_price or 0.0, effective_tp, submitted,
                         )
 
                         # ── Async entry fill tracking ──────────────────────────
