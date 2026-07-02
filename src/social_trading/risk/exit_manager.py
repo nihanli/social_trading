@@ -8,7 +8,13 @@ Exit rules (design §6b, evaluated in priority order):
   4. Trailing stop triggered  → TRAILING_STOP close
      (trailing_stop_pct may be tightened by mention decay in execution_service)
   5. Sentiment reversal       → SENTIMENT_REVERSAL — tightens trail to min_pct (no immediate close)
-  6. Hard time stop           → TIME_STOP close
+  6. Session time stop        → TIME_STOP close
+
+TIME_STOP fires ``cfg.time_stop_minutes_before_close`` minutes before the close of
+the ``cfg.max_hold_sessions``-th trading session after entry.  The close time is
+obtained from exchange_calendars (XNYS), which correctly handles holidays and
+early-close days.  Example: max_hold_sessions=1, time_stop_minutes_before_close=5
+→ exit order submitted at 3:55 PM ET on the entry day.
 
 If multiple rules fire, the highest-priority one wins.
 
@@ -27,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from social_trading.config.system_config import SystemConfig
@@ -95,7 +101,6 @@ class PositionExitManager:
         pnl = _unrealised_pnl(position, current_price)
         entry_cost = position.cost_basis
         hours_held = (now - position.opened_at.replace(tzinfo=UTC)).total_seconds() / 3600
-        trading_days_held = _NYSE.trading_days_between(position.opened_at, now)
 
         # ── 1. Emergency single-trade loss ────────────────────────────────────
         # Only activate when there is no valid ATR-based stop_loss already set.
@@ -157,12 +162,24 @@ class PositionExitManager:
                     detail=f"Sentiment {current_sentiment:.3f} reversed against {position.direction}",
                 )
 
-        # ── 6. Hard time stop ─────────────────────────────────────────────────
-        if trading_days_held >= cfg.max_hold_trading_days:
+        # ── 6. Session time stop ──────────────────────────────────────────────
+        # Fire when we are within cfg.time_stop_minutes_before_close of the
+        # close of the cfg.max_hold_sessions-th trading session after entry.
+        # nth_session_close() uses exchange_calendars so holidays and early
+        # closes are handled automatically.
+        time_stop_deadline = _NYSE.nth_session_close(
+            position.opened_at, cfg.max_hold_sessions
+        )
+        pre_close_window = timedelta(minutes=cfg.time_stop_minutes_before_close)
+        if now >= time_stop_deadline - pre_close_window:
+            _et = __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("America/New_York")
             return ExitDecision(
                 should_exit=True,
                 reason="TIME_STOP",
-                detail=f"Held {trading_days_held} trading days >= max {cfg.max_hold_trading_days}",
+                detail=(
+                    f"Session {cfg.max_hold_sessions} close approaching — "
+                    f"deadline {time_stop_deadline.astimezone(_et):%m/%d %I:%M %p ET}"
+                ),
             )
 
         return _HOLD

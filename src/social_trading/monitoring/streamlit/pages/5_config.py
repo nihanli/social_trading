@@ -774,12 +774,22 @@ with tab_risk:
         )
 
     with col_ex2:
-        cfg.max_hold_trading_days = st.number_input(
-            "Max hold time (trading days)", 1, 20, int(cfg.max_hold_trading_days), 1,
+        cfg.max_hold_sessions = st.number_input(
+            "Max hold time (sessions)", 1, 20, int(cfg.max_hold_sessions), 1,
             help=(
-                "Hard time-based exit: a position is closed after it has been open for "
-                "this many NYSE trading days (excludes weekends and market holidays). "
-                "Prevents indefinite holding of stale social-momentum trades. Default: 3 days."
+                "Hard time-based exit: the position is closed N minutes before the close of "
+                "the Nth trading session after entry. "
+                "1 = same day (exit ~5 min before today's close). "
+                "2 = exit ~5 min before next session's close. "
+                "Weekends, NYSE holidays, and early-close days are handled automatically."
+            ),
+        )
+        cfg.time_stop_minutes_before_close = st.number_input(
+            "Exit N min before session close", 1, 60,
+            int(cfg.time_stop_minutes_before_close), 1,
+            help=(
+                "How many minutes before the session close to submit the TIME_STOP market order. "
+                "Default: 5 minutes. Must be at least 1 minute."
             ),
         )
         cfg.signal_reversal_threshold = st.slider(

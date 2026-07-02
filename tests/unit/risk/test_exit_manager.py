@@ -27,7 +27,8 @@ def cfg() -> SystemConfig:
         atr_multiplier=2.0,
         take_profit_pct=0.04,
         trailing_stop_pct=0.08,
-        max_hold_trading_days=3,
+        max_hold_sessions=2,
+        time_stop_minutes_before_close=5,
         loss_limit_single_trade=0.01,
         signal_reversal_threshold=-0.20,
         mention_decay_threshold=0.25,
@@ -310,7 +311,8 @@ def test_mention_decay_tightens_trailing_stop_exit(
     tightened_cfg = SystemConfig(
         trailing_stop_pct=0.02,        # tightened by mention decay
         take_profit_pct=0.04,
-        max_hold_trading_days=3,
+        max_hold_sessions=2,
+        time_stop_minutes_before_close=5,
         loss_limit_single_trade=0.01,
         signal_reversal_threshold=-0.20,
     )
@@ -336,22 +338,36 @@ def test_no_mention_decay_hard_exit(
 # ── TIME_STOP ─────────────────────────────────────────────────────────────────
 
 def test_time_stop(manager: PositionExitManager, cfg: SystemConfig) -> None:
+    """TIME_STOP fires when now is within time_stop_minutes_before_close of the session deadline."""
     pos = make_long(hours_ago=1)
-    now = datetime.now(UTC)
-    # Mock calendar: 4 trading days held (> max 3)
-    with patch("social_trading.risk.exit_manager._NYSE.trading_days_between", return_value=4):
-        decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
+    # Simulate: deadline = 1 minute from now → we are within the 5-min window
+    deadline = datetime.now(UTC) + timedelta(minutes=1)
+    with patch("social_trading.risk.exit_manager._NYSE.nth_session_close", return_value=deadline):
+        decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=datetime.now(UTC))
     assert decision.should_exit is True
     assert decision.reason == "TIME_STOP"
 
 
 def test_time_stop_not_triggered(manager: PositionExitManager, cfg: SystemConfig) -> None:
+    """TIME_STOP does not fire when deadline is far in the future."""
+    pos = make_long(hours_ago=1)
+    # Deadline is 3 hours away — well outside the 5-min window
+    deadline = datetime.now(UTC) + timedelta(hours=3)
+    with patch("social_trading.risk.exit_manager._NYSE.nth_session_close", return_value=deadline):
+        decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=datetime.now(UTC))
+    assert decision.should_exit is False
+
+
+def test_time_stop_exact_window(manager: PositionExitManager, cfg: SystemConfig) -> None:
+    """TIME_STOP fires exactly at the pre-close window boundary."""
     pos = make_long(hours_ago=1)
     now = datetime.now(UTC)
-    # Mock calendar: 2 trading days held (< max 3)
-    with patch("social_trading.risk.exit_manager._NYSE.trading_days_between", return_value=2):
+    # Deadline is exactly time_stop_minutes_before_close away → boundary fires
+    deadline = now + timedelta(minutes=cfg.time_stop_minutes_before_close)
+    with patch("social_trading.risk.exit_manager._NYSE.nth_session_close", return_value=deadline):
         decision = manager.evaluate(pos, current_price=101.0, cfg=cfg, now=now)
-    assert decision.should_exit is False
+    assert decision.should_exit is True
+    assert decision.reason == "TIME_STOP"
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────

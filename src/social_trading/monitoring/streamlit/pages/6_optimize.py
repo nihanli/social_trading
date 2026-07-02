@@ -372,7 +372,7 @@ with tab_suggest:
                 if pd.notna(avg_ts) and avg_ts / avg_total > 0.5:
                     suggestions.append({
                         "symptom": f"Time stop dominates exits ({avg_ts / avg_total:.0%})",
-                        "suggestion": "Signals decay before target — reduce take_profit_pct or max_hold_trading_days",
+                        "suggestion": "Signals decay before target — reduce take_profit_pct or max_hold_sessions",
                         "parameter": "take_profit_pct",
                         "current": cfg_now.take_profit_pct,
                         "recommended": round(max(cfg_now.take_profit_pct * 0.8, 0.01), 3),
@@ -837,7 +837,7 @@ with tab_grid:
         "take_profit_pct":  cfg_bt.take_profit_pct,
         "atr_multiplier":   cfg_bt.atr_multiplier,
         "trailing_stop_pct": getattr(cfg_bt, "trailing_stop_pct", 0.07),
-        "max_hold_days":    getattr(cfg_bt, "max_hold_trading_days", 3),
+        "max_hold_days":    getattr(cfg_bt, "max_hold_sessions", 2),
         # Pass contrarian flag so _simulate_trade inverts sentiment-reversal check correctly.
         # None (mixed) defaults to False — least surprising behaviour for blended data.
         "contrarian": bool(bt_is_contrarian) if bt_is_contrarian is not None else False,
@@ -1026,7 +1026,7 @@ with tab_grid:
             "take_profit_pct":            "take_profit_pct",
             "atr_multiplier":             "atr_multiplier",
             "trailing_stop_pct":          "trailing_stop_pct",
-            "max_hold_days":              "max_hold_trading_days",
+            "max_hold_days":              "max_hold_sessions",
             "signal_phase1_threshold":    "signal_phase1_threshold",
             "mention_decay_threshold":    "mention_decay_threshold",
             "sentiment_reversal_threshold": "sentiment_reversal_threshold",
@@ -1125,7 +1125,7 @@ with tab_grid:
             "take_profit_pct":            "take_profit_pct",
             "atr_multiplier":             "atr_multiplier",
             "trailing_stop_pct":          "trailing_stop_pct",
-            "max_hold_days":              "max_hold_trading_days",
+            "max_hold_days":              "max_hold_sessions",
             "signal_phase1_threshold":    "signal_phase1_threshold",
             "mention_decay_threshold":    "mention_decay_threshold",
             "sentiment_reversal_threshold": "sentiment_reversal_threshold",

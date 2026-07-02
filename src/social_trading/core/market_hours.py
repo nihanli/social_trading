@@ -149,6 +149,50 @@ class MarketHours:
             logger.warning("[MarketHours] trading_days_between failed (%s) — returning 0", exc)
             return 0
 
+    def nth_session_close(self, opened_at: datetime, n: int) -> datetime:
+        """Return the UTC close of the *n*th trading session counting from the opening session.
+
+        Session counting:
+          n=1 — close of the session on ``opened_at.date()`` (same-day exit deadline).
+                If that date is not a trading day (weekend/holiday), the first trading
+                day on or after that date is used as session 1.
+          n=2 — close of the session immediately after the opening session.
+          … and so on.
+
+        Early-close days (e.g. day before Thanksgiving) are handled correctly by
+        ``exchange_calendars`` — their session close will be e.g. 13:00 ET, not 16:00 ET.
+
+        Degrades safely: falls back to a weekday 16:00 ET heuristic on any calendar
+        error so the exit loop never silently bypasses the time stop.
+
+        Args:
+            opened_at: Timezone-aware entry datetime.
+            n:         Session count (>= 1).
+        """
+        try:
+            start_date = pd.Timestamp(opened_at.date())
+            # Extend window generously: n sessions + 30 extra days covers holidays
+            end_date = start_date + pd.Timedelta(days=max(n * 2, 14) + 30)
+            sessions = self._cal.sessions_in_range(start_date, end_date)
+            if len(sessions) < n:
+                raise ValueError(f"Only {len(sessions)} sessions found, need {n}")
+            target_session = sessions[n - 1]
+            close_ts = self._cal.session_close(target_session)
+            return close_ts.to_pydatetime().astimezone(_UTC)
+        except Exception as exc:
+            logger.warning(
+                "[MarketHours] nth_session_close(n=%d) failed (%s) — using 16:00 ET fallback",
+                n, exc,
+            )
+            # Fallback: advance n-1 weekdays from opened_at's date, return 16:00 ET
+            d = opened_at.astimezone(_ET).date()
+            days_added = 0
+            while days_added < n - 1:
+                d += timedelta(days=1)
+                if d.weekday() < 5:
+                    days_added += 1
+            return datetime(d.year, d.month, d.day, 16, 0, 0, tzinfo=_ET).astimezone(_UTC)
+
     def status_str(self, dt: datetime | None = None) -> str:
         """Human-readable status string for logging/UI."""
         if self.is_open(dt):
