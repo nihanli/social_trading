@@ -778,9 +778,14 @@ class IBKRExecutionEngine:
                 error=str(exc),
             )
 
-    async def close_position(self, ticker: str, reason: str = "") -> OrderResult:
+    async def close_position(self, ticker: str, reason: str = "", tif: str = "GTC") -> OrderResult:
         """
-        Cancel all open orders for ticker then submit a market close order.
+        Cancel all open orders for ticker then submit a GTC market close order.
+
+        Always uses GTC so the order persists into the next RTH session when submitted
+        outside regular hours (e.g. naked-position emergency closes, after-hours exits).
+        The ``tif`` parameter is kept for backward compatibility but defaults to ``"GTC"``
+        for all paths — passing ``"DAY"`` is no longer recommended.
         """
         if not _IB_AVAILABLE:
             raise RuntimeError("ib_async is not installed")
@@ -796,10 +801,18 @@ class IBKRExecutionEngine:
             # openOrders() returns Order objects which have no .contract attribute.
             # Filtering by orderRef avoids cancelling manually-placed hedge orders
             # or orders from other API clients on the same ticker.
+            cancelled_count = 0
             for trade in self._ib.openTrades():
                 if (trade.contract.symbol == ticker
                         and getattr(trade.order, "orderRef", "") == ORDER_REF):
                     self._ib.cancelOrder(trade.order)
+                    cancelled_count += 1
+
+            # Brief wait so IB processes the cancel requests before the close order
+            # arrives.  PreSubmitted / Submitted OCA orders are cancelled asynchronously;
+            # without this delay IB may reject the MKT close due to conflicting orders.
+            if cancelled_count:
+                await asyncio.sleep(2.0)
 
             # Determine close action from existing position.
             # IB updates its positions() cache asynchronously after a fill — there's
@@ -835,6 +848,7 @@ class IBKRExecutionEngine:
             close_action = "SELL" if pos_qty > 0 else "BUY"
             direction: Direction = "LONG" if pos_qty > 0 else "SHORT"
             close_order = MarketOrder(close_action, abs(pos_qty))
+            close_order.tif       = tif
             close_order.transmit  = True  # must be explicit — default varies by ib_async version
             close_order.orderRef  = ORDER_REF
             if self._account:
@@ -847,11 +861,17 @@ class IBKRExecutionEngine:
             if trade.fills:
                 fill_price = float(trade.fills[0].execution.price)
 
-            # Clean up in-memory state so re-entry on same ticker starts fresh
-            self._hwm.pop(ticker, None)
-            self._hwm_min.pop(ticker, None)
-            self._ts_order_id.pop(ticker, None)
-            self._position_params.pop(ticker, None)
+            # Clean up in-memory state only on confirmed fill.
+            # For GTC orders submitted outside market hours, the fill arrives
+            # at the next RTH open — premature cleanup would orphan the position
+            # from the exit loop and prevent the reconcile loop from detecting
+            # the fill via closed_offline.  Leave params intact so the position
+            # stays managed until fill is confirmed.
+            if fill_price is not None:
+                self._hwm.pop(ticker, None)
+                self._hwm_min.pop(ticker, None)
+                self._ts_order_id.pop(ticker, None)
+                self._position_params.pop(ticker, None)
 
             logger.info("[IBKR] CLOSE %s qty=%d reason=%s fill=%.4f",
                         ticker, abs(pos_qty), reason, fill_price or 0.0)
@@ -1005,6 +1025,11 @@ class IBKRExecutionEngine:
 
         _stp_types   = {"STP", "STP LMT"}
         _done_states = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+        # PreSubmitted = sent to IB API but not yet acknowledged by the exchange.
+        # Modifying a PreSubmitted stop will update its price in IB's local cache
+        # but the order is NOT on the exchange and will NOT trigger.  Treat this
+        # the same as "no STP found" so the caller falls back to close_position().
+        _not_on_exchange = {"PreSubmitted", "PendingSubmit"}
 
         stp_trade = None
         for trade in self._ib.openTrades():
@@ -1014,6 +1039,13 @@ class IBKRExecutionEngine:
             ot  = getattr(ord_obj, "orderType", "")
             st  = getattr(getattr(trade, "orderStatus", None), "status", "")
             if sym == ticker and ref == ORDER_REF and ot in _stp_types and st not in _done_states:
+                if st in _not_on_exchange:
+                    logger.warning(
+                        "[IBKR] trigger_stop_exit: STP for %s is %s (not on exchange) — "
+                        "cannot rely on modification to trigger; falling back to close_position()",
+                        ticker, st,
+                    )
+                    return False
                 stp_trade = trade
                 break
 

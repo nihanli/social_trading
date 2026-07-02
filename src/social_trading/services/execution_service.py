@@ -781,6 +781,9 @@ async def run_exit_loop(
     # Prevents re-evaluation until run_reconcile_loop detects the fill next cycle.
     # Ephemeral (not persisted) — cleared by reconcile when closed_offline is confirmed.
     _closing_tickers: set[str] = set()
+    # Track when each ticker was added to _closing_tickers for timeout detection.
+    _closing_tickers_ts: dict[str, float] = {}
+    _CLOSING_TIMEOUT_SECS = 120  # force retry close_position after 2 min without fill
     _IB_CACHE_REFRESH_SECS = 300  # 5 minutes
     _last_ib_cache_refresh: float = 0.0
 
@@ -852,19 +855,35 @@ async def run_exit_loop(
             now_ts = asyncio.get_event_loop().time()
             if hasattr(engine, "_ib") and (now_ts - _last_ib_cache_refresh) > _IB_CACHE_REFRESH_SECS:
                 try:
-                    await engine._ib.reqPositionsAsync()  # type: ignore[union-attr]
+                    await asyncio.wait_for(
+                        engine._ib.reqPositionsAsync(),  # type: ignore[union-attr]
+                        timeout=10.0,
+                    )
                     _last_ib_cache_refresh = now_ts
                     logger.debug("[SYNC] IB position cache refreshed")
+                except asyncio.TimeoutError:
+                    logger.warning("[SYNC] IB position cache refresh timed out — skipping this cycle")
+                    _last_ib_cache_refresh = now_ts  # back off so we don't retry every cycle
                 except Exception as exc:
                     logger.debug("[SYNC] IB position cache refresh failed: %s", exc)
 
             # Fetch VIX once per cycle (shared across all ticker snapshots)
-            vix = await market_data.get_vix()
+            try:
+                vix = await asyncio.wait_for(market_data.get_vix(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[SYNC] VIX fetch timed out — using last known value")
+                _vix_raw = await redis.get("market:vix")
+                vix = float(_vix_raw) if _vix_raw else 20.0
             await redis.set("market:vix", str(vix))
 
             # ── 2. Refresh market data ────────────────────────────────────────
             # Only track market data for system-managed positions.
-            all_ib_positions = await engine.get_positions()
+            try:
+                all_ib_positions = await asyncio.wait_for(engine.get_positions(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[SYNC] get_positions() timed out — skipping this cycle")
+                await asyncio.sleep(cfg.exit_eval_interval_sec)
+                continue
             _sys_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}  # type: ignore[union-attr]
             open_positions = [p for p in all_ib_positions if p.ticker in _sys_params]
             open_tickers = {p.ticker for p in open_positions}
@@ -925,38 +944,46 @@ async def run_exit_loop(
                         ticker,
                     )
                     try:
-                        snapshot = await _write_market_snapshot_and_get_price(
-                            redis, ticker, market_data, vix=vix
+                        snapshot = await asyncio.wait_for(
+                            _write_market_snapshot_and_get_price(redis, ticker, market_data, vix=vix),
+                            timeout=8.0,
                         )
                         if snapshot is not None:
                             engine.set_price(ticker, snapshot)
-                    except Exception as exc:
+                    except (asyncio.TimeoutError, Exception) as exc:
                         logger.debug("yfinance fallback failed for %s: %s", ticker, exc)
 
-                # Full snapshot (ATR, OHLCV, momentum) for open positions runs
-                # every POSITION_FULL_SNAPSHOT_SECS so signal generation and
-                # startup reconciliation always have fresh ATR data.
-                if now_ts - _position_last_full_snapshot.get(ticker, 0) >= POSITION_FULL_SNAPSHOT_SECS:
+                # Full snapshot (ATR/OHLCV) — skip if IB already provided a price
+                # to avoid blocking exit evaluation with slow yfinance calls.
+                if (not price
+                        and now_ts - _position_last_full_snapshot.get(ticker, 0) >= POSITION_FULL_SNAPSHOT_SECS):
                     try:
-                        await _write_market_snapshot_and_get_price(
-                            redis, ticker, market_data, vix=vix
+                        await asyncio.wait_for(
+                            _write_market_snapshot_and_get_price(redis, ticker, market_data, vix=vix),
+                            timeout=8.0,
                         )
                         _position_last_full_snapshot[ticker] = now_ts
-                    except Exception as exc:
+                    except (asyncio.TimeoutError, Exception) as exc:
                         logger.debug("Full snapshot failed for %s: %s", ticker, exc)
 
             # ── 2b. Watchlist prices: full yfinance snapshot ──────────────────
             # Watchlist tickers are not open positions; use yfinance (or IB
             # FallbackMarketData) for their full snapshot on the slow cadence.
+            # Cap total watchlist refresh time at 20s so it never blocks exits.
+            _wl_phase_start = asyncio.get_event_loop().time()
             for ticker in stale_watchlist - open_tickers:
+                if asyncio.get_event_loop().time() - _wl_phase_start > 20.0:
+                    logger.debug("[SYNC] Watchlist refresh time budget exceeded — deferring remaining tickers")
+                    break
                 try:
-                    snapshot = await _write_market_snapshot_and_get_price(
-                        redis, ticker, market_data, vix=vix
+                    snapshot = await asyncio.wait_for(
+                        _write_market_snapshot_and_get_price(redis, ticker, market_data, vix=vix),
+                        timeout=8.0,
                     )
                     if snapshot is not None:
                         engine.set_price(ticker, snapshot)
                     _watchlist_last_refresh[ticker] = now_ts
-                except Exception as exc:
+                except (asyncio.TimeoutError, Exception) as exc:
                     logger.debug("Watchlist price refresh failed for %s: %s", ticker, exc)
 
             # ── 3. Evaluate exit rules ────────────────────────────────────────
@@ -964,7 +991,12 @@ async def run_exit_loop(
             # Write positions:live NOW (before any exits) so the UI always shows
             # accurate sl/tp values — clearing params after a close would make
             # sl/tp appear as 0 if we write after the evaluation loop.
-            all_pos = await engine.get_positions()
+            try:
+                all_pos = await asyncio.wait_for(engine.get_positions(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[SYNC] get_positions() (step 3) timed out — skipping this cycle")
+                await asyncio.sleep(cfg.exit_eval_interval_sec)
+                continue
             # Only manage positions opened by this system; manual IB positions
             # are managed by the user elsewhere and must not be touched.
             system_params = engine.get_position_params() if hasattr(engine, "get_position_params") else {}  # type: ignore[union-attr]
@@ -978,14 +1010,26 @@ async def run_exit_loop(
             # Attempt reattach; fall back to immediate close if that fails.
             # Tickers handled here are excluded from this cycle's exit evaluation
             # to avoid race conditions with just-placed orders.
-            naked_closed, naked_reattached = await _check_naked_positions(
-                redis, engine, open_positions, system_params, cfg, mode,
+            naked_closed, naked_reattached, naked_pending = await _check_naked_positions(
+                redis, engine, open_positions, system_params, mode,
                 startup_ts=_loop_start_ts,
             )
             if naked_closed:
                 just_closed.update(naked_closed)
                 await _write_positions_to_redis(redis, engine, pending_close=_closing_tickers)
-            handled_this_cycle = naked_closed | naked_reattached
+            if naked_pending:
+                # GTC closes submitted but not yet filled — add to _closing_tickers
+                # so exit-rule evaluation is suppressed until the fill is confirmed
+                # by the reconcile loop (closed_offline detection).
+                _now_ts = asyncio.get_event_loop().time()
+                for _np_ticker in naked_pending:
+                    _closing_tickers.add(_np_ticker)
+                    _closing_tickers_ts[_np_ticker] = _now_ts
+                    logger.info(
+                        "[EXIT] %s: GTC naked-close pending fill — suppressing exit eval",
+                        _np_ticker,
+                    )
+            handled_this_cycle = naked_closed | naked_reattached | naked_pending
             open_positions_for_eval = [
                 p for p in open_positions if p.ticker not in handled_this_cycle
             ]
@@ -1046,43 +1090,12 @@ async def run_exit_loop(
                     _pos_shares = pos.shares
                     _pos_direction = pos.direction
 
-                    # ── Regular exit: modify existing STP order to trigger immediately ──
-                    # This keeps the OCA group intact and avoids creating a new market
-                    # order.  The STP becomes a market order on the next tick and the
-                    # OCA siblings (TRAIL, LMT) are cancelled automatically by IB on fill.
-                    # Emergency closes (circuit breaker, volatility spike) bypass this and
-                    # call close_position() directly.
-                    _triggered = False
-                    if hasattr(engine, "trigger_stop_exit"):
-                        try:
-                            _triggered = await engine.trigger_stop_exit(  # type: ignore[union-attr]
-                                pos.ticker, current_price
-                            )
-                        except Exception as _te:
-                            logger.warning(
-                                "[EXIT] trigger_stop_exit failed for %s (%s) — falling back to market close",
-                                pos.ticker, _te,
-                            )
-
-                    if _triggered:
-                        # STP modified — IB will fill it on the next tick via OCA.
-                        # Reconcile loop detects the fill and publishes position_closed.
-                        _closing_tickers.add(pos.ticker)
-                        _trailing_pct_applied.pop(pos.ticker, None)
-                        logger.info(
-                            "[EXIT] %s STP order triggered at %.4f (reason=%s) — "
-                            "awaiting fill via OCA; reconcile will confirm",
-                            pos.ticker, current_price, decision.reason,
-                        )
-                        continue
-
-                    # ── Fallback: no active STP — use emergency market close ──────────
-                    logger.warning(
-                        "[EXIT] %s no STP order found for rule-based exit — "
-                        "falling back to market close (reason=%s)",
+                    # ── Exit: cancel OCA bracket + submit GTC market close ────────
+                    logger.info(
+                        "[EXIT] %s exit triggered (reason=%s) — cancelling OCA and submitting GTC MKT close",
                         pos.ticker, decision.reason,
                     )
-                    close_result = await engine.close_position(pos.ticker, reason=decision.reason)
+                    close_result = await engine.close_position(pos.ticker, reason=decision.reason, tif="GTC")
 
                     if close_result and close_result.status == "rejected":
                         # Order rejected (e.g. no IB position found) — log and skip.
@@ -1130,6 +1143,7 @@ async def run_exit_loop(
                         # run_reconcile_loop will detect the fill via closed_offline
                         # state on the next 60-second reconcile cycle.
                         _closing_tickers.add(pos.ticker)
+                        _closing_tickers_ts[pos.ticker] = asyncio.get_event_loop().time()
                         _trailing_pct_applied.pop(pos.ticker, None)
                         logger.info(
                             "[EXIT] %s close order submitted — awaiting fill; reconcile will confirm",
@@ -1162,7 +1176,11 @@ async def run_exit_loop(
                 state.daily_pnl / state.net_liquidation if state.net_liquidation else 0
             )
             DRAWDOWN.set(state.drawdown_pct)
-            remaining_positions = await engine.get_positions()
+            try:
+                remaining_positions = await asyncio.wait_for(engine.get_positions(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.debug("[SYNC] get_positions() (metrics) timed out — skipping metrics update")
+                remaining_positions = []
             OPEN_POSITIONS_COUNT.set(len(remaining_positions))
             for pos in remaining_positions:
                 cur = engine.get_price(pos.ticker) or pos.entry_price
@@ -1177,12 +1195,56 @@ async def run_exit_loop(
             # exit loop doesn't permanently skip evaluation for those tickers.
             # Reconcile loop handles the position_closed event; we only clear the
             # local guard set here once IB no longer reports the position.
-            if _closing_tickers:
+            #
+            # Guard: never clear when IB returned 0 positions — the position
+            # cache may be momentarily stale (e.g. during TWS nightly restart or
+            # brief disconnection). A spurious clear would re-expose the ticker
+            # to the exit evaluator before the fill is confirmed, potentially
+            # triggering a duplicate close order.
+            if _closing_tickers and remaining_positions:
                 remaining_tickers = {p.ticker for p in remaining_positions}
                 cleared = _closing_tickers - remaining_tickers
                 if cleared:
                     logger.info("[EXIT] _closing_tickers cleared (fill confirmed): %s", sorted(cleared))
                     _closing_tickers -= cleared
+                    for t in cleared:
+                        _closing_tickers_ts.pop(t, None)
+            elif _closing_tickers and not remaining_positions:
+                logger.warning(
+                    "[EXIT] IB returned 0 positions while _closing_tickers=%s — "
+                    "not clearing (IB cache may be stale)",
+                    sorted(_closing_tickers),
+                )
+
+            # ── 5b. _closing_tickers timeout: retry close_position if fill not
+            #        confirmed within _CLOSING_TIMEOUT_SECS.  This handles the case
+            #        where the original STP modification or MKT order was silently
+            #        rejected by IB (e.g. PreSubmitted order that cannot trigger,
+            #        or an order rejected outside RTH). ────────────────────────────
+            _now_ts = asyncio.get_event_loop().time()
+            for _stuck_ticker in list(_closing_tickers):
+                _added_ts = _closing_tickers_ts.get(_stuck_ticker, _now_ts)
+                if _now_ts - _added_ts > _CLOSING_TIMEOUT_SECS:
+                    logger.warning(
+                        "[EXIT] %s in _closing_tickers for >%ds without fill — "
+                        "retrying close_position() (original close may have been silently rejected)",
+                        _stuck_ticker, _CLOSING_TIMEOUT_SECS,
+                    )
+                    if hasattr(engine, "close_position"):
+                        try:
+                            _retry_result = await engine.close_position(  # type: ignore[union-attr]
+                                _stuck_ticker, reason="CLOSING_TIMEOUT_RETRY", tif="GTC"
+                            )
+                            logger.info(
+                                "[EXIT] %s close_position retry: status=%s fill=%s",
+                                _stuck_ticker,
+                                getattr(_retry_result, "status", "?"),
+                                getattr(_retry_result, "fill_price", None),
+                            )
+                        except Exception as _re:
+                            logger.error("[EXIT] %s close_position retry failed: %s", _stuck_ticker, _re)
+                    # Reset timestamp so we don't retry on every cycle
+                    _closing_tickers_ts[_stuck_ticker] = _now_ts
 
             # ── 6. EOD snapshot ───────────────────────────────────────────────
             # Save session metrics once per day after NYSE close (≥ 16:00 ET).
@@ -2842,7 +2904,6 @@ async def _check_naked_positions(
     engine: ExecutionEngine,
     open_positions: list,
     system_params: dict,
-    cfg: "SystemConfig",
     mode: str,
     *,
     startup_ts: float = 0.0,
@@ -2851,26 +2912,30 @@ async def _check_naked_positions(
     Detect system-tracked positions that have no live server-side OCA protective
     orders in IB (a "naked" position — open in IB with no stop/trail bracket).
 
-    For each naked position:
-      1. Reconstruct stop_loss / take_profit from entry_price + ATR if missing.
-      2. Attempt to reattach OCA orders (STP, LMT, TRAIL) via
-         engine.reattach_oca_orders().
-      3. If reattach fails (or params are completely missing), close the position
-         immediately to avoid running unprotected.
+    For each naked position (after the startup and recent-entry grace windows):
+      1. Cancel any partial / stale OCA orders to avoid conflicting orders.
+      2. Submit a GTC market order to close the position immediately.
+         GTC ensures the order persists into the next RTH session if submitted
+         outside regular hours.
 
     Returns:
-        (just_closed, just_reattached) — both sets should be excluded from
-        exit rule evaluation for the remainder of this cycle.
+        (just_closed, just_reattached, just_pending_close):
+          just_closed        — filled immediately; exclude from exit eval this cycle.
+          just_reattached    — always empty (removed); retained for API compat only.
+          just_pending_close — GTC submitted but not yet filled; caller must add to
+                               _closing_tickers so exit eval doesn't re-fire until fill.
     """
     just_closed: set[str] = set()
-    just_reattached: set[str] = set()
+    just_reattached: set[str] = set()  # kept for API compatibility; always empty
+    just_pending_close: set[str] = set()
 
     # Only applicable to live IBKR engine with active connection
-    if not hasattr(engine, "_ib") or not hasattr(engine, "reattach_oca_orders"):
-        return just_closed, just_reattached
+    if not hasattr(engine, "_ib") or not hasattr(engine, "close_position"):
+        return just_closed, just_reattached, just_pending_close
     ib = engine._ib  # type: ignore[union-attr]
+
     if not ib.isConnected():
-        return just_closed, just_reattached
+        return just_closed, just_reattached, just_pending_close
 
     # Grace period after startup/reconnect: IB pushes openOrder callbacks
     # asynchronously.  If the exit loop fires within 30s of startup, openTrades()
@@ -2923,7 +2988,7 @@ async def _check_naked_positions(
                 pending_mkt_close_tickers.add(sym)
     except Exception as exc:
         logger.warning("[NAKED] Could not inspect IB open trades: %s — skipping check", exc)
-        return just_closed, just_reattached  # cannot safely assess
+        return just_closed, just_reattached, just_pending_close  # cannot safely assess
 
     # Under-covered: has a protective order but it covers fewer shares than held.
     # This happens when duplicate entry orders result in an oversized position
@@ -2955,8 +3020,9 @@ async def _check_naked_positions(
                 "OCA intentionally absent; skipping naked check",
                 ticker,
             )
+
     if not naked:
-        return just_closed, just_reattached
+        return just_closed, just_reattached, just_pending_close
 
     for pos in naked:
         ticker = pos.ticker
@@ -3007,145 +3073,67 @@ async def _check_naked_positions(
 
         logger.warning(
             "[NAKED] %s: no server-side protective orders — "
+            "cancelling partial OCA orders and closing immediately (GTC). "
             "sl=%.4f tp=%.4f entry=%.4f current=%.4f",
             ticker, stop_loss, take_profit, entry_price, current_price,
         )
 
-        # ── Reconstruct SL/TP from entry_price + ATR when persisted levels missing ──
-        # Always use entry_price as anchor (not current_price) to preserve the
-        # original risk envelope intended at order time.
-        if (stop_loss <= 0 or take_profit <= 0) and entry_price > 0:
-            atr = 0.0
-            try:
-                mkt_raw = await redis.hgetall(f"market_data:{ticker}")
-                atr_val = mkt_raw.get(b"atr_14") or mkt_raw.get("atr_14")
-                if atr_val:
-                    atr = float(atr_val.decode() if isinstance(atr_val, bytes) else atr_val)
-            except Exception:
-                pass
-            if atr > 0:
-                if stop_loss <= 0:
-                    stop_loss = round(
-                        entry_price - cfg.atr_multiplier * atr
-                        if direction == "LONG"
-                        else entry_price + cfg.atr_multiplier * atr,
-                        2,
-                    )
-                    logger.info(
-                        "[NAKED] %s: reconstructed sl=%.4f from entry=%.4f ATR=%.4f",
-                        ticker, stop_loss, entry_price, atr,
-                    )
-                if take_profit <= 0:
-                    take_profit = round(
-                        entry_price * (1.0 + cfg.take_profit_pct)
-                        if direction == "LONG"
-                        else entry_price * (1.0 - cfg.take_profit_pct),
-                        2,
-                    )
-                    logger.info(
-                        "[NAKED] %s: reconstructed tp=%.4f from entry=%.4f",
-                        ticker, take_profit, entry_price,
-                    )
-
-        # If we have absolutely no usable params AND no entry price to reconstruct
-        # from, close immediately — cannot define any risk envelope.
-        if entry_price <= 0 and stop_loss <= 0 and take_profit <= 0:
-            logger.error(
-                "[NAKED] %s: no entry_price and no SL/TP — closing for safety",
-                ticker,
-            )
-            try:
-                await engine.close_position(ticker, reason="NAKED_NO_PARAMS")  # type: ignore[union-attr]
-                just_closed.add(ticker)
-                await _publish_execution_event(redis, "position_closed", {
-                    "ticker": ticker,
-                    "exit_price": current_price,
-                    "exit_reason": "NAKED_NO_PARAMS",
-                    "shares": quantity,
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "closed_at": datetime.now(UTC).isoformat(),
-                    "opened_at": params.get("opened_at", ""),
-                    "mode": mode,
-                })
-                await redis.hdel(_HWM_REDIS_KEY, ticker)
-                await redis.hdel(_POSITION_PARAMS_KEY, ticker)
-                await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
-            except Exception as exc:
-                logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
-            continue
-
-        # ── Attempt reattach ──────────────────────────────────────────────────
-        # GAP-3 fix: cancel any partial/stale brackets first so reattach
-        # doesn't layer new OCA orders on top of lingering old ones.
-        _cancel_bracket_orders_sync(engine, ticker)
+        # ── Submit GTC market close ───────────────────────────────────────────
+        # close_position() cancels all ORDER_REF orders, waits 2s, then submits
+        # GTC MKT.  No separate cancel step needed here.
+        close_result = None
         try:
-            success = await engine.reattach_oca_orders(  # type: ignore[union-attr]
-                ticker=ticker,
-                direction=direction,
-                quantity=quantity,
-                current_price=current_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trailing_stop_pct=cfg.trailing_stop_pct,
+            close_result = await engine.close_position(  # type: ignore[union-attr]
+                ticker, reason="NAKED_CLOSE", tif="GTC"
             )
         except Exception as exc:
-            logger.error("[NAKED] %s: reattach raised exception: %s", ticker, exc)
-            success = False
+            logger.error("[NAKED] %s: close_position failed: %s", ticker, exc)
 
-        if success:
-            # Update in-memory params with possibly-reconstructed SL/TP so the
-            # exit loop and step-5 persistence see the corrected values.
-            if hasattr(engine, "_position_params") and ticker in engine._position_params:  # type: ignore[union-attr]
-                engine._position_params[ticker]["stop_loss"] = stop_loss  # type: ignore[union-attr]
-                engine._position_params[ticker]["take_profit"] = take_profit  # type: ignore[union-attr]
-            # Immediately persist the new oca_group and trail order ID to Redis
-            # so they survive a crash within the next cycle (60s window).
-            try:
-                params_raw_r = await redis.hget(_POSITION_PARAMS_KEY, ticker)
-                _pdata: dict = {}
-                if params_raw_r:
-                    _pdata = json.loads(params_raw_r.decode() if isinstance(params_raw_r, bytes) else params_raw_r)
-                if hasattr(engine, "_position_params") and ticker in engine._position_params:  # type: ignore[union-attr]
-                    new_oca = engine._position_params[ticker].get("oca_group", "")  # type: ignore[union-attr]
-                    if new_oca:
-                        _pdata["oca_group"] = new_oca
-                _pdata["stop_loss"]   = stop_loss
-                _pdata["take_profit"] = take_profit
-                await redis.hset(_POSITION_PARAMS_KEY, ticker, json.dumps(_pdata))
-                if hasattr(engine, "_ts_order_id") and ticker in engine._ts_order_id:  # type: ignore[union-attr]
-                    await redis.hset(_TRAIL_ORDERS_KEY, ticker, str(engine._ts_order_id[ticker]))  # type: ignore[union-attr]
-            except Exception as _rpe:
-                logger.debug("[NAKED] Failed to persist reattach params for %s: %s", ticker, _rpe)
-            just_reattached.add(ticker)
-            logger.warning(
-                "[NAKED] %s: OCA bracket reattached — sl=%.4f tp=%.4f", ticker, stop_loss, take_profit,
+        if close_result and close_result.status == "rejected":
+            logger.error(
+                "[NAKED] %s: GTC close rejected (%s) — position stays open",
+                ticker, close_result.error or "unknown",
+            )
+            continue
+
+        # Mark as handled this cycle regardless of fill confirmation so the exit
+        # evaluator doesn't also try to close it on the same cycle.
+        just_closed.add(ticker)
+
+        if close_result and close_result.fill_price is not None:
+            # Immediate fill confirmed — publish event and clean up Redis state.
+            await _publish_execution_event(redis, "position_closed", {
+                "ticker": ticker,
+                "exit_price": close_result.fill_price,
+                "exit_reason": "NAKED_CLOSE",
+                "shares": quantity,
+                "direction": direction,
+                "entry_price": entry_price,
+                "closed_at": datetime.now(UTC).isoformat(),
+                "opened_at": params.get("opened_at", ""),
+                "mode": mode,
+            })
+            await redis.hdel(_HWM_REDIS_KEY, ticker)
+            await redis.hdel(_POSITION_PARAMS_KEY, ticker)
+            await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
+            logger.info(
+                "[NAKED] %s: closed immediately at %.4f",
+                ticker, close_result.fill_price,
             )
         else:
-            logger.error(
-                "[NAKED] %s: reattach failed — closing to avoid unprotected position", ticker,
+            # GTC order submitted — fill will arrive at next RTH open.
+            # The pending MKT order is now visible in IB openTrades(), so the
+            # next naked-check cycle will see it in pending_mkt_close_tickers
+            # and skip re-processing.  The reconcile loop detects the fill via
+            # closed_offline and publishes position_closed.
+            just_pending_close.add(ticker)
+            logger.info(
+                "[NAKED] %s: GTC close order submitted — fill expected at next RTH open; "
+                "reconcile will confirm. Adding to _closing_tickers to suppress re-evaluation.",
+                ticker,
             )
-            try:
-                await engine.close_position(ticker, reason="NAKED_REATTACH_FAILED")  # type: ignore[union-attr]
-                just_closed.add(ticker)
-                await _publish_execution_event(redis, "position_closed", {
-                    "ticker": ticker,
-                    "exit_price": current_price,
-                    "exit_reason": "NAKED_REATTACH_FAILED",
-                    "shares": quantity,
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "closed_at": datetime.now(UTC).isoformat(),
-                    "opened_at": params.get("opened_at", ""),
-                    "mode": mode,
-                })
-                await redis.hdel(_HWM_REDIS_KEY, ticker)
-                await redis.hdel(_POSITION_PARAMS_KEY, ticker)
-                await redis.hdel(_TRAIL_ORDERS_KEY, ticker)
-            except Exception as exc:
-                logger.error("[NAKED] %s: emergency close also failed: %s", ticker, exc)
 
-    return just_closed, just_reattached
+    return just_closed, just_reattached, just_pending_close
 
 
 async def _close_adopted_no_oca(
@@ -3175,7 +3163,7 @@ async def _close_adopted_no_oca(
     current_price = engine.get_price(ticker) or entry_price  # type: ignore[union-attr]
     result = None
     try:
-        result = await engine.close_position(ticker, reason="NO_OCA_ON_ADOPT")  # type: ignore[union-attr]
+        result = await engine.close_position(ticker, reason="NO_OCA_ON_ADOPT", tif="GTC")  # type: ignore[union-attr]
     except Exception as exc:
         logger.error("[SYNC] %s: close_position failed during adoption cleanup: %s", ticker, exc)
         return
@@ -4716,7 +4704,7 @@ async def _command_close_position(
     _pos_shares      = int(params.get("shares", 0))
     _pos_direction   = params.get("direction", "unknown")
 
-    close_result = await engine.close_position(ticker, reason=reason)
+    close_result = await engine.close_position(ticker, reason=reason, tif="GTC")
 
     if close_result and close_result.status == "rejected":
         logger.warning("[CMD] close_position for %s rejected: %s", ticker, close_result.error or "unknown")
