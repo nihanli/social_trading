@@ -713,7 +713,9 @@ async def run_trade_loop(
                                 except Exception as _cb_exc:
                                     logger.warning("[EXEC] Error in entry fill callback for %s: %s", _t, _cb_exc)
 
-                                engine.register_order_fill_callback(_entry_order_id, _on_entry_fill_async)  # type: ignore[union-attr]
+                            # Register callback OUTSIDE the function body so it fires
+                            # when IB delivers the fill (could be seconds to minutes later).
+                            engine.register_order_fill_callback(_entry_order_id, _on_entry_fill_async)  # type: ignore[union-attr]
                     else:
                         ORDERS_PLACED.labels(ticker=signal.ticker, status="rejected").inc()
                         logger.warning("[EXEC] Rejected %s: %s", signal.ticker, result.error)
