@@ -2504,6 +2504,11 @@ async def _reconcile_ib_state(
 
                 if _to_float(app_entry.get("entry_price", 0.0)) <= 0:
                     fill_price = _entry_fill_price(ticker, ib_dir or app_dir or "LONG")
+                    # Fallback: IB position avgCost is always available for open positions
+                    # and covers the case where the entry fill is from a prior TWS session
+                    # (reqExecutionsAsync / reqCompletedOrdersAsync only cover today's fills).
+                    if fill_price <= 0:
+                        fill_price = _to_float(ib_entry.get("avg_cost", 0.0))
                     state = "fill_pending"
                     if fill_price > 0:
                         updated = dict(app_entry)
@@ -2513,7 +2518,7 @@ async def _reconcile_ib_state(
                         app_by_ticker[ticker] = updated
                         app_entry = updated
                         entry_fix_tickers.add(ticker)
-                        reason = f"{ticker}: recovered entry VWAP {fill_price:.4f} from IB fills."
+                        reason = f"{ticker}: recovered entry price {fill_price:.4f} from IB avgCost."
                         auto_actions.append({"ticker": ticker, "action": "fix_entry_price"})
                         await _publish_execution_event(redis, "position_entry_updated", {
                             "ticker": ticker,
