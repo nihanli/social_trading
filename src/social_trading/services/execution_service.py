@@ -502,6 +502,28 @@ async def run_trade_loop(
                         except Exception as exc:
                             logger.debug("On-demand price fetch failed for %s: %s", signal.ticker, exc)
 
+                    # Guard: skip if current price has already breached the take-profit.
+                    # This prevents immediate TP exits caused by stale OCA targets
+                    # computed from an earlier (higher/lower) price.
+                    _cur_price = engine.get_price(signal.ticker) or 0.0
+                    if _cur_price > 0 and take_profit > 0:
+                        _tp_breached = (
+                            (signal.direction == "SHORT" and _cur_price <= take_profit)
+                            or (signal.direction == "LONG" and _cur_price >= take_profit)
+                        )
+                        if _tp_breached:
+                            logger.warning(
+                                "[EXEC] %s %s: price %.4f already past take-profit %.4f — skipping entry",
+                                signal.direction, signal.ticker, _cur_price, take_profit,
+                            )
+                            skipped += 1
+                            await _publish_signal_rejection(
+                                redis, signal,
+                                f"tp_breached: price {_cur_price:.4f} already past take_profit {take_profit:.4f}",
+                            )
+                            await bus.ack(STREAM_SELECTED_SIGNALS, _GROUP, msg_id)
+                            continue
+
                     result = await engine.submit_signal(
                         signal=signal,
                         quantity=quantity,
@@ -2564,11 +2586,27 @@ async def _reconcile_ib_state(
             elif ib_entry and not app_entry:
                 if ticker in (system_tickers | system_entry_tickers):
                     state = "adopted"
-                    if ticker in _round_tripped_today:
+                    # Direction-aware round-trip check:
+                    # LONG:  entry=BOT, close=SLD → round-tripped if latest SLD > latest BOT
+                    # SHORT: entry=SLD, close=BOT → round-tripped if latest BOT > latest SLD
+                    _ib_dir = str(ib_entry.get("direction", "LONG")).upper()
+                    _close_side  = "SLD" if _ib_dir == "LONG" else "BOT"
+                    _entry_side  = "BOT" if _ib_dir == "LONG" else "SLD"
+                    _close_t  = _latest_fill_time.get(f"{ticker}:{_close_side}")
+                    _entry_t  = _latest_fill_time.get(f"{ticker}:{_entry_side}")
+                    _dir_round_tripped = (
+                        _close_t is not None
+                        and _entry_t is not None
+                        and _close_t > _entry_t
+                    )
+                    if _dir_round_tripped:
                         reason = (
-                            f"{ticker}: IB shows a system position marker but BOT/SLD fills indicate it round-tripped today; "
+                            f"{ticker}: IB shows a system position marker but {_ib_dir} fills "
+                            f"indicate it round-tripped today (close {_close_t} > entry {_entry_t}); "
                             "skipping adoption."
                         )
+                        logger.info("[RECONCILE] %s: direction-aware round-trip detected (%s) — skipping adoption",
+                                    ticker, _ib_dir)
                     else:
                         adopted_ok, reason = await _adopt_position(ticker, ib_entry)
                         if adopted_ok:
@@ -2759,6 +2797,41 @@ async def _reconcile_ib_state(
     }
     await redis.set(_RECONCILE_LAST_RUN_KEY, collected_at, ex=3600)
     await redis.set(_RECONCILE_FULL_KEY, json.dumps(summary, default=str), ex=3600)
+
+    # ── Recover entry_price=0 on recently closed trades ──────────────────────
+    # When an OCA position exits in seconds (e.g. TP already breached at entry),
+    # the async fill callback may fire after Redis params are cleaned up.
+    # Re-publish position_entry_updated for all BOT/SLD entry fills seen in
+    # today's IB execution history — persistence handler is idempotent
+    # (only updates rows WHERE entry_price = 0) so this is safe to repeat.
+    try:
+        closed_entry_fixed: list[str] = []
+        for _t, _fill in fills_by_ticker.items():
+            _action = str(_fill.get("action", "")).upper()
+            _fp = _to_float(_fill.get("fill_price", 0.0))
+            if _action in ("BOT", "SLD") and _fp > 0:
+                _dir = "LONG" if _action == "BOT" else "SHORT"
+                # Only correct if position is NOT currently open (avoid overwriting
+                # active positions whose entry_price is legitimately pending).
+                if _t not in matched_tickers and _t not in adopted_tickers:
+                    fill_price_for_closed = _entry_fill_price(_t, _dir)
+                    if fill_price_for_closed > 0:
+                        await _publish_execution_event(redis, "position_entry_updated", {
+                            "ticker": _t,
+                            "entry_price": fill_price_for_closed,
+                        })
+                        closed_entry_fixed.append(_t)
+                        logger.debug(
+                            "[RECONCILE] Published entry correction for closed trade %s: %.4f",
+                            _t, fill_price_for_closed,
+                        )
+        if closed_entry_fixed:
+            summary["closed_entry_fixed"] = closed_entry_fixed
+            logger.info("[RECONCILE] Recovered entry_price=0 for %d closed trade(s): %s",
+                        len(closed_entry_fixed), closed_entry_fixed)
+    except Exception as _cef_exc:
+        logger.debug("[RECONCILE] closed entry_price recovery failed: %s", _cef_exc)
+
     return summary
 
 
