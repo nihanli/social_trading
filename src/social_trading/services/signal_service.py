@@ -132,6 +132,9 @@ def _signal_to_stream_dict(sig: Signal) -> dict[str, str]:
         "generated_at": sig.generated_at.isoformat(),
         "signal_phase": sig.signal_phase or "",
         "atr": str(sig.atr) if sig.atr is not None else "",
+        # contrarian is stored in metadata by the generator; promote it to a
+        # top-level field so persistence_service can read it from the stream.
+        "contrarian": str(sig.metadata.get("contrarian", False)).lower(),
     }
 
 

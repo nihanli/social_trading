@@ -110,6 +110,8 @@ class BacktestResult:
 def load_ohlc(tickers: list[str], conn) -> dict[str, dict[str, pd.DataFrame]]:
     """
     Load price_ohlc bars for the given tickers from the DB.
+    Falls back to yfinance for any tickers missing from the DB
+    (e.g. tickers no longer on the watchlist).
 
     Returns:
         {ticker: {"1d": daily_df, "5m": intraday_df}}
@@ -165,6 +167,35 @@ def load_ohlc(tickers: list[str], conn) -> dict[str, dict[str, pd.DataFrame]]:
                 result.setdefault(ticker, {})["5m"] = df
     except Exception as exc:
         logger.warning("[BACKTEST] OHLC load error: %s", exc)
+
+    # Fall back to yfinance for any tickers missing from the DB.
+    # This covers trades on tickers that have since left the watchlist
+    # and therefore have no price_ohlc rows — without this, _simulate_trade
+    # would produce only TIME_STOP exits and 0% win rates for those trades.
+    missing = [t for t in tickers if t not in result or "1d" not in result.get(t, {})]
+    if missing:
+        try:
+            import yfinance as yf  # noqa: PLC0415
+            logger.info("[BACKTEST] Fetching OHLC from yfinance for %d tickers missing from DB: %s",
+                        len(missing), missing)
+            _col_map = {"Open": "open", "High": "high", "Low": "low",
+                        "Close": "close", "Volume": "volume"}
+            for t in missing:
+                try:
+                    h1d = yf.Ticker(t).history(period="180d", interval="1d", auto_adjust=True)
+                    h5m = yf.Ticker(t).history(period="5d",   interval="5m",  auto_adjust=True)
+                    if not h1d.empty:
+                        h1d.index = h1d.index.tz_convert("UTC") if h1d.index.tz else h1d.index.tz_localize("UTC")
+                        h5m.index = h5m.index.tz_convert("UTC") if h5m.index.tz and not h5m.empty else (
+                            h5m.index.tz_localize("UTC") if not h5m.empty else h5m.index
+                        )
+                        result.setdefault(t, {})["1d"] = h1d.rename(columns=_col_map)
+                        if not h5m.empty:
+                            result[t]["5m"] = h5m.rename(columns=_col_map)
+                except Exception as _yf_exc:
+                    logger.debug("[BACKTEST] yfinance fallback failed for %s: %s", t, _yf_exc)
+        except ImportError:
+            logger.warning("[BACKTEST] yfinance not available — %d tickers will have no OHLC data", len(missing))
 
     return result
 
