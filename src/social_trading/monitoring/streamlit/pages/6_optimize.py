@@ -1100,10 +1100,11 @@ with tab_grid:
         # Full results table
         display_cols = bt_keys + ["sharpe", "win_rate", "total_pnl", "trades", "avg_hold_days"]
         display_cols = [c for c in display_cols if c in res_df.columns]
+        rename_map = {"max_hold_days": "max_hold_sessions", "avg_hold_days": "avg_hold_sessions"}
         st.dataframe(
-            res_df[display_cols].style.format({
+            res_df[display_cols].rename(columns=rename_map).style.format({
                 "sharpe": "{:.3f}", "win_rate": "{:.1%}",
-                "total_pnl": "${:.2f}", "avg_hold_days": "{:.1f}",
+                "total_pnl": "${:.2f}", "avg_hold_sessions": "{:.1f}",
             }),
             use_container_width=True,
             hide_index=True,

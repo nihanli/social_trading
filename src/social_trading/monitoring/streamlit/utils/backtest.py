@@ -60,7 +60,7 @@ PARAM_DEFS: dict[str, dict[str, Any]] = {
         "fmt":     lambda v: f"{v:.0%}",
     },
     "max_hold_days": {
-        "label":   "Max hold days",
+        "label":   "Max hold sessions",
         "modes":   {"fast", "full"},
         "default": [2, 3],
         "options": [1, 2, 3, 4, 5],
